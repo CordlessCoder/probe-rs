@@ -12,19 +12,27 @@ use gimli::{
     read::RegisterRule,
 };
 use object::read::{Object, ObjectSection};
-use probe_rs::{CoreRegister, Error, InstructionSet, MemoryInterface, RegisterRole, RegisterValue};
+use probe_rs::{
+    CoreRegister, Endian, Error, InstructionSet, MemoryInterface, RegisterRole, RegisterValue,
+};
 use std::{
-    borrow, cmp::Ordering, num::NonZeroU64, ops::ControlFlow, path::Path, rc::Rc, str::from_utf8,
+    borrow,
+    cmp::Ordering,
+    num::NonZeroU64,
+    ops::ControlFlow,
+    path::Path,
+    str::from_utf8,
+    sync::{Arc, Mutex},
 };
 use typed_path::{TypedPath, TypedPathBuf};
 
-pub(crate) type GimliReader = gimli::EndianReader<RunTimeEndian, std::rc::Rc<[u8]>>;
+pub(crate) type GimliReader = gimli::EndianReader<RunTimeEndian, std::sync::Arc<[u8]>>;
 pub(crate) type GimliReaderOffset =
-    <gimli::EndianReader<RunTimeEndian, Rc<[u8]>> as gimli::Reader>::Offset;
+    <gimli::EndianReader<RunTimeEndian, Arc<[u8]>> as gimli::Reader>::Offset;
 
 pub(crate) type GimliAttribute = gimli::Attribute<GimliReader>;
 
-pub(crate) type DwarfReader = gimli::read::EndianRcSlice<RunTimeEndian>;
+pub(crate) type DwarfReader = gimli::read::EndianArcSlice<RunTimeEndian>;
 
 /// Debug information which is parsed from DWARF debugging information.
 pub struct DebugInfo {
@@ -37,7 +45,11 @@ pub struct DebugInfo {
     pub(crate) unit_infos: Vec<UnitInfo>,
     pub(crate) endianness: gimli::RunTimeEndian,
 
-    pub(crate) addr2line: Option<addr2line::Loader>,
+    /// Cached symbol-table fallback for frames without DWARF.
+    ///
+    /// Wrapped in a [`Mutex`] because `addr2line::Loader` is `Send` but not
+    /// `Sync`, while [`DebugInfo`] must be both so an RPC server can share it.
+    pub(crate) addr2line: Option<Mutex<addr2line::Loader>>,
 }
 
 impl DebugInfo {
@@ -46,7 +58,7 @@ impl DebugInfo {
         let data = std::fs::read(path.as_ref())?;
 
         let mut this = DebugInfo::from_raw(&data)?;
-        this.addr2line = addr2line::Loader::new(path).ok();
+        this.addr2line = addr2line::Loader::new(path).ok().map(Mutex::new);
         Ok(this)
     }
 
@@ -67,8 +79,8 @@ impl DebugInfo {
                 .and_then(|section| section.uncompressed_data().ok())
                 .unwrap_or_else(|| borrow::Cow::Borrowed(&[][..]));
 
-            Ok(gimli::read::EndianRcSlice::new(
-                Rc::from(&*data),
+            Ok(gimli::read::EndianArcSlice::new(
+                Arc::from(&*data),
                 endianness,
             ))
         };
@@ -112,6 +124,44 @@ impl DebugInfo {
             endianness,
             addr2line: None,
         })
+    }
+
+    /// Create a [`DebugInfo`] that contains no debug information, for a target of the given
+    /// endianness.
+    ///
+    /// Unwinding with this still yields a backtrace: when the unwinder finds no unwind info for a
+    /// frame it falls back to the architecture's calling convention (for example the Xtensa window
+    /// save area). The resulting frames carry a program counter but no name or source location.
+    pub fn empty(endian: Endian) -> Self {
+        let endianness = match endian {
+            Endian::Little => RunTimeEndian::Little,
+            Endian::Big => RunTimeEndian::Big,
+        };
+        let load_section = |_id: gimli::SectionId| -> Result<DwarfReader, gimli::Error> {
+            Ok(gimli::read::EndianArcSlice::new(
+                Arc::from(&[][..]),
+                endianness,
+            ))
+        };
+
+        use gimli::Section;
+        let load = || -> Result<Self, gimli::Error> {
+            let debug_loc = gimli::DebugLoc::load(load_section)?;
+            let debug_loc_lists = gimli::DebugLocLists::load(load_section)?;
+
+            Ok(DebugInfo {
+                dwarf: gimli::Dwarf::load(&load_section)?,
+                frame_section: gimli::DebugFrame::load(load_section)?,
+                locations_section: gimli::LocationLists::new(debug_loc, debug_loc_lists),
+                address_section: gimli::DebugAddr::load(load_section)?,
+                debug_line_section: gimli::DebugLine::load(load_section)?,
+                unit_infos: Vec::new(),
+                endianness,
+                addr2line: None,
+            })
+        };
+
+        load().expect("loading empty DWARF sections cannot fail")
     }
 
     /// Try get the [`SourceLocation`] for a given address.
@@ -326,6 +376,10 @@ impl DebugInfo {
         let Some(ref addr2line) = self.addr2line else {
             return Ok(vec![]);
         };
+        // `Loader` is not `Sync`; serialize lookups against the shared cache.
+        let Ok(addr2line) = addr2line.lock() else {
+            return Ok(vec![]);
+        };
         let Some(fn_name) = addr2line.find_symbol(address) else {
             return Ok(vec![]);
         };
@@ -360,7 +414,7 @@ impl DebugInfo {
     /// Returns a populated (resolved) [`StackFrame`] struct.
     /// This function will also populate the `DebugInfo::VariableCache` with in scope `Variable`s for each `StackFrame`,
     /// while taking into account the appropriate strategy for lazy-loading of variables.
-    pub(crate) fn get_stackframe_info(
+    pub fn get_stackframe_info(
         &self,
         memory: &mut impl MemoryInterface,
         address: u64,
@@ -1032,34 +1086,36 @@ impl DebugInfo {
     }
 }
 
-/// Uses the [`TypedPathBuf::normalize`] function to normalize both paths before comparing them
-pub(crate) fn canonical_path_eq(primary_path: TypedPath, secondary_path: TypedPath) -> bool {
-    primary_path.normalize() == secondary_path.normalize()
-}
-
 /// Returns `true` if `full_path` matches `partial_path`.
 ///
-/// When `partial_path` is absolute, the comparison is normalized equality).
+/// When `partial_path` is absolute, the comparison is normalized equality.
 /// When `partial_path` is relative the function additionally accepts a suffix match at
 /// a component boundary, so that a caller can supply just a filename (`main.rs`) or a partial
 /// sub-path (`src/main.rs`) and still resolve to the correct compilation unit.
 ///
+/// If one of the paths is a Windows path, both are normalized to lowercase before comparison.
+///
 /// Separators are normalized to `/` before comparison so that cross-OS paths (e.g. DWARF info
 /// embedded by a Windows compiler, inspected on Linux) are handled correctly.
 pub(crate) fn path_matches(full_path: TypedPath, partial_path: TypedPath) -> bool {
-    if canonical_path_eq(full_path, partial_path) {
-        return true;
-    }
-    if partial_path.is_relative() {
-        let full_buf = full_path.normalize();
-        let full_str = full_buf.to_string_lossy().replace('\\', "/");
-        let partial_buf = partial_path.normalize();
-        let partial_str = partial_buf.to_string_lossy().replace('\\', "/");
-        full_str.ends_with(&*partial_str)
-            && (full_str.len() == partial_str.len()
-                || full_str[..full_str.len() - partial_str.len()].ends_with('/'))
-    } else {
-        false
+    let ignore_case = full_path.is_windows() || partial_path.is_windows();
+    let normalize_path = |path: TypedPath| {
+        let string = path.normalize().to_string_lossy().replace('\\', "/");
+
+        if ignore_case {
+            string.to_lowercase()
+        } else {
+            string
+        }
+    };
+
+    let full_str = normalize_path(full_path);
+    let partial_str = normalize_path(partial_path);
+
+    match full_str.strip_suffix(&partial_str) {
+        Some("") => true,
+        Some(prefix) => partial_path.is_relative() && prefix.ends_with('/'),
+        None => false,
     }
 }
 
@@ -1433,7 +1489,7 @@ mod test {
     use std::path::{Path, PathBuf};
     use test_case::test_case;
 
-    use super::unwind_register_using_rule;
+    use super::{TypedPath, path_matches, unwind_register_using_rule};
 
     /// Get the full path to a file in the `tests` directory.
     fn get_path_for_test_files(relative_file: &str) -> PathBuf {
@@ -2186,5 +2242,48 @@ mod test {
         // forward, NOT the canonical frame address. Overwriting it with the CFA
         // would corrupt the frame pointer when unwinding handlers that don't save R7.
         assert_eq!(value, Some(RegisterValue::U32(0x100)));
+    }
+
+    #[test_case("/home/user/src/main.rs", true; "identical absolute path")]
+    #[test_case("/home/user/./other/../src/main.rs", true; "unnormalized absolute path")]
+    #[test_case("main.rs", true; "file name only")]
+    #[test_case("src/main.rs", true; "partial sub path")]
+    #[test_case("./src/main.rs", true; "unnormalized partial sub path")]
+    #[test_case("ain.rs", false; "suffix that does not start at a component boundary")]
+    #[test_case("/src/main.rs", false; "absolute path that is only a suffix")]
+    #[test_case("src/lib.rs", false; "different file name")]
+    #[test_case("/home/user/src", false; "prefix of the full path")]
+    #[test_case("/home/other/src/main.rs", false; "different absolute path")]
+    fn path_matches_unix(partial_path: &str, expected: bool) {
+        let full_path = TypedPath::unix("/home/user/src/main.rs");
+
+        assert_eq!(
+            path_matches(full_path, TypedPath::unix(partial_path)),
+            expected
+        );
+    }
+
+    #[test_case(r"C:\Users\me\src\main.rs", true; "identical absolute path")]
+    #[test_case(r"c:\users\me\SRC\Main.rs", true; "absolute path with different case")]
+    #[test_case(r"src\main.rs", true; "partial sub path")]
+    #[test_case(r"Main.rs", true; "file name with different case")]
+    #[test_case(r"C:\Users\me\src\lib.rs", false; "different file name")]
+    fn path_matches_windows(partial_path: &str, expected: bool) {
+        let full_path = TypedPath::windows(r"C:\Users\me\src\main.rs");
+
+        assert_eq!(
+            path_matches(full_path, TypedPath::windows(partial_path)),
+            expected
+        );
+    }
+
+    /// DWARF info that a Windows compiler emitted can be inspected on a Unix host, and the other
+    /// way around.
+    #[test_case(TypedPath::windows(r"C:\Users\me\src\main.rs"), TypedPath::unix("src/main.rs"), true; "unix partial path against windows full path")]
+    #[test_case(TypedPath::windows(r"C:\Users\me\src\main.rs"), TypedPath::unix("SRC/Main.rs"), true; "unix partial path with different case")]
+    #[test_case(TypedPath::unix("/home/user/src/main.rs"), TypedPath::windows(r"src\main.rs"), true; "windows partial path against unix full path")]
+    #[test_case(TypedPath::windows(r"C:\Users\me\src\main.rs"), TypedPath::unix("src/lib.rs"), false; "unix partial path with different file name")]
+    fn path_matches_mixed_flavours(full_path: TypedPath, partial_path: TypedPath, expected: bool) {
+        assert_eq!(path_matches(full_path, partial_path), expected);
     }
 }
