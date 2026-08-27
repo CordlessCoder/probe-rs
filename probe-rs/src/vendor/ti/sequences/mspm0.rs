@@ -13,13 +13,21 @@
 //! The values here are transcribed from TI's own low-power-mode patches shipped in the MSPM0 SDK
 //! (`tools/keil/low_power_mode_patch/*.pdsc` `DebugPortStart` sequences, cross-checked against
 //! `tools/iar/low_power_mode_patch/*.dmac` `_InhibitSleepForceActive()`).
+//!
+//! Resets go through SYSCTL when the caller has armed the reset catch, because `AIRCR.SYSRESETREQ`
+//! only resets the CPU here and leaves the peripherals as the flash algorithm left them. Without
+//! the catch the stock reset is used instead — see [`MSPM0::reset_system`].
 
 use std::sync::Arc;
 
+use crate::architecture::arm::core::armv7m::Demcr;
 use crate::architecture::arm::dp::DpAddress;
 use crate::architecture::arm::memory::ArmMemoryInterface;
-use crate::architecture::arm::sequences::ArmDebugSequence;
+use crate::architecture::arm::sequences::{
+    ArmDebugSequence, cortex_m_reset_system, cortex_m_wait_for_reset,
+};
 use crate::architecture::arm::{ArmError, DapAccess, FullyQualifiedApAddress};
+use crate::core::MemoryMappedRegister;
 use probe_rs_target::CoreType;
 
 /// Access Port Select values used by this sequence.
@@ -66,6 +74,19 @@ const DPREC0_DEBUG_ENABLE: u32 =
 
 /// `SPREC.SYS RST`.
 const SPREC_SYS_RST: u32 = 1 << 0;
+
+/// `SYSCTL.RESETLEVEL` — selects the level of the next software-triggered reset.
+const SYSCTL_RESETLEVEL: u64 = 0x400B_0300;
+/// `SYSCTL.RESETCMD` — executes the reset selected by `RESETLEVEL`.
+const SYSCTL_RESETCMD: u64 = 0x400B_0304;
+
+/// `RESETLEVEL.LEVEL` = 0: SYSRST, resetting the CPU and the peripherals.
+///
+/// Level 1 (BOOTRST) would additionally run the boot configuration routine, which parks a blank
+/// device in STANDBY0.
+const RESETLEVEL_SYSRST: u32 = 0;
+/// `RESETCMD.GO` together with the `RESETCMD.KEY` value of `0xE4` it has to be written with.
+const RESETCMD_GO: u32 = 0xE400_0001;
 
 /// Marker struct indicating initialization sequencing for MSPM0 family parts.
 #[derive(Debug)]
@@ -185,6 +206,39 @@ impl ArmDebugSequence for MSPM0 {
 
         Ok(())
     }
+
+    fn reset_system(
+        &self,
+        interface: &mut dyn ArmMemoryInterface,
+        _core_type: CoreType,
+        _debug_base: Option<u64>,
+    ) -> Result<(), ArmError> {
+        // `AIRCR.SYSRESETREQ` is a CPU-only reset on this device and leaves every peripheral
+        // untouched (TRM section 2.4.1.1.5), so state a flash algorithm left behind survives it.
+        // TI's algorithms clear `CPUSS.CTL` in `Init` to turn off the prefetcher and both caches,
+        // and their `UnInit` is a stub, so an application flashed by probe-rs would run with flash
+        // accesses slowed down until the next power cycle. SYSCTL's SYSRST clears the CPU and the
+        // peripherals both (SLAAEO5 section 6), which is what puts `CPUSS.CTL` back.
+        //
+        // Only do that when the caller has armed the reset catch. SYSRST restarts the core, which
+        // then runs from whatever the reset vector holds; on a device with erased MAIN that is
+        // 0xFFFFFFFF, and the core faults, locks up and takes the access ports down with it. The
+        // part is then reachable only through TI's `xds110reset`. `reset_and_halt` arms the catch
+        // and is the path flashing resets through, so SYSRST is both needed and safe there. A bare
+        // `Core::reset` is neither, and gets the stock reset that probe-rs used before.
+        let demcr = Demcr(interface.read_word_32(Demcr::get_mmio_address())?);
+        if !demcr.vc_corereset() {
+            return cortex_m_reset_system(interface);
+        }
+
+        interface.write_word_32(SYSCTL_RESETLEVEL, RESETLEVEL_SYSRST)?;
+
+        // The device resets while this write is still in flight, so its acknowledge is unreliable.
+        interface.write_word_32(SYSCTL_RESETCMD, RESETCMD_GO).ok();
+        interface.flush().ok();
+
+        cortex_m_wait_for_reset(interface)
+    }
 }
 
 #[cfg(test)]
@@ -198,6 +252,15 @@ mod tests {
         assert_eq!(DPREC0_DEBUG_ENABLE, 0x0019_0008);
         assert_eq!(DPREC0_DEBUG_ENABLE | DPREC0_STICKY, 0x00F9_0008);
         assert_eq!(DPREC0_FORCEACTIVE, 0x0000_0008);
+    }
+
+    /// The SYSCTL reset command from SLAAEO5 table 6-1, pinned so the key cannot go missing.
+    #[test]
+    fn sysctl_reset_matches_ti_documentation() {
+        assert_eq!(SYSCTL_RESETLEVEL, 0x400B_0300);
+        assert_eq!(SYSCTL_RESETCMD, 0x400B_0304);
+        assert_eq!(RESETLEVEL_SYSRST, 0);
+        assert_eq!(RESETCMD_GO, 0xE400_0001);
     }
 
     #[test]
@@ -226,6 +289,7 @@ mod tests {
         let names = [
             "MSPM0C1104",
             "MSPM0L1306",
+            "MSPM0L2117",
             "MSPM0L2228",
             "MSPM0G3507",
             "MSPM0G5187",
