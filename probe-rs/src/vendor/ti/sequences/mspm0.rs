@@ -19,20 +19,26 @@
 //! the catch the stock reset is used instead — see [`MSPM0::reset_system`].
 
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::architecture::arm::core::armv7m::Demcr;
 use crate::architecture::arm::dp::DpAddress;
 use crate::architecture::arm::memory::ArmMemoryInterface;
 use crate::architecture::arm::sequences::{
-    ArmDebugSequence, cortex_m_reset_system, cortex_m_wait_for_reset,
+    ArmDebugSequence, ArmDebugSequenceError, cortex_m_reset_system, cortex_m_wait_for_reset,
 };
-use crate::architecture::arm::{ArmError, DapAccess, FullyQualifiedApAddress};
+use crate::architecture::arm::traits::Pins;
+use crate::architecture::arm::{ArmDebugInterface, ArmError, DapAccess, FullyQualifiedApAddress};
 use crate::core::MemoryMappedRegister;
+use crate::session::MissingPermissions;
 use probe_rs_target::CoreType;
 
 /// Access Port Select values used by this sequence.
 #[derive(Debug, Clone, Copy)]
 enum ApSel {
+    /// SEC-AP: the mailbox the boot ROM services, used to recover an inaccessible device.
+    SecAp = 2,
     /// PWR-AP: controls the power and reset state of the CPU for debug purposes.
     PwrAp = 4,
 }
@@ -74,6 +80,29 @@ const DPREC0_DEBUG_ENABLE: u32 =
 
 /// `SPREC.SYS RST`.
 const SPREC_SYS_RST: u32 = 1 << 0;
+
+/// SEC-AP `TXDATA`, the word passed alongside a mailbox command.
+const TXDATA: u64 = 0x00;
+/// SEC-AP `TXCTL`. The command goes here as-is; bit 0 is `TXVLD`, which the ROM drives.
+const TXCTL: u64 = 0x04;
+/// SEC-AP `RXDATA`, the boot ROM's answer.
+const RXDATA: u64 = 0x08;
+/// SEC-AP `RXCTL`. Bit 0 is `RXVLD`, and reading `RXDATA` clears it.
+const RXCTL: u64 = 0x0C;
+
+/// `RXCTL.RXVLD`.
+const RXCTL_RX_VALID: u32 = 1 << 0;
+
+/// DSSM "Mass Erase": erases MAIN and leaves NONMAIN, and so the debug access policy, alone.
+///
+/// The alternative, "Factory Reset" (`0x020A`), also erases NONMAIN and restores TI's defaults.
+/// That is a bigger hammer than an unreachable AHB-AP warrants.
+const DSSM_MASS_ERASE: u32 = 0x020C;
+/// What the boot ROM leaves in `RXDATA` when it has serviced a command.
+const DSSM_RESPONSE_OK: u32 = 0x0001_0003;
+
+/// Access port identification register, the same offset on every ADIv5 AP.
+const AP_IDR: u64 = 0xFC;
 
 /// `SYSCTL.RESETLEVEL` — selects the level of the next software-triggered reset.
 const SYSCTL_RESETLEVEL: u64 = 0x400B_0300;
@@ -158,6 +187,62 @@ impl MSPM0 {
 
         Ok(())
     }
+
+    /// Erase MAIN through the boot ROM's mailbox, recovering a device whose AHB-AP is gone.
+    ///
+    /// The mailbox is only read by the boot code, and only out of a BOOTRST, so the command has to
+    /// be staged before the reset rather than issued after it. A system reset through the PWR-AP is
+    /// a lower reset level and does not run the boot code, which leaves the reset pin as the only
+    /// way in from here (SLAAEO5 section 4).
+    fn dssm_mass_erase(&self, interface: &mut dyn ArmDebugInterface) -> Result<(), ArmError> {
+        let sec_ap: FullyQualifiedApAddress = ApSel::SecAp.into();
+
+        interface.write_raw_ap_register(&sec_ap, TXCTL, DSSM_MASS_ERASE)?;
+        interface.write_raw_ap_register(&sec_ap, TXDATA, 0)?;
+
+        // Drain anything an earlier command left in the receive side, or its answer will be
+        // mistaken for this one's.
+        let _ = interface.read_raw_ap_register(&sec_ap, RXDATA);
+        let _ = interface.read_raw_ap_register(&sec_ap, RXCTL);
+        let _ = interface.flush();
+        thread::sleep(Duration::from_millis(500));
+
+        let mut pins = Pins(0);
+        pins.set_nreset(true);
+        interface.swj_pins(0, pins.0 as u32, 0)?;
+        thread::sleep(Duration::from_millis(50));
+        interface.swj_pins(pins.0 as u32, pins.0 as u32, 0)?;
+
+        let start = Instant::now();
+        loop {
+            let rxctl = interface.read_raw_ap_register(&sec_ap, RXCTL).unwrap_or(0);
+            if rxctl & RXCTL_RX_VALID != 0 {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(2) {
+                return Err(ArmDebugSequenceError::custom(
+                    "MSPM0: the boot ROM did not answer the mass erase command",
+                )
+                .into());
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        // Reading RXDATA clears RXVLD, so this order matters.
+        let response = interface.read_raw_ap_register(&sec_ap, RXDATA)?;
+        let echoed = interface.read_raw_ap_register(&sec_ap, RXCTL)?;
+
+        if response != DSSM_RESPONSE_OK || echoed != DSSM_MASS_ERASE & 0xFF {
+            return Err(ArmDebugSequenceError::custom(format!(
+                "MSPM0: mass erase rejected, RXDATA {response:#010x} RXCTL {echoed:#010x}"
+            ))
+            .into());
+        }
+
+        tracing::info!("{}: main flash erased, device recovered", self.name);
+
+        Ok(())
+    }
 }
 
 impl ArmDebugSequence for MSPM0 {
@@ -205,6 +290,34 @@ impl ArmDebugSequence for MSPM0 {
         )?;
 
         Ok(())
+    }
+
+    fn debug_device_unlock(
+        &self,
+        interface: &mut dyn ArmDebugInterface,
+        default_ap: &FullyQualifiedApAddress,
+        permissions: &crate::Permissions,
+    ) -> Result<(), ArmError> {
+        // Everything past this point needs the AHB-AP. If it answers, there is nothing to recover.
+        if matches!(interface.read_raw_ap_register(default_ap, AP_IDR), Ok(idr) if idr != 0) {
+            return Ok(());
+        }
+
+        tracing::warn!(
+            "{}: the AHB-AP is not responding. Either the device is in a low-power mode that \
+             disables PD1, or main flash holds an image that faults the core as soon as it runs.",
+            self.name
+        );
+
+        // The only way back is to erase what the core is running, so this needs saying out loud
+        // rather than happening quietly on an ordinary attach.
+        permissions
+            .erase_all()
+            .map_err(|MissingPermissions(desc)| ArmError::MissingPermissions(desc))?;
+
+        self.dssm_mass_erase(interface)?;
+
+        Err(ArmError::ReAttachRequired)
     }
 
     fn reset_system(
