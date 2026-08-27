@@ -1,0 +1,118 @@
+name: MSPM0L211X Series
+manufacturer:
+  id: 0x17
+  cc: 0x0
+variants:
+- name: MSPM0L2116
+  cores:
+  - name: main
+    type: armv6m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: IROM1
+    range:
+      start: 0x0
+      end: 0x10000
+    cores:
+    - main
+    access:
+      boot: true
+  - !Ram
+    name: IRAM1
+    range:
+      start: 0x20200000
+      end: 0x20203000
+    cores:
+    - main
+  - !Generic
+    name: NonMain
+    range:
+      start: 0x41c00000
+      end: 0x41c00200
+    cores:
+    - main
+    access:
+      write: false
+      execute: false
+  - !Generic
+    name: Factory
+    range:
+      start: 0x41c40000
+      end: 0x41c40080
+    cores:
+    - main
+    access:
+      write: false
+      execute: false
+  flash_algorithms:
+  - mspm0l211x_main_128kb
+- name: MSPM0L2117
+  cores:
+  - name: main
+    type: armv6m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: IROM1
+    range:
+      start: 0x0
+      end: 0x20000
+    cores:
+    - main
+    access:
+      boot: true
+  - !Ram
+    name: IRAM1
+    range:
+      start: 0x20200000
+      end: 0x20203000
+    cores:
+    - main
+  - !Generic
+    name: NonMain
+    range:
+      start: 0x41c00000
+      end: 0x41c00200
+    cores:
+    - main
+    access:
+      write: false
+      execute: false
+  - !Generic
+    name: Factory
+    range:
+      start: 0x41c40000
+      end: 0x41c40080
+    cores:
+    - main
+    access:
+      write: false
+      execute: false
+  flash_algorithms:
+  - mspm0l211x_main_128kb
+flash_algorithms:
+- name: mspm0l211x_main_128kb
+  description: MSPM0L211X MAIN
+  default: true
+  instructions: gLUArwVIAHgBKATRUCAAIQDwpPiAvQEggL3ARiAEICCAtQCvAUYISAJ4ASoH0YoKgGiQQgXZQCAA8JD4gL0BIIC9AkiAvcBGIAQgIAEAAICwtQKvDkgDeA5JACsB0ENoC2ABIwNwUh4EKg/SCmgHJBVGpUMNYAhJCWgISQloA3AHSwtAQmCDYAAgsL0A8KT4IAQgIAATQEAABAtAGADEQf8PAADwtQOvh7AERh5IA3gBKzHRowqAaJhCL9kVRgApLtADlAAm9EMFlASUCCkCkQpGANMIIgSoKUYBkgDwgPgA8Fb4E0gGYEZghmAEZAEgD0kIYAOczGEEmMhiBZgIY/8gCGIA8FT4ACgK0QGYLRgCmQkaCDTS5wEgAuADSADgACAHsPC9wEYgBCAgAQAAgAThDEDQ4QxAgLUArwVJCHgBKAXRSGgEShBgACAIcIC9ASCAvSAEICAAE0BAsLUCrwxGBUYA8BT4B0gAIQFgQWCBYMlDAWQCIChDBEkIYMxhAPAW+LC9wEbQ4QxABOEMQIC1AK8ESAUhQWABIQFgA0gBaEkH/NSAvQDhDEDQ4wxAgLUArwZIASEBYAZKEGjDB/zQggcB1QAggL3JBwhDgL0A4QxA0OMMQIC1AK8A3v7egLUArwDwAfiAvfC1A6+NsBAqFtMWRkNCAyIEkhNABpPFGKhCLNIGmlMeACoCRgxGGNAKeAJwBpwBLAjRTBxCHBDgA0aeGLNCANLK4OvgSnhCcAIsAtGMHIIcA+CKeIJwzBzCHAMrC9MjeBNwY3hTcKN4k3DjeNNwJB0SHapC89EGnDYbA5YEmpZDqxkMGQWUFEBL0ACWApAAIgySDKgAGSZGBCQBlqQb5gcD0AWaEngCcAEipAcC1QWcpFqEUgGYBkbCAAycKB2YQgiSQ9JwQg4YUEIJlBgkBEAHlAKYBpkJndVABpZyGAmSVmgyRgecokAqQ0JQQhgURgg0nEIv0gic5kAJnKVoCZUHnKVANUNVYAgwRRgqHQaeCDaaQgia3tNwGAaQAZoJnB/gnUJQ0gWaEWgCxZ1CS9JRaALFnUJH0pFoAsWdQkPS0WgCxRAynULu0z3gBZgyRoAbBpAF4AmYAB0GkBUdNEYBmgupACYOcAqoBnABKjBGMkYBlgjQBphBeQB5C6oQcAoCAiEBkQqpCZQHkAWYwAcK0AaYAB0BnoBdCHALqAB4B5AKqAB4BgQImEFCBpEYIQacIUAyQweeMkOKQAmZwUARQylgApgAngOaBJkKQAWZiRmeGLNCIdIDJBRAUh4ALA7QDXgdcAEsBNFJHFscAyoI0hPgTXhdcAIsEdGJHJscAyoL0wp4GnBKeFpwiniacMp42nAJHRsds0Lz0Q2w8L2MeJxwyRzbHAMq69L25wAAAAAAAAAAAAAAAA==
+  load_address: 0x20200008
+  pc_init: 0x51
+  pc_uninit: 0x139
+  pc_program_page: 0xa5
+  pc_erase_sector: 0x21
+  pc_erase_all: 0x1
+  data_section_offset: 0x424
+  flash_properties:
+    address_range:
+      start: 0x0
+      end: 0x20000
+    page_size: 0x400
+    erased_byte_value: 0xff
+    program_page_timeout: 1000
+    erase_sector_timeout: 3000
+    sectors:
+    - size: 0x400
+      address: 0x0

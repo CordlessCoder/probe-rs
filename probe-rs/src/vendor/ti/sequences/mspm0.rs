@@ -495,6 +495,7 @@ mod tests {
         let names = [
             "MSPM0C1104",
             "MSPM0L1306",
+            "MSPM0L2117",
             "MSPM0L2228",
             "MSPM0G3507",
             "MSPM0G5187",
