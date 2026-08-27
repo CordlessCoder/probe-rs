@@ -120,6 +120,11 @@ pub struct Debugger {
     /// end of that session (in [`Self::debug_session_impl`]); `None` in local mode and between
     /// sessions in TCP multi-session mode.
     uploaded_files: Option<UploadedFiles>,
+
+    /// Optional RPC session already attached by the CLI (for example after
+    /// `cli::flash`). When set, [`SessionData::new_rpc_backed`] reuses it
+    /// instead of calling `probe/attach` again.
+    pub(crate) preattached_session: Option<probe_rs_rpc_client::SessionInterface>,
 }
 
 impl Debugger {
@@ -135,6 +140,7 @@ impl Debugger {
             svd_timestamp: None,
             debug_logger: DebugLogger::new(log_file)?,
             uploaded_files: None,
+            preattached_session: None,
         };
 
         debugger
@@ -657,8 +663,13 @@ impl Debugger {
 
         self.config.validate_config_files()?;
 
-        let mut session_data =
-            SessionData::new_rpc_backed(client, &mut self.config, timestamp_offset).await?;
+        let mut session_data = SessionData::new_rpc_backed(
+            client,
+            &mut self.config,
+            timestamp_offset,
+            self.preattached_session.take(),
+        )
+        .await?;
 
         debug_adapter.halt_after_reset = self.config.flashing_config.halt_after_reset;
 
@@ -1555,8 +1566,7 @@ mod test {
         // `FakeProbe` is visible to `probe/attach`), and drive the DAP
         // session through `RpcBackend` — the same path production uses.
         let probe_broker = Arc::new(crate::rpc::probe_broker::ProbeBroker::new());
-        let (mut local_server, tx, rx) =
-            RpcApp::create_server_with_lister(16, lister, probe_broker);
+        let (local_server, tx, rx) = RpcApp::create_server_with_lister(16, lister, probe_broker);
         let handle = tokio::spawn(async move { local_server.run().await });
 
         let client = RpcClient::new_local_from_wire(tx, rx);
