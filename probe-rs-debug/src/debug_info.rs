@@ -8,8 +8,8 @@ use super::{
 };
 use crate::{SourceLocation, VerifiedBreakpoint, stack_frame::StackFrameInfo, unit_info::RangeExt};
 use gimli::{
-    BaseAddresses, DebugFrame, RunTimeEndian, UnwindContext, UnwindSection, UnwindTableRow,
-    read::RegisterRule,
+    BaseAddresses, DebugFrame, DebugInfoOffset, RunTimeEndian, UnwindContext, UnwindSection,
+    UnwindTableRow, read::RegisterRule,
 };
 use object::read::{Object, ObjectSection};
 use probe_rs::{
@@ -38,8 +38,6 @@ pub(crate) type DwarfReader = gimli::read::EndianArcSlice<RunTimeEndian>;
 pub struct DebugInfo {
     pub(crate) dwarf: gimli::Dwarf<DwarfReader>,
     pub(crate) frame_section: gimli::DebugFrame<DwarfReader>,
-    pub(crate) locations_section: gimli::LocationLists<DwarfReader>,
-    pub(crate) address_section: gimli::DebugAddr<DwarfReader>,
     pub(crate) debug_line_section: gimli::DebugLine<DwarfReader>,
 
     pub(crate) unit_infos: Vec<UnitInfo>,
@@ -49,7 +47,7 @@ pub struct DebugInfo {
     ///
     /// Wrapped in a [`Mutex`] because `addr2line::Loader` is `Send` but not
     /// `Sync`, while [`DebugInfo`] must be both so an RPC server can share it.
-    pub(crate) addr2line: Option<Mutex<addr2line::Loader>>,
+    pub(crate) addr2line: Option<Mutex<Box<addr2line::Loader>>>,
 }
 
 impl DebugInfo {
@@ -58,7 +56,10 @@ impl DebugInfo {
         let data = std::fs::read(path.as_ref())?;
 
         let mut this = DebugInfo::from_raw(&data)?;
-        this.addr2line = addr2line::Loader::new(path).ok().map(Mutex::new);
+        this.addr2line = addr2line::Loader::new(path)
+            .ok()
+            .map(Box::new)
+            .map(Mutex::new);
         Ok(this)
     }
 
@@ -90,10 +91,6 @@ impl DebugInfo {
 
         use gimli::Section;
         let mut frame_section = gimli::DebugFrame::load(load_section)?;
-        let address_section = gimli::DebugAddr::load(load_section)?;
-        let debug_loc = gimli::DebugLoc::load(load_section)?;
-        let debug_loc_lists = gimli::DebugLocLists::load(load_section)?;
-        let locations_section = gimli::LocationLists::new(debug_loc, debug_loc_lists);
         let debug_line_section = gimli::DebugLine::load(load_section)?;
 
         let mut unit_infos = Vec::new();
@@ -117,12 +114,21 @@ impl DebugInfo {
         Ok(DebugInfo {
             dwarf: dwarf_cow,
             frame_section,
-            locations_section,
-            address_section,
             debug_line_section,
             unit_infos,
             endianness,
             addr2line: None,
+        })
+    }
+
+    pub(crate) fn call_site_value(
+        &self,
+        return_pc: u64,
+        location: &gimli::Expression<GimliReader>,
+    ) -> Option<(&UnitInfo, gimli::Expression<GimliReader>)> {
+        self.unit_infos.iter().find_map(|unit| {
+            unit.call_site_value(return_pc, location)
+                .map(|expression| (unit, expression))
         })
     }
 
@@ -146,14 +152,9 @@ impl DebugInfo {
 
         use gimli::Section;
         let load = || -> Result<Self, gimli::Error> {
-            let debug_loc = gimli::DebugLoc::load(load_section)?;
-            let debug_loc_lists = gimli::DebugLocLists::load(load_section)?;
-
             Ok(DebugInfo {
                 dwarf: gimli::Dwarf::load(&load_section)?,
                 frame_section: gimli::DebugFrame::load(load_section)?,
-                locations_section: gimli::LocationLists::new(debug_loc, debug_loc_lists),
-                address_section: gimli::DebugAddr::load(load_section)?,
                 debug_line_section: gimli::DebugLine::load(load_section)?,
                 unit_infos: Vec::new(),
                 endianness,
@@ -284,6 +285,22 @@ impl DebugInfo {
         Ok(function_variable_cache)
     }
 
+    fn unit_info_at(&self, header_offset: DebugInfoOffset) -> Result<&UnitInfo, DebugError> {
+        self.unit_infos
+            .iter()
+            .find(|unit_info| {
+                unit_info
+                    .unit
+                    .header
+                    .offset()
+                    .to_debug_info_offset(&unit_info.unit)
+                    == Some(header_offset)
+            })
+            .ok_or_else(|| {
+                DebugError::Other("Failed to find unit info for offset lookup.".to_string())
+            })
+    }
+
     /// This effects the on-demand expansion of lazy/deferred load of all the 'child' `Variable`s for a given 'parent'.
     #[tracing::instrument(level = "trace", skip_all, fields(parent_variable = ?parent_variable.variable_key()))]
     pub fn cache_deferred_variables(
@@ -291,7 +308,7 @@ impl DebugInfo {
         cache: &mut VariableCache,
         memory: &mut dyn MemoryInterface,
         parent_variable: &mut Variable,
-        frame_info: StackFrameInfo<'_>,
+        frame_info: &StackFrameInfo<'_>,
     ) -> Result<(), DebugError> {
         if !parent_variable.is_valid() {
             // Do nothing. The parent_variable.get_value() will already report back the debug_error value.
@@ -304,20 +321,20 @@ impl DebugInfo {
         }
 
         match parent_variable.variable_node_type {
+            VariableNodeType::PointerTarget(header_offset, type_offset) => {
+                let unit_info = self.unit_info_at(header_offset)?;
+                unit_info.resolve_pointer_target(
+                    self,
+                    type_offset,
+                    parent_variable,
+                    memory,
+                    cache,
+                    frame_info,
+                )?;
+            }
             VariableNodeType::TypeOffset(header_offset, unit_offset)
             | VariableNodeType::DirectLookup(header_offset, unit_offset) => {
-                let Some(unit_info) = self.unit_infos.iter().find(|unit_info| {
-                    unit_info
-                        .unit
-                        .header
-                        .offset()
-                        .to_debug_info_offset(&unit_info.unit)
-                        == Some(header_offset)
-                }) else {
-                    return Err(DebugError::Other(
-                        "Failed to find unit info for offset lookup.".to_string(),
-                    ));
-                };
+                let unit_info = self.unit_info_at(header_offset)?;
 
                 // Find the parent node
                 let mut type_tree = unit_info.unit.entries_tree(Some(unit_offset))?;
@@ -326,6 +343,17 @@ impl DebugInfo {
                 unit_info.process_tree(
                     self,
                     parent_node,
+                    parent_variable,
+                    memory,
+                    cache,
+                    frame_info,
+                )?;
+
+                // Members are in the cache. `process_struct` can rewrite them now.
+                let mut type_tree = unit_info.unit.entries_tree(Some(unit_offset))?;
+                unit_info.process_struct(
+                    self,
+                    type_tree.root()?.entry(),
                     parent_variable,
                     memory,
                     cache,
@@ -347,13 +375,10 @@ impl DebugInfo {
                     let unit_node = entries.next_dfs()?.unwrap();
                     let unit_offset = unit_node.offset();
 
-                    let mut type_tree = unit_info.unit.entries_tree(Some(unit_offset))?;
-                    let parent_node = type_tree.root()?;
-
-                    unit_info.process_tree(
+                    unit_info.collect_static_variables(
                         self,
-                        parent_node,
-                        parent_variable,
+                        unit_offset,
+                        parent_variable.variable_key(),
                         memory,
                         cache,
                         frame_info,
@@ -393,7 +418,7 @@ impl DebugInfo {
             gimli::DW_LANG_C_plus_plus_14,
         ] {
             if let Some(demangle) = addr2line::demangle(&fn_name, lang) {
-                fn_name = demangle;
+                fn_name = crate::language::from_dwarf(lang).compact_debug_name(&demangle);
                 break;
             }
         }
@@ -444,10 +469,11 @@ impl DebugInfo {
         let frame_base = functions[0].frame_base(
             self,
             memory,
-            StackFrameInfo {
+            &StackFrameInfo {
                 registers: unwind_registers,
                 frame_base: None,
                 canonical_frame_address: cfa,
+                caller: None,
             },
         )?;
 
@@ -1006,20 +1032,6 @@ impl DebugInfo {
         )))
     }
 
-    /// Look up the DIE reference for the given attribute, if it exists.
-    pub(crate) fn resolve_die_reference<'debug_info, 'unit_info>(
-        &'debug_info self,
-        attribute: gimli::DwAt,
-        die: &Die,
-        unit_info: &'unit_info UnitInfo,
-    ) -> Option<Die>
-    where
-        'unit_info: 'debug_info,
-    {
-        self.resolve_die_reference_with_unit_info(attribute, die, unit_info)
-            .map(|(_, die)| die)
-    }
-
     /// Look up the DIE reference for the given attribute, returning both the resolved DIE
     /// and the compilation unit it belongs to.
     ///
@@ -1059,30 +1071,36 @@ impl DebugInfo {
             gimli::AttributeValue::UnitRef(unit_ref) => {
                 Ok((unit_info, unit_info.unit.entry(unit_ref)?))
             }
-            gimli::AttributeValue::DebugInfoRef(offset) => {
-                for unit_info in &self.unit_infos {
-                    let Some(unit_offset) = offset.to_unit_offset(&unit_info.unit.header) else {
-                        continue;
-                    };
-
-                    let entry = unit_info.unit.entry(unit_offset).map_err(|error| {
-                        DebugError::Other(format!(
-                            "Error reading DIE at debug info offset {:#x} : {}",
-                            offset.0, error
-                        ))
-                    })?;
-                    return Ok((unit_info, entry));
-                }
-
-                Err(DebugError::Other(format!(
-                    "Unable to find unit info for debug info offset {:#x}",
-                    offset.0
-                )))
-            }
+            gimli::AttributeValue::DebugInfoRef(offset) => self.entry_at_debug_info_offset(offset),
             other_attribute_value => Err(DebugError::Other(format!(
                 "Unimplemented attribute value {other_attribute_value:?}"
             ))),
         }
+    }
+
+    /// Returns the UnitInfo and DIE at the given offset into the debug info.
+    pub(crate) fn entry_at_debug_info_offset(
+        &self,
+        offset: gimli::DebugInfoOffset,
+    ) -> Result<(&UnitInfo, Die), DebugError> {
+        for unit_info in &self.unit_infos {
+            let Some(unit_offset) = offset.to_unit_offset(&unit_info.unit.header) else {
+                continue;
+            };
+
+            let entry = unit_info.unit.entry(unit_offset).map_err(|error| {
+                DebugError::Other(format!(
+                    "Error reading DIE at debug info offset {:#x} : {}",
+                    offset.0, error
+                ))
+            })?;
+            return Ok((unit_info, entry));
+        }
+
+        Err(DebugError::Other(format!(
+            "Unable to find unit info for debug info offset {:#x}",
+            offset.0
+        )))
     }
 }
 
@@ -1238,7 +1256,7 @@ pub fn unwind_pc_without_debuginfo(
     ControlFlow::Continue(())
 }
 
-/// A per_register unwind, applying register rules and updating the [`registers::DebugRegister`] value as appropriate, before returning control to the calling function.
+/// A per_register unwind, applying register rules and updating the [`crate::DebugRegister`] value as appropriate, before returning control to the calling function.
 pub fn unwind_register(
     debug_register: &super::DebugRegister,
     // The callee_frame_registers are used to lookup values and never updated.
@@ -1472,7 +1490,7 @@ fn add_to_address(address: u64, offset: i64, address_size_in_bytes: usize) -> u6
 #[cfg(test)]
 mod test {
     use crate::{
-        DebugInfo, DebugRegister, DebugRegisters,
+        DebugInfo, DebugRegister, DebugRegisters, ObjectRef, VariableCache,
         exception_handling::{
             armv6m::ArmV6MExceptionHandler, armv7m::ArmV7MExceptionHandler,
             exception_handler_for_core,
@@ -1482,7 +1500,7 @@ mod test {
 
     use gimli::RegisterRule;
     use probe_rs::{
-        CoreDump, RegisterValue,
+        CoreDump, MemoryInterface, RegisterValue,
         architecture::arm::core::registers::cortex_m::{self, CORTEX_M_CORE_REGISTERS},
         test::MockMemory,
     };
@@ -2018,6 +2036,9 @@ mod test {
         insta::assert_snapshot!(printed_backtrace);
     }
 
+    /// A pointer graph can be cyclic, so the walk stops at a fixed depth.
+    const MAX_VARIABLE_DEPTH: usize = 14;
+
     #[test_case("RP2040_full_unwind"; "full_unwind Armv6-m using RP2040")]
     #[test_case("RP2040_svcall"; "svcall Armv6-m using RP2040")]
     #[test_case("RP2040_systick"; "systick Armv6-m using RP2040")]
@@ -2036,6 +2057,8 @@ mod test {
     #[test_case("esp32s3_esp_hal_panic"; "Xtensa unwinding on an esp32s3 in a panic handler")]
     #[test_case("esp32c6_coredump_elf"; "Unwind using a RISC-V coredump in ELF format")]
     #[test_case("esp32s3_coredump_elf"; "Unwind using an Xtensa coredump in ELF format")]
+    #[test_case("async_esp32s3"; "Unwind an async embassy task on an ESP32-S3")]
+    #[test_case("async_esp32c6"; "Unwind an async embassy task on an ESP32-C6")]
     fn full_unwind(test_name: &str) {
         let debug_info =
             load_test_elf_as_debug_info(format!("debug-unwind-tests/{test_name}.elf").as_str());
@@ -2060,7 +2083,20 @@ mod test {
             .unwrap();
 
         // Expand and validate the static and local variables for each stack frame.
-        for frame in stack_frames.iter_mut() {
+        for i in 0..stack_frames.len() {
+            let caller_registers = stack_frames.get(i + 1).map(|frame| frame.registers.clone());
+            let caller_frame_base = stack_frames.get(i + 1).and_then(|frame| frame.frame_base);
+            let caller_cfa = stack_frames
+                .get(i + 1)
+                .and_then(|frame| frame.canonical_frame_address);
+            let caller = caller_registers.as_ref().map(|registers| StackFrameInfo {
+                registers,
+                frame_base: caller_frame_base,
+                canonical_frame_address: caller_cfa,
+                caller: None,
+            });
+
+            let frame = &mut stack_frames[i];
             let mut variable_caches = Vec::new();
             if let Some(local_variables) = &mut frame.local_variables {
                 variable_caches.push(local_variables);
@@ -2070,11 +2106,12 @@ mod test {
                 variable_cache.recurse_deferred_variables(
                     &debug_info,
                     &mut adapter,
-                    10,
-                    StackFrameInfo {
+                    MAX_VARIABLE_DEPTH,
+                    &StackFrameInfo {
                         registers: &frame.registers,
                         frame_base: frame.frame_base,
                         canonical_frame_address: frame.canonical_frame_address,
+                        caller: caller.as_ref(),
                     },
                 );
             }
@@ -2083,6 +2120,97 @@ mod test {
         // Using YAML output because it is easier to read than the default snapshot output,
         // and also because they provide better diffs.
         insta::assert_yaml_snapshot!(snapshot_name, stack_frames);
+    }
+
+    /// Expand every variable below `key` except a device register, and report how many device
+    /// registers the walk left unexpanded.
+    fn expand_around_registers(
+        cache: &mut VariableCache,
+        debug_info: &DebugInfo,
+        memory: &mut dyn MemoryInterface,
+        frame_info: &StackFrameInfo<'_>,
+        key: ObjectRef,
+        depth: usize,
+    ) -> usize {
+        let Some(mut variable) = cache.get_variable_by_key(key) else {
+            return 0;
+        };
+
+        if variable.type_name.ident() == Some("VolatileCell") {
+            // A read of the register flattens the wrapper away and replaces the value, so a
+            // deferred node is the proof that the walk left the register alone.
+            assert!(
+                variable.variable_node_type.is_deferred(),
+                "{:?} holds a device register, so the walk must not read it, but it read {:?}",
+                variable.name,
+                variable.value
+            );
+            return 1;
+        }
+
+        if depth == 0 {
+            return 0;
+        }
+
+        if debug_info
+            .cache_deferred_variables(cache, memory, &mut variable, frame_info)
+            .is_err()
+        {
+            return 0;
+        }
+
+        let children: Vec<_> = cache.get_children(key).map(|c| c.variable_key).collect();
+        children
+            .into_iter()
+            .map(|child| {
+                expand_around_registers(cache, debug_info, memory, frame_info, child, depth - 1)
+            })
+            .sum()
+    }
+
+    #[test]
+    fn a_device_register_does_not_expand_without_a_request() {
+        let debug_info = load_test_elf_as_debug_info("debug-unwind-tests/async_esp32s3.elf");
+        let coredump_path = coredump_path("debug-unwind-tests/async_esp32s3".to_string());
+        let mut adapter = CoreDump::load(&coredump_path).unwrap();
+
+        let initial_registers = DebugRegisters::from_coredump(&adapter);
+        let exception_handler = exception_handler_for_core(adapter.core_type());
+        let instruction_set = adapter.instruction_set();
+
+        let mut stack_frames = debug_info
+            .unwind(
+                &mut adapter,
+                initial_registers,
+                exception_handler.as_ref(),
+                Some(instruction_set),
+                1000,
+            )
+            .unwrap();
+
+        let mut registers = 0;
+        for frame in &mut stack_frames {
+            let frame_info = StackFrameInfo {
+                registers: &frame.registers,
+                frame_base: frame.frame_base,
+                canonical_frame_address: frame.canonical_frame_address,
+                caller: None,
+            };
+            let Some(cache) = &mut frame.local_variables else {
+                continue;
+            };
+            let root = cache.root_variable().variable_key;
+            registers += expand_around_registers(
+                cache,
+                &debug_info,
+                &mut adapter,
+                &frame_info,
+                root,
+                MAX_VARIABLE_DEPTH,
+            );
+        }
+
+        assert!(registers > 0, "the test found no device register to check");
     }
 
     #[test_case("RP2040_full_unwind"; "Armv6-m using RP2040")]
@@ -2107,11 +2235,12 @@ mod test {
         static_variables.recurse_deferred_variables(
             &debug_info,
             &mut adapter,
-            10,
-            StackFrameInfo {
+            MAX_VARIABLE_DEPTH,
+            &StackFrameInfo {
                 registers: &initial_registers,
                 frame_base: None,
                 canonical_frame_address: None,
+                caller: None,
             },
         );
         // Using YAML output because it is easier to read than the default snapshot output,

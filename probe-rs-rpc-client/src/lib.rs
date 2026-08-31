@@ -4,10 +4,12 @@
 //! Enable the `remote` feature for websocket, SSH, and unix socket transport.
 
 use postcard_rpc::{
-    Topic,
+    Topic, TopicDirection,
     header::{VarSeq, VarSeqKind},
-    host_client::{HostClient, HostClientConfig, HostErr, IoClosed, Subscription},
-    standard_icd::WireError,
+    host_client::{
+        HostClient, HostClientConfig, HostErr, IoClosed, SchemaError, SchemaReport, Subscription,
+    },
+    standard_icd::{GetAllSchemaDataTopic, GetAllSchemasEndpoint, OwnedSchemaData, WireError},
 };
 use postcard_schema::Schema;
 use serde::{Serialize, de::DeserializeOwned};
@@ -22,6 +24,7 @@ use std::{
     time::Duration,
 };
 
+mod schema;
 mod upload_cache;
 
 use upload_cache::UploadCache;
@@ -127,6 +130,10 @@ pub enum ClientError {
     /// The server does not know this endpoint. The client and the server
     /// versions may differ.
     UnknownEndpoint,
+    /// The RPC schema of the server does not match this client.
+    ///
+    /// Use the same probe-rs version for the client and the server.
+    IncompatibleServer,
     /// The server refused the request.
     #[display("{0}")]
     Remote(RpcError),
@@ -138,7 +145,7 @@ pub enum ClientError {
     FileRead(PathBuf, #[source] std::io::Error),
 }
 
-fn from_host_err(e: HostErr<WireError>) -> ClientError {
+pub(crate) fn from_host_err(e: HostErr<WireError>) -> ClientError {
     match e {
         HostErr::Wire(WireError::UnknownKey) => ClientError::UnknownEndpoint,
         HostErr::Wire(w) => ClientError::Transport(TransportError::Wire(w)),
@@ -160,7 +167,7 @@ async fn rpc_client_from_websocket<S>(
     ws_stream: tokio_tungstenite::WebSocketStream<S>,
     challenge: &str,
     token: Option<&str>,
-) -> Result<RpcClient, TransportError>
+) -> Result<RpcClient, ClientError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -182,7 +189,7 @@ where
         TransportError::Message(format!("Failed to send challenge response: {err:?}"))
     })?;
 
-    Ok(RpcClient::new_from_wire(
+    RpcClient::new_from_wire(
         tx,
         WebsocketRx::new(rx.map(|message| {
             message.map(|message| match message {
@@ -190,7 +197,9 @@ where
                 _ => Bytes::new(),
             })
         })),
-    ))
+    )
+    .ensure_compatible()
+    .await
 }
 
 /// Connect to a `probe-rs serve` server.
@@ -262,9 +271,7 @@ pub async fn connect(
         .to_str()
         .map_err(|_| TransportError::Message("Failed to parse challenge header".into()))?;
 
-    rpc_client_from_websocket(ws_stream, challenge, token)
-        .await
-        .map_err(ClientError::Transport)
+    rpc_client_from_websocket(ws_stream, challenge, token).await
 }
 
 #[cfg(all(feature = "remote", unix))]
@@ -281,7 +288,7 @@ pub async fn connect_unix(path: &str) -> Result<RpcClient, ClientError> {
     let tx = UnixStreamTx::new(writer);
     let rx = UnixStreamRx::new(reader);
 
-    Ok(RpcClient::new_from_wire(tx, rx))
+    RpcClient::new_from_wire(tx, rx).ensure_compatible().await
 }
 
 #[cfg(feature = "remote")]
@@ -396,6 +403,111 @@ impl RpcClient {
         let mut this = Self::new_from_wire(tx, rx);
         this.is_localhost = true;
         this
+    }
+
+    /// Fetch the schema of the server and refuse to continue when it does
+    /// not match the schema of this client.
+    pub async fn ensure_compatible(self) -> Result<Self, ClientError> {
+        self.check_compatibility().await?;
+        Ok(self)
+    }
+
+    async fn get_schema_report(
+        &self,
+        expected: &SchemaReport,
+    ) -> Result<SchemaReport, SchemaError<WireError>> {
+        // Our own copy of hostClient::get_schema_report so that we can tune capacity.
+        let expected_messages =
+            expected.endpoints.len() + expected.topics_in.len() + expected.topics_out.len();
+        let Ok(mut sub) = self
+            .client
+            .subscribe_multi::<GetAllSchemaDataTopic>(expected_messages)
+            .await
+        else {
+            return Err(SchemaError::Comms(HostErr::Closed));
+        };
+
+        let collect_task = tokio::task::spawn({
+            async move {
+                let mut got = vec![];
+                while let Ok(Ok(val)) =
+                    tokio::time::timeout(Duration::from_millis(500), sub.recv()).await
+                {
+                    got.push(val);
+                }
+                got
+            }
+        });
+        let trigger_task = self.client.send_resp::<GetAllSchemasEndpoint>(&()).await;
+        let data = collect_task.await;
+        let (resp, data) = match (trigger_task, data) {
+            (Ok(a), Ok(b)) => (a, b),
+            (Ok(_), Err(_)) => return Err(SchemaError::TaskError),
+            (Err(e), Ok(_)) => return Err(SchemaError::Comms(e)),
+            (Err(e1), Err(_e2)) => return Err(SchemaError::Comms(e1)),
+        };
+        let mut rpt = SchemaReport::default();
+        let mut e_and_t = vec![];
+
+        for d in data {
+            match d {
+                OwnedSchemaData::Type(d) => {
+                    rpt.add_type(d);
+                }
+                e @ OwnedSchemaData::Endpoint { .. } => e_and_t.push(e),
+                t @ OwnedSchemaData::Topic { .. } => e_and_t.push(t),
+            }
+        }
+
+        for e in e_and_t {
+            match e {
+                OwnedSchemaData::Type(_) => unreachable!(),
+                OwnedSchemaData::Endpoint {
+                    path,
+                    request_key,
+                    response_key,
+                } => {
+                    rpt.add_endpoint(path, request_key, response_key)?;
+                }
+                OwnedSchemaData::Topic {
+                    path,
+                    key,
+                    direction,
+                } => match direction {
+                    TopicDirection::ToServer => rpt.add_topic_in(path, key)?,
+                    TopicDirection::ToClient => rpt.add_topic_out(path, key)?,
+                },
+            }
+        }
+
+        let mut data_matches = true;
+        data_matches &= resp.endpoints_sent as usize == rpt.endpoints.len();
+        data_matches &= resp.topics_in_sent as usize == rpt.topics_in.len();
+        data_matches &= resp.topics_out_sent as usize == rpt.topics_out.len();
+        data_matches &= resp.errors == 0;
+
+        if data_matches {
+            // TODO: filter primitive types out?
+            Ok(rpt)
+        } else {
+            Err(SchemaError::LostData)
+        }
+    }
+
+    /// Fetch the schema of the server and compare it with the schema of this
+    /// client.
+    pub async fn check_compatibility(&self) -> Result<(), ClientError> {
+        let expected = schema::expected_schema_report()?;
+        let actual = self
+            .get_schema_report(&expected)
+            .await
+            .map_err(schema::from_schema_err)?;
+
+        if schema::schema_reports_match(&expected, &actual) {
+            Ok(())
+        } else {
+            Err(ClientError::IncompatibleServer)
+        }
     }
 
     async fn send<E, T>(&self, req: &E::Request) -> Result<T, ClientError>
@@ -754,10 +866,17 @@ impl SessionInterface {
         format: FormatOptions,
         image_target: Option<String>,
         read_flasher_rtt: bool,
+        rtt_client: Option<Key<RttClient>>,
     ) -> Result<BuildResult, ClientError> {
         let upload = self.client.resolve_upload(&path).await?;
-        self.build_flash_loader_resolved(&upload, format, image_target, read_flasher_rtt)
-            .await
+        self.build_flash_loader_resolved(
+            &upload,
+            format,
+            image_target,
+            read_flasher_rtt,
+            rtt_client,
+        )
+        .await
     }
 
     pub async fn build_flash_loader_resolved(
@@ -766,6 +885,7 @@ impl SessionInterface {
         mut format: FormatOptions,
         image_target: Option<String>,
         read_flasher_rtt: bool,
+        rtt_client: Option<Key<RttClient>>,
     ) -> Result<BuildResult, ClientError> {
         let path = upload.server_path().to_path_buf();
 
@@ -794,6 +914,7 @@ impl SessionInterface {
                 format,
                 image_target,
                 read_flasher_rtt,
+                rtt_client,
             })
             .await
     }
@@ -802,7 +923,6 @@ impl SessionInterface {
         &self,
         options: DownloadOptions,
         loader: Key<FlashLoader>,
-        rtt_client: Option<Key<RttClient>>,
         on_msg: impl AsyncFnMut(ProgressEvent),
     ) -> Result<(), ClientError> {
         self.client
@@ -811,7 +931,6 @@ impl SessionInterface {
                     sessid: self.sessid,
                     loader,
                     options,
-                    rtt_client,
                 },
                 on_msg,
             )

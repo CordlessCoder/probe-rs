@@ -11,7 +11,7 @@ pub mod debug_step;
 pub mod function_die;
 /// Programming languages
 pub(crate) mod language;
-/// Target Register definitions, expanded from [`crate::core::registers::CoreRegister`] to include unwind specific information.
+/// Target Register definitions, expanded from [`probe_rs::CoreRegister`] to include unwind specific information.
 pub mod registers;
 /// The source statement information used while identifying haltpoints for debug stepping and breakpoints.
 pub(crate) mod source_instructions;
@@ -83,7 +83,7 @@ pub enum DebugError {
     #[error("Non-UTF8 data found in debug data")]
     NonUtf8(#[from] Utf8Error),
     /// A probe-rs error occurred.
-    #[error("Error using the probe")]
+    #[error(transparent)]
     Probe(#[from] probe_rs::Error),
     /// A char could not be created from the given string.
     #[error(transparent)]
@@ -213,6 +213,21 @@ fn extract_file(
                 "Unable to extract file information from attribute value {:?}: Not implemented.",
                 other
             );
+            None
+        }
+    }
+}
+
+/// If a DW_AT_alignment attribute exists, return the u64 value, otherwise (including errors) return None
+fn extract_alignment(node_die: &DebuggingInformationEntry<GimliReader>) -> Option<u64> {
+    match node_die.attr(gimli::DW_AT_alignment)?.value() {
+        AttributeValue::Udata(alignment) => Some(alignment),
+        AttributeValue::Data1(alignment) => Some(alignment as u64),
+        AttributeValue::Data2(alignment) => Some(alignment as u64),
+        AttributeValue::Data4(alignment) => Some(alignment as u64),
+        AttributeValue::Data8(alignment) => Some(alignment),
+        other => {
+            tracing::warn!("Unimplemented: DW_AT_alignment value: {other:?}");
             None
         }
     }
