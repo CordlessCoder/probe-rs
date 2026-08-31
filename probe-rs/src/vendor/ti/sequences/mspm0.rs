@@ -239,7 +239,17 @@ impl MSPM0 {
             .into());
         }
 
-        tracing::info!("{}: main flash erased, device recovered", self.name);
+        // Warn rather than inform, for two reasons. The default stderr filter is `WARN`, so an
+        // `info!` here is invisible next to the warnings above it and the recovery reads as a
+        // failure. And the device is not out of trouble yet: main flash is blank, which is itself
+        // an image the core faults on, so a session that ends here leaves the part exactly as
+        // unreachable as it found it.
+        tracing::warn!(
+            "{}: main flash erased, device recovered. It is blank now, so the core will fault as \
+             soon as it is released — program the device in this session, or it will be \
+             unreachable again.",
+            self.name
+        );
 
         Ok(())
     }
