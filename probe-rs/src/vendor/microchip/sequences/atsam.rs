@@ -546,6 +546,9 @@ impl DebugEraseSequence for AtSAM {
 
         let mut memory = interface.memory_interface(mem_ap)?;
 
+        // Consent is established by `Session::sequence_erase_all` before this is reached, so the
+        // inner check here can only pass. It is kept because the inner function also uses the
+        // permission to choose between two failure messages.
         AtSAM::erase_all(self, &mut *memory, &Permissions::new().allow_erase_all())
     }
 }

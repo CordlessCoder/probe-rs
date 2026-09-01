@@ -1,0 +1,1 @@
+Vendor erase sequences now require the same erase-all permission as every other way of erasing a chip. `probe-rs erase` reached them without one, which mattered because the trait allows an implementation to reset non-volatile configuration as well as flash, and on some parts that configuration decides whether the device can be debugged at all.

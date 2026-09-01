@@ -53,6 +53,11 @@ pub struct Session {
     interfaces: ArchitectureInterface,
     cores: Vec<CombinedCoreState>,
     configured_trace_sink: Option<TraceSink>,
+    /// What the caller consented to when the session was opened.
+    ///
+    /// Kept for the lifetime of the session rather than consumed during attach, because operations
+    /// that need consent are not all reachable from the attach path.
+    permissions: Permissions,
 }
 
 /// The `SessionConfig` struct is used to configure a new `Session` during auto-attach.
@@ -333,6 +338,7 @@ impl Session {
                 interfaces,
                 cores,
                 configured_trace_sink: None,
+                permissions,
             };
 
             {
@@ -375,6 +381,7 @@ impl Session {
                 interfaces,
                 cores,
                 configured_trace_sink: None,
+                permissions,
             })
         }
     }
@@ -423,7 +430,7 @@ impl Session {
         mut probe: Probe,
         target: Target,
         _attach_method: AttachMethod,
-        _permissions: Permissions,
+        permissions: Permissions,
         cores: Vec<CombinedCoreState>,
     ) -> Result<Self, Error> {
         // While we still don't support mixed architectures
@@ -516,6 +523,7 @@ impl Session {
             interfaces,
             cores,
             configured_trace_sink: None,
+            permissions,
         };
 
         // Connect to the cores
@@ -855,6 +863,14 @@ impl Session {
     /// NotImplemented if no custom erase sequence exists
     /// Err(e) if the custom erase sequence failed
     pub fn sequence_erase_all(&mut self) -> Result<(), Error> {
+        // A vendor erase sequence is not merely a faster chip erase. The trait documents it as
+        // possibly resetting "other non-volatile chip state to its default setting", which on some
+        // parts is the configuration deciding whether the device can be debugged at all. Ask before
+        // running it, in the shared path, rather than leaving each implementation to remember.
+        self.permissions
+            .erase_all()
+            .map_err(|MissingPermissions(desc)| Error::MissingPermissions(desc))?;
+
         let interface_ref = match &mut self.interfaces {
             ArchitectureInterface::Arm(i) => i.deref_mut(),
             ArchitectureInterface::ArmWithRiscv { arm, .. } => arm.deref_mut(),
