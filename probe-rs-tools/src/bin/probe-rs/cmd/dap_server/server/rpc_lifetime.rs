@@ -143,6 +143,7 @@ mod tests {
             connect_under_reset: false,
             dry_run: false,
             allow_erase_all: false,
+            allow_factory_reset: false,
             attach_timeout: None,
         };
 

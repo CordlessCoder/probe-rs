@@ -114,6 +114,7 @@ pub struct AttachRequest {
     pub connect_under_reset: bool,
     pub dry_run: bool,
     pub allow_erase_all: bool,
+    pub allow_factory_reset: bool,
     pub resume_target: bool,
     pub wait_for_probe: Option<Duration>,
 }

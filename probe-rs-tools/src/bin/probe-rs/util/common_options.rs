@@ -187,6 +187,17 @@ pub struct ProbeOptions {
     )]
     pub allow_erase_all: bool,
 
+    /// Allow the session to reset the chip's non-volatile configuration to factory default.
+    ///
+    /// On some devices that configuration decides whether the device can be debugged at all, so
+    /// this is deliberately not implied by `--allow-erase-all`.
+    #[arg(
+        long,
+        env = "PROBE_RS_ALLOW_FACTORY_RESET",
+        help_heading = "PROBE CONFIGURATION"
+    )]
+    pub allow_factory_reset: bool,
+
     /// How long to wait for a busy probe, in seconds.
     ///
     /// Another process, or another user of the same server, can hold the probe.
@@ -412,6 +423,9 @@ impl<'r> LoadedProbeOptions<'r> {
         let mut permissions = Permissions::new();
         if self.0.allow_erase_all {
             permissions = permissions.allow_erase_all();
+        }
+        if self.0.allow_factory_reset {
+            permissions = permissions.allow_factory_reset();
         }
 
         let session = if self.0.connect_under_reset {
@@ -815,6 +829,7 @@ mod tests {
             connect_under_reset: false,
             dry_run: false,
             allow_erase_all: false,
+            allow_factory_reset: false,
             attach_timeout,
         }
     }

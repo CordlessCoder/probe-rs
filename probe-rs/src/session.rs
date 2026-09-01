@@ -1144,8 +1144,10 @@ fn get_target_from_selector(
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct Permissions {
-    /// When set to true, all memory of the chip may be erased or reset to factory default
+    /// When set to true, all memory of the chip may be erased
     erase_all: bool,
+    /// When set to true, the chip's non-volatile configuration may be reset to factory default
+    factory_reset: bool,
 }
 
 impl Permissions {
@@ -1154,15 +1156,35 @@ impl Permissions {
         Self::default()
     }
 
-    /// Allow the session to erase all memory of the chip or reset it to factory default.
+    /// Allow the session to erase all memory of the chip.
     ///
     /// # Warning
     /// This may irreversibly remove otherwise read-protected data from the device like security keys and 3rd party firmware.
     /// What happens exactly may differ per device and per probe-rs version.
+    ///
+    /// This does **not** allow resetting the device's non-volatile configuration; see
+    /// [`Permissions::allow_factory_reset`].
     #[must_use]
     pub fn allow_erase_all(self) -> Self {
         Self {
             erase_all: true,
+            ..self
+        }
+    }
+
+    /// Allow the session to reset the chip's non-volatile configuration to factory default.
+    ///
+    /// # Warning
+    /// On some devices that configuration decides whether the device can be debugged at all, so a
+    /// failed or interrupted reset can leave a part unreachable.
+    ///
+    /// This is deliberately not implied by [`Permissions::allow_erase_all`]. Erasing an
+    /// application and resetting the configuration that decides whether a part is reachable are
+    /// different consents, and the second is not a stronger form of the first.
+    #[must_use]
+    pub fn allow_factory_reset(self) -> Self {
+        Self {
+            factory_reset: true,
             ..self
         }
     }
@@ -1172,6 +1194,14 @@ impl Permissions {
             Ok(())
         } else {
             Err(MissingPermissions("erase_all".into()))
+        }
+    }
+
+    pub(crate) fn factory_reset(&self) -> Result<(), MissingPermissions> {
+        if self.factory_reset {
+            Ok(())
+        } else {
+            Err(MissingPermissions("factory_reset".into()))
         }
     }
 }

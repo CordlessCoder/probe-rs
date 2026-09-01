@@ -268,6 +268,7 @@ impl SessionConfig {
             cycle_power: false,
             dry_run: false,
             allow_erase_all: self.allow_erase_all,
+            allow_factory_reset: false,
             attach_timeout: self
                 .attach_timeout
                 .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok()),

@@ -384,6 +384,7 @@ mod tests {
                 connect_under_reset: false,
                 dry_run: false,
                 allow_erase_all: false,
+                allow_factory_reset: false,
                 resume_target: false,
                 wait_for_probe,
             })
@@ -555,6 +556,7 @@ pub(crate) mod convert {
                 cycle_power: false,
                 dry_run: request.dry_run,
                 allow_erase_all: request.allow_erase_all,
+                allow_factory_reset: request.allow_factory_reset,
                 // `attach_impl` runs the wait, so that it can also retry a
                 // probe that has dropped out of the probe list, and so that the
                 // client can cancel it.
