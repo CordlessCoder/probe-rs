@@ -185,6 +185,14 @@ pub struct EraseAllRequest {
     pub read_flasher_rtt: bool,
 }
 
+/// Reset a device's non-volatile configuration to factory default.
+///
+/// Requires the session to hold `Permissions::allow_factory_reset`.
+#[derive(Serialize, Deserialize, Schema)]
+pub struct FactoryResetRequest {
+    pub sessid: Key<Session>,
+}
+
 #[derive(Serialize, Deserialize, Schema)]
 pub struct EraseRangeRequest {
     pub sessid: Key<Session>,

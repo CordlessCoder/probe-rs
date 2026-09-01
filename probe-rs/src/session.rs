@@ -854,6 +854,58 @@ impl Session {
         }
     }
 
+    /// Reset the device's non-volatile configuration to factory default, if it supports it.
+    ///
+    /// This is not a deeper erase. It restores the configuration the device boots with, which on
+    /// some parts decides whether the device can be debugged at all, so it is gated on its own
+    /// permission rather than on [`Permissions::allow_erase_all`].
+    ///
+    /// # Errors
+    /// NotImplemented if the target has no factory reset sequence.
+    /// MissingPermissions if the session was not opened with [`Permissions::allow_factory_reset`].
+    pub fn sequence_factory_reset(&mut self) -> Result<(), Error> {
+        self.permissions
+            .factory_reset()
+            .map_err(|MissingPermissions(desc)| Error::MissingPermissions(desc))?;
+
+        let interface_ref = match &mut self.interfaces {
+            ArchitectureInterface::Arm(i) => i.deref_mut(),
+            ArchitectureInterface::ArmWithRiscv { arm, .. } => arm.deref_mut(),
+            ArchitectureInterface::Jtag(..) => {
+                return Err(Error::NotImplemented(
+                    "Factory reset is not implemented for non-ARM targets.",
+                ));
+            }
+        };
+
+        let DebugSequence::Arm(ref debug_sequence) = self.target.debug_sequence else {
+            unreachable!("This should never happen. Please file a bug if it does.");
+        };
+
+        match debug_sequence.factory_reset(interface_ref) {
+            Ok(()) => (),
+            // The device restarts out of a reset, so the connection has to be rebuilt.
+            Err(ArmError::ReAttachRequired) => match &mut self.interfaces {
+                ArchitectureInterface::Arm(interface) => {
+                    Self::reattach_arm_interface(interface, debug_sequence)?;
+                    for core_state in &self.cores {
+                        core_state.enable_arm_debug(interface.deref_mut())?;
+                    }
+                }
+                ArchitectureInterface::ArmWithRiscv { arm, .. } => {
+                    Self::reattach_arm_interface(arm, debug_sequence)?;
+                    for core_state in &self.cores {
+                        core_state.enable_arm_debug(arm.deref_mut())?;
+                    }
+                }
+                ArchitectureInterface::Jtag(..) => {}
+            },
+            Err(e) => return Err(Error::Arm(e)),
+        }
+
+        Ok(())
+    }
+
     /// Erase all flash memory using the Device's Debug Erase Sequence if any
     ///
     /// # Returns
