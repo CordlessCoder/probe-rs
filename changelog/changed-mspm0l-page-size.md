@@ -1,1 +1,1 @@
-MSPM0L: the MAIN flash algorithm now uses a 1 KiB page, matching the sector size. It previously declared 256 bytes, which made programming a device take four times as many flash algorithm invocations as its geometry needs.
+MSPM0L: the MAIN flash algorithm now uses a 2 KiB page. It previously declared 256 bytes against a 1 KiB sector, so programming a device took eight times as many flash algorithm invocations as it needs, and each invocation costs a fixed number of debug transactions.
