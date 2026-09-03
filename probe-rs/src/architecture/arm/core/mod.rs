@@ -150,6 +150,13 @@ pub struct CortexMState {
     /// `pending_step` tracks whether we're waiting for a step so that `CoreInterface::status()`
     /// can return `HaltReason::Step` instead of `HaltReason::Request` if a step was pending.
     pending_step: bool,
+
+    /// Set when the host writes the program counter, cleared when the core is resumed.
+    ///
+    /// `run()` single-steps first so that a breakpoint on the current instruction cannot halt the
+    /// core again immediately. Writing the program counter moves the core off whatever it halted
+    /// on, so that step has nothing left to step over.
+    pc_written: bool,
 }
 
 impl CortexMState {
@@ -161,6 +168,7 @@ impl CortexMState {
             fp_present: false,
             semihosting_command: None,
             pending_step: false,
+            pc_written: false,
         }
     }
 
@@ -170,6 +178,15 @@ impl CortexMState {
 
     pub(crate) fn clear_pending_step(&mut self) {
         self.pending_step = false;
+    }
+
+    pub(crate) fn note_pc_written(&mut self) {
+        self.pc_written = true;
+    }
+
+    /// Whether the step in `run()` can be skipped, clearing the flag either way.
+    pub(crate) fn take_pc_written(&mut self) -> bool {
+        std::mem::take(&mut self.pc_written)
     }
 
     /// Apply step context to a halt reason read from DFSR.

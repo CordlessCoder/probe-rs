@@ -823,8 +823,13 @@ impl CoreInterface for Armv7m<'_> {
     }
 
     fn run(&mut self) -> Result<(), Error> {
-        // Before we run, we always perform a single instruction step, to account for possible breakpoints that might get us stuck on the current instruction.
-        self.step()?;
+        // Stepping first keeps a breakpoint on the current instruction from halting the core again
+        // before it makes any progress. That cannot happen when the host has just written the
+        // program counter, and the step is expensive: it disables every breakpoint, steps, decodes
+        // the halt and puts the breakpoints back.
+        if !self.state.take_pc_written() {
+            self.step()?;
+        }
         self.state.clear_pending_step();
 
         let mut dhcsr = Dhcsr(self.memory.read_word_32(Dhcsr::get_mmio_address())?);
@@ -1000,6 +1005,9 @@ impl CoreInterface for Armv7m<'_> {
     }
 
     fn write_core_reg(&mut self, address: RegisterId, value: RegisterValue) -> Result<(), Error> {
+        if address == self.program_counter().id {
+            self.state.note_pc_written();
+        }
         if self.state.current_state.is_halted() {
             super::cortex_m::write_core_reg(&mut *self.memory, address, value.try_into()?)?;
             Ok(())
