@@ -1,0 +1,1 @@
+CMSIS-DAP: batched transfers are packed by what a request and a reply actually cost, instead of charging every access the price of a write. A read costs one byte in the request and four in the reply, so read-heavy batches previously went out under-filled.

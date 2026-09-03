@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use probe_rs::probe::{list::Lister, WireProtocol};
+use probe_rs::probe::{WireProtocol, list::Lister};
 use probe_rs::{MemoryInterface, Permissions, config::TargetSelector};
 use std::time::{Duration, Instant};
 
@@ -68,7 +68,11 @@ fn main() -> Result<()> {
     );
     println!(
         "values match:  {}",
-        if one_at_a_time == batched { "yes" } else { "NO" }
+        if one_at_a_time == batched {
+            "yes"
+        } else {
+            "NO"
+        }
     );
 
     // Leave the target running. Halting and walking away makes the next person wonder why their

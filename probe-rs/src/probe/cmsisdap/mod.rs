@@ -129,6 +129,9 @@ impl std::fmt::Debug for CmsisDap {
     }
 }
 
+/// Bytes of `DAP_Transfer` command and reply that are not transfers.
+const HEADER_BYTES: usize = 3;
+
 /// Transfers one `DAP_Transfer` can carry.
 ///
 /// The count travels in a single byte, and it is written with a cast rather than a check, so
@@ -1142,21 +1145,42 @@ impl RawDapAccess for CmsisDap {
         // Anything already queued was requested first and has to stay ahead of these.
         self.process_batch()?;
 
-        // A write costs its address byte plus four of data, and a read costs four in the reply, so
-        // sizing by the write case keeps both request and response inside one packet whatever the
-        // mix is.
-        let per_packet = ((self.packet_size as usize).saturating_sub(3) / (1 + 4))
-            .clamp(1, MAX_TRANSFERS_PER_PACKET);
+        // A write and a read cost different things, and in different directions: every access
+        // costs a request byte, a write adds four more of data to the request, and a read adds
+        // four to the reply. Charging both at the write price under-fills the packet, and the more
+        // reads a batch holds the further under it lands.
+        let capacity = self.packet_size as usize;
+        let mut request = HEADER_BYTES;
+        let mut response = HEADER_BYTES;
 
-        for chunk in accesses.chunks(per_packet) {
-            for &(address, value) in chunk {
-                self.batch.push(match value {
-                    Some(value) => BatchCommand::Write(address, value),
-                    None => BatchCommand::Read(address),
-                });
+        for &(address, value) in accesses {
+            let (in_request, in_response) = match value {
+                Some(_) => (1 + 4, 0),
+                None => (1, 4),
+            };
+
+            // Send what is queued rather than overrun either direction, or the count field. An
+            // empty batch cannot overrun, so a single access always fits and this terminates.
+            if !self.batch.is_empty()
+                && (request + in_request > capacity
+                    || response + in_response > capacity
+                    || self.batch.len() == MAX_TRANSFERS_PER_PACKET)
+            {
+                values.extend(self.process_batch_reads()?);
+                request = HEADER_BYTES;
+                response = HEADER_BYTES;
             }
-            values.extend(self.process_batch_reads()?);
+
+            request += in_request;
+            response += in_response;
+
+            self.batch.push(match value {
+                Some(value) => BatchCommand::Write(address, value),
+                None => BatchCommand::Read(address),
+            });
         }
+
+        values.extend(self.process_batch_reads()?);
 
         Ok(())
     }
