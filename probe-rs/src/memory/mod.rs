@@ -89,6 +89,24 @@ where
     /// Returns [`Error::MemoryNotAligned`] if this does not hold true.
     fn read_32(&mut self, address: u64, data: &mut [u32]) -> Result<(), ERR>;
 
+    /// Read a 32-bit word from each of `addresses`, which need not be contiguous or ordered.
+    ///
+    /// One word is written to `values` per address, in the same order. Every address has to be a
+    /// multiple of 4, and `values` has to be at least as long as `addresses`.
+    ///
+    /// Prefer this over calling [`MemoryInterface::read_word_32`] in a loop for scattered
+    /// addresses. An implementation that can put several accesses into one probe transaction will
+    /// do so, which on a debug probe is the difference between one round trip and one per address.
+    /// For a contiguous range, [`MemoryInterface::read_32`] remains better.
+    ///
+    /// The default reads them one at a time.
+    fn read_words_32(&mut self, addresses: &[u64], values: &mut [u32]) -> Result<(), ERR> {
+        for (address, value) in addresses.iter().zip(values.iter_mut()) {
+            *value = self.read_word_32(*address)?;
+        }
+        Ok(())
+    }
+
     /// Read a block of 16bit words at `address` in the target's endianness.
     ///
     /// The number of words read is `data.len()`.
@@ -436,6 +454,12 @@ where
     fn read_32(&mut self, address: u64, data: &mut [u32]) -> Result<(), Error> {
         self.memory_mut()
             .read_32(address, data)
+            .map_err(Error::from)
+    }
+
+    fn read_words_32(&mut self, addresses: &[u64], values: &mut [u32]) -> Result<(), Error> {
+        self.memory_mut()
+            .read_words_32(addresses, values)
             .map_err(Error::from)
     }
 

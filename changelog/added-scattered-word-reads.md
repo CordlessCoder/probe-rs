@@ -1,0 +1,1 @@
+Added `MemoryInterface::read_words_32`, which reads a 32-bit word from each of a list of addresses that need not be contiguous. On CMSIS-DAP the whole list is packed into as few probe transactions as fit, where reading the addresses one at a time costs a round trip each. Existing implementations are unaffected: the default reads them one at a time, as before.

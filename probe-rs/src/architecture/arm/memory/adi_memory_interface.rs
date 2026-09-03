@@ -3,7 +3,7 @@ use crate::{
     architecture::arm::{
         ArmDebugInterface, ArmError, DapAccess, FullyQualifiedApAddress,
         ap::{
-            AccessPortType, ApAccess, CSW, DataSize,
+            AccessPortType, ApAccess, ApRegister, CSW, DRW, DataSize, TAR,
             memory_ap::{MemoryAp, MemoryApType},
         },
         memory::ArmMemoryInterface,
@@ -137,6 +137,50 @@ where
         }
 
         tracing::debug!("Finished reading block");
+
+        Ok(())
+    }
+
+    fn read_words_32(&mut self, addresses: &[u64], values: &mut [u32]) -> Result<(), ArmError> {
+        if let Some(&address) = addresses.iter().find(|a| !a.is_multiple_of(4)) {
+            return Err(ArmError::alignment_error(address, 4));
+        }
+
+        // A 64-bit address needs TAR2 set as well, which would put a second write between the
+        // address and its read. Nothing needs that yet, so leave those to the one-at-a-time path.
+        if addresses.iter().any(|a| a >> 32 != 0) {
+            for (address, value) in addresses.iter().zip(values.iter_mut()) {
+                *value = self.read_word_32(*address)?;
+            }
+            return Ok(());
+        }
+
+        self.memory_ap
+            .try_set_datasize(self.interface, DataSize::U32)?;
+
+        // Address then value, per word. Both registers are in the same bank, which is what lets
+        // the whole run go to the probe as a single list.
+        let accesses = addresses
+            .iter()
+            .flat_map(|&address| [(TAR::ADDRESS, Some(address as u32)), (DRW::ADDRESS, None)])
+            .collect::<Vec<_>>();
+
+        let mut read = Vec::with_capacity(addresses.len());
+        self.interface.read_raw_ap_registers_batched(
+            &self.memory_ap.ap_address().clone(),
+            &accesses,
+            &mut read,
+        )?;
+
+        if read.len() != addresses.len() {
+            return Err(ArmError::Probe(DebugProbeError::Other(format!(
+                "expected {} words from a batched read, got {}",
+                addresses.len(),
+                read.len()
+            ))));
+        }
+
+        values[..read.len()].copy_from_slice(&read);
 
         Ok(())
     }

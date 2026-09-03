@@ -539,9 +539,18 @@ impl CmsisDap {
     /// raised if necessary.
     #[tracing::instrument(skip(self))]
     fn process_batch(&mut self) -> Result<Option<u32>, ArmError> {
+        Ok(self.process_batch_reads()?.last().copied())
+    }
+
+    /// Run the queued batch and return the value of every read in it, in order.
+    ///
+    /// The probe answers a `DAP_Transfer` with one entry per transfer, so the values have always
+    /// been coming back; [`CmsisDap::process_batch`] just keeps the last one because its callers
+    /// only ever queue a single read.
+    fn process_batch_reads(&mut self) -> Result<Vec<u32>, ArmError> {
         let batch = std::mem::take(&mut self.batch);
         if batch.is_empty() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
         tracing::debug!("{} items in batch", batch.len());
@@ -602,7 +611,12 @@ impl CmsisDap {
                 }
 
                 tracing::trace!("Last transfer status: ACK");
-                Ok(response.transfers[count - 1].data)
+                Ok(batch
+                    .iter()
+                    .zip(response.transfers.iter())
+                    .filter(|(command, _)| matches!(command, BatchCommand::Read(_)))
+                    .filter_map(|(_, transfer)| transfer.data)
+                    .collect())
             }
             Ack::NoAck => {
                 tracing::debug!(
@@ -1110,6 +1124,33 @@ impl RawDapAccess for CmsisDap {
         res.ok_or_else(|| {
             DebugProbeError::Other("CMSIS-DAP read did not return any data".to_string()).into()
         })
+    }
+
+    /// Runs a mixed sequence of accesses, packing as many as fit into each probe transaction.
+    fn raw_access_batch(
+        &mut self,
+        accesses: &[(RegisterAddress, Option<u32>)],
+        values: &mut Vec<u32>,
+    ) -> Result<(), ArmError> {
+        // Anything already queued was requested first and has to stay ahead of these.
+        self.process_batch()?;
+
+        // A write costs its address byte plus four of data, and a read costs four in the reply, so
+        // sizing by the write case keeps both request and response inside one packet whatever the
+        // mix is.
+        let per_packet = ((self.packet_size as usize).saturating_sub(3) / (1 + 4)).max(1);
+
+        for chunk in accesses.chunks(per_packet) {
+            for &(address, value) in chunk {
+                self.batch.push(match value {
+                    Some(value) => BatchCommand::Write(address, value),
+                    None => BatchCommand::Read(address),
+                });
+            }
+            values.extend(self.process_batch_reads()?);
+        }
+
+        Ok(())
     }
 
     /// Writes a value to the DAP register on the specified port and address.

@@ -590,6 +590,27 @@ impl DapAccess for ArmCommunicationInterface {
         Ok(())
     }
 
+    fn read_raw_ap_registers_batched(
+        &mut self,
+        ap: &FullyQualifiedApAddress,
+        accesses: &[(u64, Option<u32>)],
+        values: &mut Vec<u32>,
+    ) -> Result<(), ArmError> {
+        let Some(&(first, _)) = accesses.first() else {
+            return Ok(());
+        };
+
+        // One bank for the whole sequence, which is what lets it go to the probe as one list.
+        self.select_ap_and_ap_bank(ap, first)?;
+
+        let accesses = accesses
+            .iter()
+            .map(|&(address, value)| (RegisterAddress::ApRegister((address & 0xFF) as u8), value))
+            .collect::<Vec<_>>();
+
+        self.probe_mut().raw_access_batch(&accesses, values)
+    }
+
     fn write_raw_ap_register(
         &mut self,
         ap: &FullyQualifiedApAddress,

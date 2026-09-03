@@ -259,6 +259,33 @@ pub trait RawDapAccess {
         Ok(())
     }
 
+    /// Perform a mixed sequence of register accesses, returning the values that were read.
+    ///
+    /// `accesses` is executed in order: an entry with a value writes it, an entry without reads,
+    /// and each read appends to `values`. It exists so a caller with a list of unrelated addresses
+    /// can hand the whole list to the probe at once — a probe that can carry several transfers per
+    /// packet then pays one round trip instead of one per address.
+    ///
+    /// Only the lowest 4 bits of each address are used. Bank switching is the caller's
+    /// responsibility, so every access has to be in the bank already selected.
+    ///
+    /// The default performs them one at a time, which is what a probe with no batching would do
+    /// anyway.
+    fn raw_access_batch(
+        &mut self,
+        accesses: &[(RegisterAddress, Option<u32>)],
+        values: &mut Vec<u32>,
+    ) -> Result<(), ArmError> {
+        for &(address, value) in accesses {
+            match value {
+                Some(value) => self.raw_write_register(address, value)?,
+                None => values.push(self.raw_read_register(address)?),
+            }
+        }
+
+        Ok(())
+    }
+
     /// Flush any outstanding writes.
     ///
     /// By default, this does nothing -- but in probes that implement write
@@ -374,6 +401,29 @@ pub trait DapAccess {
     ) -> Result<(), ArmError> {
         for val in values {
             *val = self.read_raw_ap_register(ap, addr)?;
+        }
+        Ok(())
+    }
+
+    /// Perform a mixed sequence of accesses to one Access Port, returning the values read.
+    ///
+    /// Entries with a value are written, entries without are read, and each read appends to
+    /// `values`. Every address must be in the same register bank, because the bank is selected
+    /// once for the whole sequence.
+    ///
+    /// This exists for callers holding a list of unrelated addresses, where the alternative is one
+    /// probe round trip per address. The default performs them one at a time.
+    fn read_raw_ap_registers_batched(
+        &mut self,
+        ap: &FullyQualifiedApAddress,
+        accesses: &[(u64, Option<u32>)],
+        values: &mut Vec<u32>,
+    ) -> Result<(), ArmError> {
+        for &(addr, value) in accesses {
+            match value {
+                Some(value) => self.write_raw_ap_register(ap, addr, value)?,
+                None => values.push(self.read_raw_ap_register(ap, addr)?),
+            }
         }
         Ok(())
     }
