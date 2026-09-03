@@ -160,6 +160,9 @@ pub struct CortexMState {
 
     /// Whether core status changes are still being reported to the probe.
     status_reports: StatusReports,
+
+    /// Whether a breakpoint halt might be a semihosting call.
+    semihosting_possible: bool,
 }
 
 /// Whether to pass core status changes on to the probe, which uses them to drive an indicator.
@@ -188,7 +191,23 @@ impl CortexMState {
             pending_step: false,
             pc_written: false,
             status_reports: StatusReports::Live,
+            semihosting_possible: true,
         }
+    }
+
+    /// Stop treating a breakpoint halt as possibly semihosting.
+    pub(crate) fn hold_semihosting_checks(&mut self) {
+        self.semihosting_possible = false;
+    }
+
+    /// Treat a breakpoint halt as possibly semihosting again.
+    pub(crate) fn release_semihosting_checks(&mut self) {
+        self.semihosting_possible = true;
+    }
+
+    /// Whether a breakpoint halt is worth decoding as a semihosting call.
+    pub(crate) fn semihosting_possible(&self) -> bool {
+        self.semihosting_possible
     }
 
     /// Report the next status change to the probe and then stop reporting them.
