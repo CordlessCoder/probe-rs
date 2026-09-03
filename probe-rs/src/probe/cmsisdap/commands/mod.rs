@@ -329,6 +329,13 @@ impl CmsisDapDevice {
                     ..
                 }) => (),
 
+                // A reply to a command from before this device was opened. It has now been read
+                // and the rest of the queue discarded with it, so the next attempt gets its own.
+                Err(CmsisDapError::Send {
+                    source: SendError::CommandIdMismatch(..),
+                    ..
+                }) => (),
+
                 // Raise other errors.
                 Err(e) => return Err(e),
             }
@@ -488,14 +495,7 @@ fn send_request_inner<Req: Request>(
     device: &mut CmsisDapDevice,
     request: &Req,
 ) -> Result<(), SendError> {
-    let buffer_len: usize = match device {
-        #[cfg(feature = "cmsisdap_v1")]
-        CmsisDapDevice::V1 { report_size, .. } => *report_size + 1,
-        CmsisDapDevice::V2 {
-            max_packet_size, ..
-        } => *max_packet_size + 1,
-    };
-    let mut buffer = vec![0; buffer_len];
+    let mut buffer = vec![0; response_buffer_len(device)];
 
     buffer[1] = Req::COMMAND_ID as u8;
     #[cfg_attr(not(feature = "cmsisdap_v1"), allow(unused_mut))]
@@ -516,16 +516,27 @@ fn receive_response_inner<Req: Request>(
     device: &mut CmsisDapDevice,
     request: &Req,
 ) -> Result<Req::Response, SendError> {
-    let buffer_len: usize = match device {
+    let mut buffer = vec![0; response_buffer_len(device)];
+
+    read_response(device, request, &mut buffer)
+}
+
+fn response_buffer_len(device: &CmsisDapDevice) -> usize {
+    match device {
         #[cfg(feature = "cmsisdap_v1")]
         CmsisDapDevice::V1 { report_size, .. } => *report_size + 1,
         CmsisDapDevice::V2 {
             max_packet_size, ..
         } => *max_packet_size + 1,
-    };
-    let mut buffer = vec![0; buffer_len];
+    }
+}
 
-    let bytes_read = device.read(&mut buffer)?;
+fn read_response<Req: Request>(
+    device: &mut CmsisDapDevice,
+    request: &Req,
+    buffer: &mut [u8],
+) -> Result<Req::Response, SendError> {
+    let bytes_read = device.read(buffer)?;
     let response_data = &buffer[..bytes_read];
     trace_buffer("Receive buffer", response_data);
 
@@ -551,14 +562,7 @@ fn send_command_inner<Req: Request>(
     // On v1, we always send this full-sized report, while
     // on v2 we can truncate to just the required data.
     // Add one byte for HID report ID.
-    let buffer_len: usize = match device {
-        #[cfg(feature = "cmsisdap_v1")]
-        CmsisDapDevice::V1 { report_size, .. } => *report_size + 1,
-        CmsisDapDevice::V2 {
-            max_packet_size, ..
-        } => *max_packet_size + 1,
-    };
-    let mut buffer = vec![0; buffer_len];
+    let mut buffer = vec![0; response_buffer_len(device)];
 
     // Leave byte 0 as the HID report, and write the command and request to the buffer.
     buffer[1] = Req::COMMAND_ID as u8;
@@ -578,23 +582,16 @@ fn send_command_inner<Req: Request>(
     let _ = device.write(&buffer[..size])?;
     trace_buffer("Transmit buffer", &buffer[..size]);
 
-    // Read back response.
-    let bytes_read = device.read(&mut buffer)?;
-    let response_data = &buffer[..bytes_read];
-    trace_buffer("Receive buffer", response_data);
-
-    if response_data.is_empty() {
-        return Err(SendError::NotEnoughData);
+    // Read back response. Once the request is out the probe owes a reply, so a failure here has
+    // to take it off the device before returning. Left there, the next command reads this reply
+    // instead of its own and rejects it as the wrong command, and so does every command after
+    // that for as long as the device stays open.
+    let response = read_response(device, request, &mut buffer);
+    if response.is_err() {
+        device.drain();
     }
 
-    if response_data[0] == Req::COMMAND_ID as u8 {
-        request.parse_response(&response_data[1..])
-    } else {
-        Err(SendError::CommandIdMismatch(
-            response_data[0],
-            Req::COMMAND_ID,
-        ))
-    }
+    response
 }
 
 /// Trace log a buffer, including only the first trailing zero.
