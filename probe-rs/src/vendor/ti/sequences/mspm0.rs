@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::architecture::arm::ap::{ApRegister, IDR};
 use crate::architecture::arm::core::armv7m::Demcr;
 use crate::architecture::arm::dp::DpAddress;
 use crate::architecture::arm::memory::ArmMemoryInterface;
@@ -37,6 +38,9 @@ use probe_rs_target::CoreType;
 /// Access Port Select values used by this sequence.
 #[derive(Debug, Clone, Copy)]
 enum ApSel {
+    /// AHB-AP: memory access to the core. It lives in power domain PD1, so it is missing while
+    /// the device is in a low-power state.
+    AhbAp = 0,
     /// SEC-AP: the mailbox the boot ROM services, used to recover an inaccessible device.
     SecAp = 2,
     /// PWR-AP: controls the power and reset state of the CPU for debug purposes.
@@ -61,6 +65,8 @@ const SPREC: u64 = 0xF0;
 const DPREC0_FORCEACTIVE: u32 = 1 << 3;
 /// `DPREC0.RST CTL` (bits 16:14) set to `100b`, selecting halt-on-reset.
 const DPREC0_HALT_ON_RESET: u32 = 0b100 << 14;
+/// The whole `DPREC0.RST CTL` field. Its default is `000b` (SLAAEO5 table 3-2).
+const DPREC0_RST_CTL: u32 = 0b111 << 14;
 /// `DPREC0.DEBUGPOWER`.
 ///
 /// Documented as Reserved in SLAAEO5 table 3-3, but set by both of TI's toolchain patches.
@@ -107,9 +113,6 @@ const DSSM_MASS_ERASE: u32 = 0x020C;
 const DSSM_FACTORY_RESET: u32 = 0x020A;
 /// What the boot ROM leaves in `RXDATA` when it has serviced a command.
 const DSSM_RESPONSE_OK: u32 = 0x0001_0003;
-
-/// Access port identification register, the same offset on every ADIv5 AP.
-const AP_IDR: u64 = 0xFC;
 
 /// `SYSCTL.RESETLEVEL` — selects the level of the next software-triggered reset.
 const SYSCTL_RESETLEVEL: u64 = 0x400B_0300;
@@ -162,6 +165,27 @@ impl MSPM0 {
     fn write_sprec(&self, interface: &mut dyn DapAccess, value: u32) -> Result<(), ArmError> {
         let pwr_ap: FullyQualifiedApAddress = ApSel::PwrAp.into();
         interface.write_raw_ap_register(&pwr_ap, SPREC, value)
+    }
+
+    /// Whether the AHB-AP answers.
+    ///
+    /// `FORCEACTIVE` needs a moment to bring PD1 back up, so this polls rather than reading once.
+    /// Treating a slow wake as an absent AP would put us straight back into resetting a device
+    /// that was only asleep.
+    fn ahb_ap_responds(&self, interface: &mut dyn DapAccess) -> bool {
+        let ahb_ap: FullyQualifiedApAddress = ApSel::AhbAp.into();
+
+        let start = Instant::now();
+        loop {
+            if matches!(interface.read_raw_ap_register(&ahb_ap, IDR::ADDRESS), Ok(idr) if idr != 0)
+            {
+                return true;
+            }
+            if start.elapsed() > Duration::from_millis(10) {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// Recover a device whose `DPREC0` sticky bits are set.
@@ -290,11 +314,21 @@ impl ArmDebugSequence for MSPM0 {
 
         if dprec0 & DPREC0_STICKY == 0 {
             self.write_dprec0(interface, DPREC0_DEBUG_ENABLE)?;
-        } else {
-            self.recover_sticky(interface)?;
+            return Ok(());
         }
 
-        Ok(())
+        // The sticky bits are set on any device that has been in a low-power state, not only on
+        // one that needs recovering, so finding them set is not on its own a reason to reset the
+        // device. Write what the recovery would write and see whether the AHB-AP comes back:
+        // `FORCEACTIVE` is what makes it discoverable again (SLAAEO5 section 3.1). Only when it
+        // stays missing is there something wrong, and only then is a system reset worth its cost.
+        self.write_dprec0(interface, DPREC0_DEBUG_ENABLE | DPREC0_STICKY)?;
+
+        if self.ahb_ap_responds(interface) {
+            return Ok(());
+        }
+
+        self.recover_sticky(interface)
     }
 
     fn debug_core_stop(
@@ -310,10 +344,15 @@ impl ArmDebugSequence for MSPM0 {
 
         // Hand low-power control back to the application. Leaving INHIBITSLEEP set would keep the
         // part awake and burning current until its next reset.
+        //
+        // Put RST CTL back to its default too. Halt-on-reset applies to "any form of reset
+        // performed on it post-configuration" (SLAAEO5 3.2.2), so leaving it selected stops the
+        // core on the next reset with no debugger present to release it. `debug_port_start`
+        // selects it again on the next attach.
         let dprec0 = self.read_dprec0(interface)?;
         self.write_dprec0(
             interface,
-            dprec0 & !(DPREC0_INHIBITSLEEP | DPREC0_FORCEACTIVE),
+            dprec0 & !(DPREC0_INHIBITSLEEP | DPREC0_FORCEACTIVE | DPREC0_RST_CTL),
         )?;
 
         Ok(())
@@ -326,7 +365,7 @@ impl ArmDebugSequence for MSPM0 {
         permissions: &crate::Permissions,
     ) -> Result<(), ArmError> {
         // Everything past this point needs the AHB-AP. If it answers, there is nothing to recover.
-        if matches!(interface.read_raw_ap_register(default_ap, AP_IDR), Ok(idr) if idr != 0) {
+        if matches!(interface.read_raw_ap_register(default_ap, IDR::ADDRESS), Ok(idr) if idr != 0) {
             return Ok(());
         }
 
@@ -373,19 +412,18 @@ impl ArmDebugSequence for MSPM0 {
         _core_type: CoreType,
         _debug_base: Option<u64>,
     ) -> Result<(), ArmError> {
-        // `AIRCR.SYSRESETREQ` is a CPU-only reset on this device and leaves every peripheral
-        // untouched (TRM section 2.4.1.1.5), so state a flash algorithm left behind survives it.
-        // TI's algorithms clear `CPUSS.CTL` in `Init` to turn off the prefetcher and both caches,
-        // and their `UnInit` is a stub, so an application flashed by probe-rs would run with flash
-        // accesses slowed down until the next power cycle. SYSCTL's SYSRST clears the CPU and the
-        // peripherals both (SLAAEO5 section 6), which is what puts `CPUSS.CTL` back.
+        // `CPUSS.CTL` holds the prefetch and cache enables and resets to 0x7 (SLAU847F 3.6.15).
+        // TI's flash algorithms clear it in `Init` and do not restore it, so once programming
+        // has finished the prefetcher and both caches are off and every flash access is slower.
+        // The TRM does not say which reset level restores the register. `AIRCR.SYSRESETREQ`
+        // leaves it as the algorithm left it; SYSCTL's SYSRST puts it back (SLAAEO5 section 6).
         //
         // Only do that when the caller has armed the reset catch. SYSRST restarts the core, which
         // then runs from whatever the reset vector holds; on a device with erased MAIN that is
-        // 0xFFFFFFFF, and the core faults, locks up and takes the access ports down with it. The
-        // part is then reachable only through TI's `xds110reset`. `reset_and_halt` arms the catch
-        // and is the path flashing resets through, so SYSRST is both needed and safe there. A bare
-        // `Core::reset` is neither, and gets the stock reset that probe-rs used before.
+        // 0xFFFFFFFF, and the core faults, locks up and takes the access ports down with it.
+        // `reset_and_halt` arms the catch and is the path flashing resets through, so SYSRST is
+        // both needed and safe there. A bare `Core::reset` is neither, and gets the stock reset
+        // that probe-rs used before.
         let demcr = Demcr(interface.read_word_32(Demcr::get_mmio_address())?);
         if !demcr.vc_corereset() {
             return cortex_m_reset_system(interface);
@@ -412,6 +450,14 @@ mod tests {
         assert_eq!(DPREC0_DEBUG_ENABLE, 0x0019_0008);
         assert_eq!(DPREC0_DEBUG_ENABLE | DPREC0_STICKY, 0x00F9_0008);
         assert_eq!(DPREC0_FORCEACTIVE, 0x0000_0008);
+    }
+
+    /// `debug_core_stop` has to clear the whole RST CTL field, not just the bit `DPREC0_DEBUG_ENABLE`
+    /// happens to set, or the device is left in some other reset mode instead of the default.
+    #[test]
+    fn clearing_rst_ctl_selects_the_default_reset_mode() {
+        assert_eq!(DPREC0_HALT_ON_RESET & DPREC0_RST_CTL, DPREC0_HALT_ON_RESET);
+        assert_eq!(DPREC0_DEBUG_ENABLE & !DPREC0_RST_CTL, 0x0018_0008);
     }
 
     /// The SYSCTL reset command from SLAAEO5 table 6-1, pinned so the key cannot go missing.
