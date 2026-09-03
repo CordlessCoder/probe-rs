@@ -685,7 +685,13 @@ impl<'probe> Armv7m<'probe> {
     }
 
     fn set_core_status(&mut self, new_status: CoreStatus) {
-        super::update_core_status(&mut self.memory, &mut self.state.current_state, new_status);
+        let report = self.state.report_status(new_status);
+        super::update_core_status(
+            &mut self.memory,
+            &mut self.state.current_state,
+            new_status,
+            report,
+        );
     }
 
     fn wait_for_status(
@@ -715,6 +721,16 @@ impl CoreInterface for Armv7m<'_> {
 
     fn core_halted(&mut self) -> Result<bool, Error> {
         Ok(self.status()?.is_halted())
+    }
+
+    fn hold_status_reports(&mut self) {
+        self.state.hold_status_reports();
+    }
+
+    fn release_status_reports(&mut self) {
+        self.state.release_status_reports();
+        let status = self.state.current_state;
+        self.memory.update_core_status(status);
     }
 
     fn status(&mut self) -> Result<CoreStatus, Error> {
