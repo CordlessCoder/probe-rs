@@ -32,7 +32,7 @@ use crate::{
 };
 
 use commands::{
-    CmsisDapDevice, Status,
+    CmsisDapDevice, SendError, Status,
     general::{
         connect::{ConnectRequest, ConnectResponse},
         disconnect::{DisconnectRequest, DisconnectResponse},
@@ -145,26 +145,57 @@ const MAX_TRANSFERS_PER_PACKET: usize = u8::MAX as usize;
 /// packets; a deeper queue mostly makes a failure take longer to surface.
 const MAX_PIPELINED_WRITES: usize = 8;
 
+/// Times the opening sequence is restarted while the probe is still answering with replies it owes
+/// from an earlier session.
+const MAX_OPEN_ATTEMPTS: usize = 8;
+
+/// How long the probe has to stay silent before its backlog counts as drained, once one has been
+/// seen. Only paid on the recovery path.
+const BACKLOG_IDLE: Duration = Duration::from_millis(100);
+
+/// What `new_from_device` asks the probe about itself.
+struct ProbeInfo {
+    packet_size: u16,
+    packet_count: u8,
+    capabilities: Capabilities,
+    swo_buffer_size: Option<usize>,
+}
+
 impl CmsisDap {
     fn new_from_device(mut device: CmsisDapDevice) -> Result<Self, DebugProbeError> {
         // Discard anything left in buffer, as otherwise
         // we'll get out of sync between requests and responses.
         device.drain();
 
-        // Determine and set the packet size. We do this as soon as possible after
-        // opening the probe to ensure all future communication uses the correct size.
-        let packet_size = device.find_packet_size()? as u16;
+        // A probe that still owes replies from an earlier session answers the start of this one
+        // with the previous one's data, and `DAP_Info` cannot detect that by itself: every
+        // sub-command shares command ID 0x00 and the reply says nothing about which one it
+        // answers, so a stale packet count parses cleanly as a capability mask and the probe is
+        // reported as not supporting SWD. Only a reply from some other command identifies itself
+        // as out of place, so on one of those, drain properly and ask everything again.
+        let mut info = Self::read_probe_info(&mut device);
+        for _ in 1..MAX_OPEN_ATTEMPTS {
+            let stale = matches!(
+                info,
+                Err(CmsisDapError::Send {
+                    source: SendError::CommandIdMismatch(..),
+                    ..
+                })
+            );
+            if !stale {
+                break;
+            }
 
-        // Read remaining probe information.
-        let packet_count = commands::send_command(&mut device, &PacketCountCommand {})?;
-        let caps: Capabilities = commands::send_command(&mut device, &CapabilitiesCommand {})?;
-        tracing::debug!("Detected probe capabilities: {:?}", caps);
-        let mut swo_buffer_size = None;
-        if caps.swo_uart_implemented || caps.swo_manchester_implemented {
-            let swo_size = commands::send_command(&mut device, &SWOTraceBufferSizeCommand {})?;
-            swo_buffer_size = Some(swo_size as usize);
-            tracing::debug!("Probe SWO buffer size: {}", swo_size);
+            device.drain_idle_for(BACKLOG_IDLE);
+            info = Self::read_probe_info(&mut device);
         }
+
+        let ProbeInfo {
+            packet_size,
+            packet_count,
+            capabilities: caps,
+            swo_buffer_size,
+        } = info?;
 
         Ok(Self {
             device,
@@ -182,6 +213,31 @@ impl CmsisDap {
             batch: Vec::new(),
             jtag_state: JtagDriverState::default(),
             jtag_buffer: JtagBuffer::new(packet_size - 1),
+        })
+    }
+
+    fn read_probe_info(device: &mut CmsisDapDevice) -> Result<ProbeInfo, CmsisDapError> {
+        // Determine and set the packet size. We do this as soon as possible after
+        // opening the probe to ensure all future communication uses the correct size.
+        let packet_size = device.find_packet_size()? as u16;
+
+        // Read remaining probe information.
+        let packet_count = commands::send_command(device, &PacketCountCommand {})?;
+        let capabilities: Capabilities = commands::send_command(device, &CapabilitiesCommand {})?;
+        tracing::debug!("Detected probe capabilities: {:?}", capabilities);
+
+        let mut swo_buffer_size = None;
+        if capabilities.swo_uart_implemented || capabilities.swo_manchester_implemented {
+            let swo_size = commands::send_command(device, &SWOTraceBufferSizeCommand {})?;
+            swo_buffer_size = Some(swo_size as usize);
+            tracing::debug!("Probe SWO buffer size: {}", swo_size);
+        }
+
+        Ok(ProbeInfo {
+            packet_size,
+            packet_count,
+            capabilities,
+            swo_buffer_size,
         })
     }
 
