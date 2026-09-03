@@ -70,5 +70,10 @@ fn main() -> Result<()> {
         "values match:  {}",
         if one_at_a_time == batched { "yes" } else { "NO" }
     );
+
+    // Leave the target running. Halting and walking away makes the next person wonder why their
+    // board is dead.
+    core.run()?;
+
     Ok(())
 }
