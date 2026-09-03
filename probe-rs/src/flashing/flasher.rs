@@ -971,6 +971,19 @@ impl<O: Operation> ActiveFlasher<'_, '_, O> {
             tracing::debug!("Routine call failed: {:?}", r);
         }
 
+        // The stack canary explains a failure rather than detecting one, and reading it costs a
+        // round trip on every call -- one in fifteen for a sector erase, and the same again for
+        // every page programmed. It is filled once when the algorithm is loaded and never
+        // rewritten, so it says just as much after the call that went wrong as it would have after
+        // each of the ones that did not. A read that fails is left alone: whatever broke the call
+        // is the more useful error.
+        if !matches!(r, Ok(0))
+            && let Err(overflow @ FlashError::StackOverflowDetected { .. }) =
+                self.check_for_stack_overflow()
+        {
+            return Err(overflow);
+        }
+
         r
     }
 
@@ -1099,8 +1112,6 @@ impl<O: Operation> ActiveFlasher<'_, '_, O> {
                 return Err(FlashError::Core(Error::Timeout));
             }
         }
-
-        self.check_for_stack_overflow()?;
 
         let result_reg: RegisterValue =
             self.core
