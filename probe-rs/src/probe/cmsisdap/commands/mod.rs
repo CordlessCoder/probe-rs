@@ -458,6 +458,91 @@ pub(crate) fn send_command<Req: Request>(
     })
 }
 
+/// Write a request to the probe without reading its response.
+///
+/// The response must be collected with [`receive_response`], once per request sent and in the
+/// order the requests went out. Until then the probe holds the reply, and any other traffic on the
+/// device will read it by mistake.
+pub(crate) fn send_request<Req: Request>(
+    device: &mut CmsisDapDevice,
+    request: &Req,
+) -> Result<(), CmsisDapError> {
+    send_request_inner(device, request).map_err(|e| CmsisDapError::Send {
+        command_id: Req::COMMAND_ID,
+        source: e,
+    })
+}
+
+/// Read the response to one request sent by [`send_request`].
+pub(crate) fn receive_response<Req: Request>(
+    device: &mut CmsisDapDevice,
+    request: &Req,
+) -> Result<Req::Response, CmsisDapError> {
+    receive_response_inner(device, request).map_err(|e| CmsisDapError::Send {
+        command_id: Req::COMMAND_ID,
+        source: e,
+    })
+}
+
+fn send_request_inner<Req: Request>(
+    device: &mut CmsisDapDevice,
+    request: &Req,
+) -> Result<(), SendError> {
+    let buffer_len: usize = match device {
+        #[cfg(feature = "cmsisdap_v1")]
+        CmsisDapDevice::V1 { report_size, .. } => *report_size + 1,
+        CmsisDapDevice::V2 {
+            max_packet_size, ..
+        } => *max_packet_size + 1,
+    };
+    let mut buffer = vec![0; buffer_len];
+
+    buffer[1] = Req::COMMAND_ID as u8;
+    #[cfg_attr(not(feature = "cmsisdap_v1"), allow(unused_mut))]
+    let mut size = request.to_bytes(&mut buffer[2..])? + 2;
+
+    #[cfg(feature = "cmsisdap_v1")]
+    if let CmsisDapDevice::V1 { report_size, .. } = device {
+        size = *report_size + 1;
+    }
+
+    let _ = device.write(&buffer[..size])?;
+    trace_buffer("Transmit buffer", &buffer[..size]);
+
+    Ok(())
+}
+
+fn receive_response_inner<Req: Request>(
+    device: &mut CmsisDapDevice,
+    request: &Req,
+) -> Result<Req::Response, SendError> {
+    let buffer_len: usize = match device {
+        #[cfg(feature = "cmsisdap_v1")]
+        CmsisDapDevice::V1 { report_size, .. } => *report_size + 1,
+        CmsisDapDevice::V2 {
+            max_packet_size, ..
+        } => *max_packet_size + 1,
+    };
+    let mut buffer = vec![0; buffer_len];
+
+    let bytes_read = device.read(&mut buffer)?;
+    let response_data = &buffer[..bytes_read];
+    trace_buffer("Receive buffer", response_data);
+
+    if response_data.is_empty() {
+        return Err(SendError::NotEnoughData);
+    }
+
+    if response_data[0] == Req::COMMAND_ID as u8 {
+        request.parse_response(&response_data[1..])
+    } else {
+        Err(SendError::CommandIdMismatch(
+            response_data[0],
+            Req::COMMAND_ID,
+        ))
+    }
+}
+
 fn send_command_inner<Req: Request>(
     device: &mut CmsisDapDevice,
     request: &Req,

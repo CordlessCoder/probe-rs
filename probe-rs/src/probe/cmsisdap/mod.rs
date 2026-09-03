@@ -129,6 +129,12 @@ impl std::fmt::Debug for CmsisDap {
     }
 }
 
+/// Upper bound on requests in flight in a block write, whatever the probe claims it can buffer.
+///
+/// The gain is in hiding the round trip, which is already most of the way there at a handful of
+/// packets; a deeper queue mostly makes a failure take longer to surface.
+const MAX_PIPELINED_WRITES: usize = 8;
+
 impl CmsisDap {
     fn new_from_device(mut device: CmsisDapDevice) -> Result<Self, DebugProbeError> {
         // Discard anything left in buffer, as otherwise
@@ -1135,21 +1141,68 @@ impl RawDapAccess for CmsisDap {
 
         let total_writes = values.len();
 
-        for (i, chunk) in values.chunks(data_chunk_len).enumerate() {
-            let mut request = TransferBlockRequest::write_request(address, Vec::from(chunk));
-            request.dap_index = self.jtag_state.chain_params.index as u8;
+        let requests = values
+            .chunks(data_chunk_len)
+            .map(|chunk| {
+                let mut request = TransferBlockRequest::write_request(address, Vec::from(chunk));
+                request.dap_index = self.jtag_state.chain_params.index as u8;
+                request
+            })
+            .collect::<Vec<_>>();
 
-            tracing::debug!("Transfer block: chunk={}, len={} bytes", i, chunk.len() * 4);
+        // Keep several requests in flight. Each one otherwise costs a full round trip to the
+        // probe, which on an interrupt endpoint is a millisecond in each direction however small
+        // the packet is, and a block write is the one place where enough of them queue up to
+        // matter. `packet_count` is what the probe says it can buffer; a probe that answers 1
+        // gets the unpipelined behaviour.
+        let depth = (self.packet_count as usize).clamp(1, MAX_PIPELINED_WRITES);
 
-            let resp: TransferBlockResponse = commands::send_command(&mut self.device, &request)
-                .map_err(DebugProbeError::from)?;
+        let mut result = Ok(());
+        let mut sent = 0;
+        let mut received = 0;
 
-            let executed_writes = i * data_chunk_len + usize::from(resp.transfer_count);
+        while received < requests.len() {
+            while sent < requests.len() && sent - received < depth && result.is_ok() {
+                if let Err(e) = commands::send_request(&mut self.device, &requests[sent]) {
+                    result = Err(ArmError::from(DebugProbeError::from(e)));
+                    break;
+                }
+                sent += 1;
+            }
 
-            self.handle_transfer_block_response(address, &resp, executed_writes, total_writes)?;
+            if sent == received {
+                break;
+            }
+
+            // Every request that went out has a reply waiting, and it has to be taken even if an
+            // earlier one already failed. Leaving one behind would desynchronise the device and
+            // the next unrelated command would read this reply instead of its own.
+            match commands::receive_response::<TransferBlockRequest>(
+                &mut self.device,
+                &requests[received],
+            ) {
+                Ok(resp) => {
+                    let executed_writes =
+                        received * data_chunk_len + usize::from(resp.transfer_count);
+                    if let Err(e) = self.handle_transfer_block_response(
+                        address,
+                        &resp,
+                        executed_writes,
+                        total_writes,
+                    ) && result.is_ok()
+                    {
+                        result = Err(e);
+                    }
+                }
+                Err(e) if result.is_ok() => {
+                    result = Err(ArmError::from(DebugProbeError::from(e)));
+                }
+                Err(_) => {}
+            }
+            received += 1;
         }
 
-        Ok(())
+        result
     }
 
     fn raw_read_block(
