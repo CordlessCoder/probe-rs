@@ -40,11 +40,11 @@ use probe_rs_target::CoreType;
 enum ApSel {
     /// AHB-AP: memory access to the core. It lives in power domain PD1, so it is missing while
     /// the device is in a low-power state.
-    AhbAp = 0,
+    Ahb = 0,
     /// SEC-AP: the mailbox the boot ROM services, used to recover an inaccessible device.
-    SecAp = 2,
+    Sec = 2,
     /// PWR-AP: controls the power and reset state of the CPU for debug purposes.
-    PwrAp = 4,
+    Pwr = 4,
 }
 
 impl From<ApSel> for FullyQualifiedApAddress {
@@ -151,19 +151,19 @@ impl MSPM0 {
 
     /// Read `DPREC0` and log it, mirroring the `Message()` calls in TI's debug sequences.
     fn read_dprec0(&self, interface: &mut dyn DapAccess) -> Result<u32, ArmError> {
-        let pwr_ap: FullyQualifiedApAddress = ApSel::PwrAp.into();
+        let pwr_ap: FullyQualifiedApAddress = ApSel::Pwr.into();
         let value = interface.read_raw_ap_register(&pwr_ap, DPREC0)?;
         tracing::debug!("{}: DPREC0 is {:#010x}", self.name, value);
         Ok(value)
     }
 
     fn write_dprec0(&self, interface: &mut dyn DapAccess, value: u32) -> Result<(), ArmError> {
-        let pwr_ap: FullyQualifiedApAddress = ApSel::PwrAp.into();
+        let pwr_ap: FullyQualifiedApAddress = ApSel::Pwr.into();
         interface.write_raw_ap_register(&pwr_ap, DPREC0, value)
     }
 
     fn write_sprec(&self, interface: &mut dyn DapAccess, value: u32) -> Result<(), ArmError> {
-        let pwr_ap: FullyQualifiedApAddress = ApSel::PwrAp.into();
+        let pwr_ap: FullyQualifiedApAddress = ApSel::Pwr.into();
         interface.write_raw_ap_register(&pwr_ap, SPREC, value)
     }
 
@@ -173,7 +173,7 @@ impl MSPM0 {
     /// Treating a slow wake as an absent AP would put us straight back into resetting a device
     /// that was only asleep.
     fn ahb_ap_responds(&self, interface: &mut dyn DapAccess) -> bool {
-        let ahb_ap: FullyQualifiedApAddress = ApSel::AhbAp.into();
+        let ahb_ap: FullyQualifiedApAddress = ApSel::Ahb.into();
 
         let start = Instant::now();
         loop {
@@ -231,7 +231,7 @@ impl MSPM0 {
         command: u32,
         what: &str,
     ) -> Result<(), ArmError> {
-        let sec_ap: FullyQualifiedApAddress = ApSel::SecAp.into();
+        let sec_ap: FullyQualifiedApAddress = ApSel::Sec.into();
 
         interface.write_raw_ap_register(&sec_ap, TXCTL, command)?;
         interface.write_raw_ap_register(&sec_ap, TXDATA, 0)?;
