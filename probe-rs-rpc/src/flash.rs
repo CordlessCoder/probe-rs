@@ -187,7 +187,7 @@ pub struct EraseAllRequest {
 
 /// Reset a device's non-volatile configuration to factory default.
 ///
-/// Requires the session to hold `Permissions::allow_factory_reset`.
+/// Restores the device's non-volatile configuration to its factory default.
 #[derive(Serialize, Deserialize, Schema)]
 pub struct FactoryResetRequest {
     pub sessid: Key<Session>,

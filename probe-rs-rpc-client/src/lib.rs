@@ -939,7 +939,7 @@ impl SessionInterface {
 
     /// Reset the target's non-volatile configuration to factory default.
     ///
-    /// Requires the session to have been opened with `allow_factory_reset`.
+    /// Restores the device's non-volatile configuration to its factory default.
     pub async fn factory_reset(
         &self,
         on_msg: impl AsyncFnMut(ProgressEvent),

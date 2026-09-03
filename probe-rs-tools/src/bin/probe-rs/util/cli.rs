@@ -112,7 +112,6 @@ pub async fn attach_probe(
         connect_under_reset: probe_options.connect_under_reset,
         dry_run: probe_options.dry_run,
         allow_erase_all: probe_options.allow_erase_all,
-        allow_factory_reset: probe_options.allow_factory_reset,
         resume_target,
         wait_for_probe: probe_options.attach_timeout,
     }))

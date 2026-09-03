@@ -4,8 +4,7 @@ use probe_rs_rpc_client::RpcClient;
 /// Reset a target's non-volatile configuration to its factory default.
 ///
 /// This is a different operation from `erase`, not a deeper one. It restores the configuration the
-/// device boots with, which on some targets decides whether the device can be debugged at all, so
-/// it needs `--allow-factory-reset` rather than `--allow-erase-all`.
+/// device boots with, which on some targets decides whether the device can be debugged at all.
 #[derive(clap::Parser)]
 pub struct Cmd {
     #[clap(flatten)]

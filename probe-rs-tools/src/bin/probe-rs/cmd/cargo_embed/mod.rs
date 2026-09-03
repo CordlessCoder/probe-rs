@@ -261,7 +261,6 @@ async fn run_embed(
         connect_under_reset: config.general.connect_under_reset,
         dry_run: false,
         allow_erase_all: config.flashing.enabled || config.gdb.enabled,
-        allow_factory_reset: false,
         attach_timeout: None,
     };
 

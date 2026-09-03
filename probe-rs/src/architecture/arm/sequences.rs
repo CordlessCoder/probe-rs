@@ -1191,9 +1191,8 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
     ///
     /// This is a different operation from [`DebugEraseSequence::erase_all`], not a deeper one: it
     /// restores the configuration a device boots with, which on some parts decides whether the
-    /// device can be debugged at all. Implementations must treat it as recoverable-of-last-resort
-    /// rather than a convenience, and callers must hold
-    /// [`crate::Permissions::allow_factory_reset`].
+    /// device can be debugged at all. Implementations must treat it as recovery of last resort
+    /// rather than a convenience.
     ///
     /// It lives here rather than on [`DebugEraseSequence`] because
     /// [`ArmDebugSequence::debug_erase_sequence`] returning `Some` is what tells probe-rs a target

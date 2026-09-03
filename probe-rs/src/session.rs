@@ -53,11 +53,6 @@ pub struct Session {
     interfaces: ArchitectureInterface,
     cores: Vec<CombinedCoreState>,
     configured_trace_sink: Option<TraceSink>,
-    /// What the caller consented to when the session was opened.
-    ///
-    /// Kept for the lifetime of the session rather than consumed during attach, because operations
-    /// that need consent are not all reachable from the attach path.
-    permissions: Permissions,
 }
 
 /// The `SessionConfig` struct is used to configure a new `Session` during auto-attach.
@@ -338,7 +333,6 @@ impl Session {
                 interfaces,
                 cores,
                 configured_trace_sink: None,
-                permissions,
             };
 
             {
@@ -381,7 +375,6 @@ impl Session {
                 interfaces,
                 cores,
                 configured_trace_sink: None,
-                permissions,
             })
         }
     }
@@ -430,7 +423,7 @@ impl Session {
         mut probe: Probe,
         target: Target,
         _attach_method: AttachMethod,
-        permissions: Permissions,
+        _permissions: Permissions,
         cores: Vec<CombinedCoreState>,
     ) -> Result<Self, Error> {
         // While we still don't support mixed architectures
@@ -523,7 +516,6 @@ impl Session {
             interfaces,
             cores,
             configured_trace_sink: None,
-            permissions,
         };
 
         // Connect to the cores
@@ -857,17 +849,14 @@ impl Session {
     /// Reset the device's non-volatile configuration to factory default, if it supports it.
     ///
     /// This is not a deeper erase. It restores the configuration the device boots with, which on
-    /// some parts decides whether the device can be debugged at all, so it is gated on its own
-    /// permission rather than on [`Permissions::allow_erase_all`].
+    /// some parts decides whether the device can be debugged at all.
+    ///
+    /// Like [`Session::sequence_erase_all`], this is not gated on a [`Permissions`] flag: asking
+    /// for it is the consent, the same way `probe-rs erase` is for a chip erase.
     ///
     /// # Errors
     /// NotImplemented if the target has no factory reset sequence.
-    /// MissingPermissions if the session was not opened with [`Permissions::allow_factory_reset`].
     pub fn sequence_factory_reset(&mut self) -> Result<(), Error> {
-        self.permissions
-            .factory_reset()
-            .map_err(|MissingPermissions(desc)| Error::MissingPermissions(desc))?;
-
         let interface_ref = match &mut self.interfaces {
             ArchitectureInterface::Arm(i) => i.deref_mut(),
             ArchitectureInterface::ArmWithRiscv { arm, .. } => arm.deref_mut(),
@@ -915,14 +904,6 @@ impl Session {
     /// NotImplemented if no custom erase sequence exists
     /// Err(e) if the custom erase sequence failed
     pub fn sequence_erase_all(&mut self) -> Result<(), Error> {
-        // A vendor erase sequence is not merely a faster chip erase. The trait documents it as
-        // possibly resetting "other non-volatile chip state to its default setting", which on some
-        // parts is the configuration deciding whether the device can be debugged at all. Ask before
-        // running it, in the shared path, rather than leaving each implementation to remember.
-        self.permissions
-            .erase_all()
-            .map_err(|MissingPermissions(desc)| Error::MissingPermissions(desc))?;
-
         let interface_ref = match &mut self.interfaces {
             ArchitectureInterface::Arm(i) => i.deref_mut(),
             ArchitectureInterface::ArmWithRiscv { arm, .. } => arm.deref_mut(),
@@ -1198,8 +1179,6 @@ fn get_target_from_selector(
 pub struct Permissions {
     /// When set to true, all memory of the chip may be erased
     erase_all: bool,
-    /// When set to true, the chip's non-volatile configuration may be reset to factory default
-    factory_reset: bool,
 }
 
 impl Permissions {
@@ -1213,30 +1192,10 @@ impl Permissions {
     /// # Warning
     /// This may irreversibly remove otherwise read-protected data from the device like security keys and 3rd party firmware.
     /// What happens exactly may differ per device and per probe-rs version.
-    ///
-    /// This does **not** allow resetting the device's non-volatile configuration; see
-    /// [`Permissions::allow_factory_reset`].
     #[must_use]
     pub fn allow_erase_all(self) -> Self {
         Self {
             erase_all: true,
-            ..self
-        }
-    }
-
-    /// Allow the session to reset the chip's non-volatile configuration to factory default.
-    ///
-    /// # Warning
-    /// On some devices that configuration decides whether the device can be debugged at all, so a
-    /// failed or interrupted reset can leave a part unreachable.
-    ///
-    /// This is deliberately not implied by [`Permissions::allow_erase_all`]. Erasing an
-    /// application and resetting the configuration that decides whether a part is reachable are
-    /// different consents, and the second is not a stronger form of the first.
-    #[must_use]
-    pub fn allow_factory_reset(self) -> Self {
-        Self {
-            factory_reset: true,
             ..self
         }
     }
@@ -1246,14 +1205,6 @@ impl Permissions {
             Ok(())
         } else {
             Err(MissingPermissions("erase_all".into()))
-        }
-    }
-
-    pub(crate) fn factory_reset(&self) -> Result<(), MissingPermissions> {
-        if self.factory_reset {
-            Ok(())
-        } else {
-            Err(MissingPermissions("factory_reset".into()))
         }
     }
 }
