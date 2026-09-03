@@ -1,0 +1,1 @@
+CMSIS-DAP: a batch of more than 255 transfers is now split rather than truncated. The `DAP_Transfer` count travels in a single byte and was written with a cast, so a longer batch ran `count % 256` transfers and reported success, leaving the rest of the buffer stale. No packet size in use reached the limit, so nothing hit it in practice.

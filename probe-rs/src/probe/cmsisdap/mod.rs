@@ -129,6 +129,13 @@ impl std::fmt::Debug for CmsisDap {
     }
 }
 
+/// Transfers one `DAP_Transfer` can carry.
+///
+/// The count travels in a single byte, and it is written with a cast rather than a check, so
+/// asking for more does not fail — the probe silently runs `count % 256` of them and reports
+/// having done so.
+const MAX_TRANSFERS_PER_PACKET: usize = u8::MAX as usize;
+
 /// Upper bound on requests in flight in a block write, whatever the probe claims it can buffer.
 ///
 /// The gain is in hiding the round trip, which is already most of the way there at a handful of
@@ -674,7 +681,7 @@ impl CmsisDap {
         // We always immediately process any reads, which means there will never
         // be more than one read in a batch. We also process whenever the batch
         // is as long as can fit in one packet.
-        let max_writes = (self.packet_size as usize - 3) / (1 + 4);
+        let max_writes = ((self.packet_size as usize - 3) / (1 + 4)).min(MAX_TRANSFERS_PER_PACKET);
         if command_is_read || self.batch.len() == max_writes {
             self.process_batch()
         } else {
@@ -1138,7 +1145,8 @@ impl RawDapAccess for CmsisDap {
         // A write costs its address byte plus four of data, and a read costs four in the reply, so
         // sizing by the write case keeps both request and response inside one packet whatever the
         // mix is.
-        let per_packet = ((self.packet_size as usize).saturating_sub(3) / (1 + 4)).max(1);
+        let per_packet = ((self.packet_size as usize).saturating_sub(3) / (1 + 4))
+            .clamp(1, MAX_TRANSFERS_PER_PACKET);
 
         for chunk in accesses.chunks(per_packet) {
             for &(address, value) in chunk {
