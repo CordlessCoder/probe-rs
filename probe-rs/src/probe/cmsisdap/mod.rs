@@ -218,7 +218,6 @@ fn reply_is_not_ours(error: &CmsisDapError) -> bool {
 
 /// What `new_from_device` asks the probe about itself.
 struct ProbeInfo {
-    packet_size: u16,
     packet_count: u8,
     capabilities: Capabilities,
     swo_buffer_size: Option<usize>,
@@ -230,12 +229,15 @@ impl CmsisDap {
         // we'll get out of sync between requests and responses.
         device.drain();
 
-        // Whatever the probe is still holding has to be prompted out of it rather than discarded.
-        resynchronise(&mut device);
+        // Before anything else is asked of the probe. Until this returns, the size a report has to
+        // be to reach the device is a guess -- and some answer nothing at all until they receive a
+        // full one, which is what the retrying inside here is for. Anything sent before it can go
+        // unanswered on those probes for reasons that have nothing to do with the probe's state.
+        let packet_size = device.find_packet_size()? as u16;
 
         // A probe that still owes replies from an earlier session answers the start of this one
-        // with the previous one's data. Drain properly and ask again for as long as the answers
-        // look like they belong to someone else.
+        // with the previous one's data. Drain properly, prompt out what it is holding, and ask
+        // again for as long as the answers look like they belong to someone else.
         let mut info = Self::read_probe_info(&mut device);
         for _ in 1..MAX_OPEN_ATTEMPTS {
             if !matches!(&info, Err(e) if reply_is_not_ours(e)) {
@@ -248,7 +250,6 @@ impl CmsisDap {
         }
 
         let ProbeInfo {
-            packet_size,
             packet_count,
             capabilities: caps,
             swo_buffer_size,
@@ -274,10 +275,6 @@ impl CmsisDap {
     }
 
     fn read_probe_info(device: &mut CmsisDapDevice) -> Result<ProbeInfo, CmsisDapError> {
-        // Determine and set the packet size. We do this as soon as possible after
-        // opening the probe to ensure all future communication uses the correct size.
-        let packet_size = device.find_packet_size()? as u16;
-
         // Read remaining probe information.
         let packet_count = commands::send_command(device, &PacketCountCommand {})?;
         tracing::debug!("Probe buffers {} packets", packet_count);
@@ -300,7 +297,6 @@ impl CmsisDap {
         commands::send_command(device, &HostStatusRequest::connected(false))?;
 
         Ok(ProbeInfo {
-            packet_size,
             packet_count,
             capabilities,
             swo_buffer_size,
