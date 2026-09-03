@@ -17,6 +17,16 @@ impl InvalidDataLengthError {
     }
 }
 
+/// One 32-bit access in a batch, for [`MemoryInterface::access_words_32`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access32 {
+    /// Read the word at this address.
+    Read(u64),
+
+    /// Write this word to this address.
+    Write(u64, u32),
+}
+
 /// Memory access to address {address:#X?} was not aligned to {alignment} bytes.
 #[derive(Debug, thiserror::Error, docsplay::Display)]
 pub struct MemoryNotAlignedError {
@@ -99,10 +109,39 @@ where
     /// do so, which on a debug probe is the difference between one round trip and one per address.
     /// For a contiguous range, [`MemoryInterface::read_32`] remains better.
     ///
-    /// The default reads them one at a time.
+    /// The default defers to [`MemoryInterface::access_words_32`].
     fn read_words_32(&mut self, addresses: &[u64], values: &mut [u32]) -> Result<(), ERR> {
-        for (address, value) in addresses.iter().zip(values.iter_mut()) {
-            *value = self.read_word_32(*address)?;
+        let accesses = addresses
+            .iter()
+            .map(|&address| Access32::Read(address))
+            .collect::<Vec<_>>();
+
+        let mut read = Vec::with_capacity(addresses.len());
+        self.access_words_32(&accesses, &mut read)?;
+
+        values[..read.len()].copy_from_slice(&read);
+
+        Ok(())
+    }
+
+    /// Perform 32-bit reads and writes in order, in as few probe transactions as possible.
+    ///
+    /// Every [`Access32::Read`] appends its word to `values`, in the order the reads appear;
+    /// writes append nothing. Addresses need not be contiguous or ordered, and every one has to be
+    /// a multiple of 4.
+    ///
+    /// This exists for sequences where a write decides what the next read returns, which is most
+    /// of what talking to a debug core consists of: select a register, then read the value it
+    /// selected. Issued one at a time, each read costs a round trip to the probe and each write
+    /// costs the flush in front of it. Ordering between the accesses is preserved.
+    ///
+    /// The default performs them one at a time.
+    fn access_words_32(&mut self, accesses: &[Access32], values: &mut Vec<u32>) -> Result<(), ERR> {
+        for access in accesses {
+            match *access {
+                Access32::Read(address) => values.push(self.read_word_32(address)?),
+                Access32::Write(address, value) => self.write_word_32(address, value)?,
+            }
         }
         Ok(())
     }
@@ -460,6 +499,16 @@ where
     fn read_words_32(&mut self, addresses: &[u64], values: &mut [u32]) -> Result<(), Error> {
         self.memory_mut()
             .read_words_32(addresses, values)
+            .map_err(Error::from)
+    }
+
+    fn access_words_32(
+        &mut self,
+        accesses: &[Access32],
+        values: &mut Vec<u32>,
+    ) -> Result<(), Error> {
+        self.memory_mut()
+            .access_words_32(accesses, values)
             .map_err(Error::from)
     }
 

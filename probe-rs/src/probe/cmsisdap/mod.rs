@@ -1264,15 +1264,20 @@ impl RawDapAccess for CmsisDap {
         accesses: &[(RegisterAddress, Option<u32>)],
         values: &mut Vec<u32>,
     ) -> Result<(), ArmError> {
-        // Anything already queued was requested first and has to stay ahead of these.
-        self.process_batch()?;
+        // Anything already queued was requested first and has to stay ahead of these, which
+        // appending to it does: the batch keeps its order and goes out as one list. It can only
+        // hold writes -- a read is sent the moment it is queued -- so none of it adds to the reply
+        // or to what this call reports back.
+        //
+        // Flushing instead would be a packet of its own, and the sequence this exists for is a
+        // write followed by the read it decides, which is exactly the case that would pay it.
 
         // A write and a read cost different things, and in different directions: every access
         // costs a request byte, a write adds four more of data to the request, and a read adds
         // four to the reply. Charging both at the write price under-fills the packet, and the more
         // reads a batch holds the further under it lands.
         let capacity = self.packet_size as usize;
-        let mut request = HEADER_BYTES;
+        let mut request = HEADER_BYTES + self.batch.len() * (1 + 4);
         let mut response = HEADER_BYTES;
 
         for &(address, value) in accesses {

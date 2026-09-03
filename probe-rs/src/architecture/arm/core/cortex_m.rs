@@ -4,6 +4,7 @@ use crate::{
     CoreInterface, Error, MemoryMappedRegister,
     architecture::arm::{ArmError, memory::ArmMemoryInterface},
     core::RegisterId,
+    memory::Access32,
     memory_mapped_bitfield_register,
     semihosting::SemihostingCommand,
     semihosting::decode_semihosting_syscall,
@@ -139,13 +140,28 @@ pub(crate) fn read_core_reg(
     dcrsr_val.set_regwnr(false); // Perform a read.
     dcrsr_val.set_regsel(addr.into()); // The address of the register to read.
 
-    memory.write_word_32(Dcrsr::get_mmio_address(), dcrsr_val.into())?;
+    // Select the register, then ask for the ready flag and the value in one request. The core
+    // completes the transfer in a couple of its own clocks, and the two reads reach the wire tens
+    // of microseconds apart, so the value is already there -- and the flag that comes back with it
+    // says whether it was.
+    let mut answers = Vec::with_capacity(2);
+    memory.access_words_32(
+        &[
+            Access32::Write(Dcrsr::get_mmio_address(), dcrsr_val.into()),
+            Access32::Read(Dhcsr::get_mmio_address()),
+            Access32::Read(Dcrdr::get_mmio_address()),
+        ],
+        &mut answers,
+    )?;
 
+    if Dhcsr(answers[0]).s_regrdy() {
+        return Ok(answers[1]);
+    }
+
+    // Asked too early, which the flag is there to catch. Wait for it and read the value again.
     wait_for_core_register_transfer(memory, Duration::from_millis(100))?;
 
-    let value = memory.read_word_32(Dcrdr::get_mmio_address())?;
-
-    Ok(value)
+    memory.read_word_32(Dcrdr::get_mmio_address())
 }
 
 pub(crate) fn write_core_reg(

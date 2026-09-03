@@ -8,6 +8,7 @@ use crate::{
         },
         memory::ArmMemoryInterface,
     },
+    memory::Access32,
     probe::DebugProbeError,
 };
 
@@ -141,16 +142,32 @@ where
         Ok(())
     }
 
-    fn read_words_32(&mut self, addresses: &[u64], values: &mut [u32]) -> Result<(), ArmError> {
-        if let Some(&address) = addresses.iter().find(|a| !a.is_multiple_of(4)) {
+    fn access_words_32(
+        &mut self,
+        accesses: &[Access32],
+        values: &mut Vec<u32>,
+    ) -> Result<(), ArmError> {
+        let address_of = |access: &Access32| match *access {
+            Access32::Read(address) => address,
+            Access32::Write(address, _) => address,
+        };
+
+        if let Some(address) = accesses
+            .iter()
+            .map(address_of)
+            .find(|a| !a.is_multiple_of(4))
+        {
             return Err(ArmError::alignment_error(address, 4));
         }
 
         // A 64-bit address needs TAR2 set as well, which would put a second write between the
-        // address and its read. Nothing needs that yet, so leave those to the one-at-a-time path.
-        if addresses.iter().any(|a| a >> 32 != 0) {
-            for (address, value) in addresses.iter().zip(values.iter_mut()) {
-                *value = self.read_word_32(*address)?;
+        // address and its access. Nothing needs that yet, so leave those to the one-at-a-time path.
+        if accesses.iter().map(address_of).any(|a| a >> 32 != 0) {
+            for access in accesses {
+                match *access {
+                    Access32::Read(address) => values.push(self.read_word_32(address)?),
+                    Access32::Write(address, value) => self.write_word_32(address, value)?,
+                }
             }
             return Ok(());
         }
@@ -158,29 +175,41 @@ where
         self.memory_ap
             .try_set_datasize(self.interface, DataSize::U32)?;
 
-        // Address then value, per word. Both registers are in the same bank, which is what lets
+        // Address then value, per access. Both registers are in the same bank, which is what lets
         // the whole run go to the probe as a single list.
-        let accesses = addresses
+        let reads = accesses
             .iter()
-            .flat_map(|&address| [(TAR::ADDRESS, Some(address as u32)), (DRW::ADDRESS, None)])
+            .filter(|a| matches!(a, Access32::Read(_)))
+            .count();
+        let raw = accesses
+            .iter()
+            .flat_map(|access| {
+                let value = match *access {
+                    Access32::Read(_) => None,
+                    Access32::Write(_, value) => Some(value),
+                };
+                [
+                    (TAR::ADDRESS, Some(address_of(access) as u32)),
+                    (DRW::ADDRESS, value),
+                ]
+            })
             .collect::<Vec<_>>();
 
-        let mut read = Vec::with_capacity(addresses.len());
+        let mut read = Vec::with_capacity(reads);
         self.interface.read_raw_ap_registers_batched(
             &self.memory_ap.ap_address().clone(),
-            &accesses,
+            &raw,
             &mut read,
         )?;
 
-        if read.len() != addresses.len() {
+        if read.len() != reads {
             return Err(ArmError::Probe(DebugProbeError::Other(format!(
-                "expected {} words from a batched read, got {}",
-                addresses.len(),
+                "expected {reads} words from a batched access, got {}",
                 read.len()
             ))));
         }
 
-        values[..read.len()].copy_from_slice(&read);
+        values.extend_from_slice(&read);
 
         Ok(())
     }
