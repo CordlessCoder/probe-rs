@@ -58,6 +58,19 @@ pub trait CoreInterface: MemoryInterface {
     /// Does nothing on architectures that do not report status to the probe.
     fn hold_status_reports(&mut self) {}
 
+    /// Stop decoding a breakpoint halt as a possible semihosting call.
+    ///
+    /// Deciding costs a read of the program counter and a read of the instruction under it. Code
+    /// the debugger supplied and runs itself -- a flash algorithm, which halts on the breakpoint at
+    /// its own return address once per sector erased and page programmed -- cannot be making a
+    /// semihosting call, so those reads only ever confirm what the caller already knew.
+    ///
+    /// Does nothing on architectures without semihosting support.
+    fn hold_semihosting_checks(&mut self) {}
+
+    /// Decode breakpoint halts as possible semihosting calls again.
+    fn release_semihosting_checks(&mut self) {}
+
     /// Report every core status change again, and tell the probe the current one.
     fn release_status_reports(&mut self) {}
 
@@ -330,6 +343,18 @@ impl<'probe> Core<'probe> {
     /// See [`CoreInterface::hold_status_reports`].
     pub fn hold_status_reports(&mut self) {
         self.inner.hold_status_reports();
+    }
+
+    /// Stop decoding a breakpoint halt as a possible semihosting call.
+    ///
+    /// See [`CoreInterface::hold_semihosting_checks`].
+    pub fn hold_semihosting_checks(&mut self) {
+        self.inner.hold_semihosting_checks();
+    }
+
+    /// Decode breakpoint halts as possible semihosting calls again.
+    pub fn release_semihosting_checks(&mut self) {
+        self.inner.release_semihosting_checks();
     }
 
     /// Report every core status change again, and tell the probe the current one.

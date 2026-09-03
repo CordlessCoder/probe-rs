@@ -316,6 +316,11 @@ impl Flasher {
         // running, and the round trip is not paid again on every sector.
         flasher.core.hold_status_reports();
 
+        // The algorithm returns onto the breakpoint at its own return address, so every call ends
+        // in a breakpoint halt that is never a semihosting call. Deciding that costs a read of the
+        // program counter and a read of the instruction under it, on every sector and every page.
+        flasher.core.hold_semihosting_checks();
+
         flasher.init(clock)?;
 
         Ok((flasher, &mut self.regions))
@@ -852,6 +857,7 @@ impl<O: Operation> Drop for ActiveFlasher<'_, '_, O> {
         // Whatever ended the operation, including an error part way through it, the probe is owed
         // the state the core actually ended in.
         self.core.release_status_reports();
+        self.core.release_semihosting_checks();
     }
 }
 

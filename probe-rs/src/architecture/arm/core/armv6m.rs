@@ -500,6 +500,14 @@ impl CoreInterface for Armv6m<'_> {
         Ok(status.is_halted())
     }
 
+    fn hold_semihosting_checks(&mut self) {
+        self.state.hold_semihosting_checks();
+    }
+
+    fn release_semihosting_checks(&mut self) {
+        self.state.release_semihosting_checks();
+    }
+
     fn hold_status_reports(&mut self) {
         self.state.hold_status_reports();
     }
@@ -566,7 +574,14 @@ impl CoreInterface for Armv6m<'_> {
             // Set the status so any semihosting operations will know we're halted
             self.set_core_status(CoreStatus::Halted(reason));
 
-            if let HaltReason::Breakpoint(_) = reason {
+            // Deciding whether a breakpoint is a semihosting call means reading the program
+            // counter and then the instruction under it, four round trips to the probe. A flash
+            // algorithm ends every call on the breakpoint the debugger put at its return address,
+            // so the answer is known in advance and paying for it once per sector erased and page
+            // programmed is the bulk of what an algorithm call costs.
+            if self.state.semihosting_possible()
+                && let HaltReason::Breakpoint(_) = reason
+            {
                 self.state.semihosting_command = super::cortex_m::check_for_semihosting(
                     self.state.semihosting_command.take(),
                     self,
