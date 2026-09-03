@@ -1228,23 +1228,69 @@ impl RawDapAccess for CmsisDap {
 
         let total_num_reads = values.len();
 
-        for (i, chunk) in values.chunks_mut(data_chunk_len).enumerate() {
-            let mut request = TransferBlockRequest::read_request(address, chunk.len() as u16);
-            request.dap_index = self.jtag_state.chain_params.index as u8;
+        let requests = values
+            .chunks(data_chunk_len)
+            .map(|chunk| {
+                let mut request = TransferBlockRequest::read_request(address, chunk.len() as u16);
+                request.dap_index = self.jtag_state.chain_params.index as u8;
+                request
+            })
+            .collect::<Vec<_>>();
 
-            tracing::debug!("Transfer block: chunk={}, len={} bytes", i, chunk.len() * 4);
+        // Same round-trip hiding as the write path above.
+        let depth = (self.packet_count as usize).clamp(1, MAX_PIPELINED_WRITES);
 
-            let resp: TransferBlockResponse = commands::send_command(&mut self.device, &request)
-                .map_err(DebugProbeError::from)?;
+        let mut result = Ok(());
+        let mut sent = 0;
+        let mut received = 0;
 
-            let executed_reads = i * data_chunk_len + usize::from(resp.transfer_count);
+        while received < requests.len() {
+            while sent < requests.len() && sent - received < depth && result.is_ok() {
+                if let Err(e) = commands::send_request(&mut self.device, &requests[sent]) {
+                    result = Err(ArmError::from(DebugProbeError::from(e)));
+                    break;
+                }
+                sent += 1;
+            }
 
-            self.handle_transfer_block_response(address, &resp, executed_reads, total_num_reads)?;
+            if sent == received {
+                break;
+            }
 
-            chunk.clone_from_slice(&resp.transfer_data[..]);
+            // As on the write path, every reply that was asked for has to be taken, or the next
+            // command on this device reads someone else's answer.
+            match commands::receive_response::<TransferBlockRequest>(
+                &mut self.device,
+                &requests[received],
+            ) {
+                Ok(resp) => {
+                    let executed_reads =
+                        received * data_chunk_len + usize::from(resp.transfer_count);
+                    let outcome = self.handle_transfer_block_response(
+                        address,
+                        &resp,
+                        executed_reads,
+                        total_num_reads,
+                    );
+                    match outcome {
+                        Ok(()) => {
+                            let start = received * data_chunk_len;
+                            let chunk = &mut values[start..start + resp.transfer_data.len()];
+                            chunk.clone_from_slice(&resp.transfer_data[..]);
+                        }
+                        Err(e) if result.is_ok() => result = Err(e),
+                        Err(_) => {}
+                    }
+                }
+                Err(e) if result.is_ok() => {
+                    result = Err(ArmError::from(DebugProbeError::from(e)));
+                }
+                Err(_) => {}
+            }
+            received += 1;
         }
 
-        Ok(())
+        result
     }
 
     fn raw_flush(&mut self) -> Result<(), ArmError> {

@@ -1,1 +1,0 @@
-CMSIS-DAP: block writes now keep several requests in flight instead of waiting for each reply before sending the next. Probes report how many packets they can buffer, and probe-rs read that value without using it; one that reports a single packet is unaffected.
