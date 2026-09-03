@@ -1262,8 +1262,14 @@ impl RawDapAccess for CmsisDap {
     fn raw_access_batch(
         &mut self,
         accesses: &[(RegisterAddress, Option<u32>)],
-        values: &mut Vec<u32>,
+        values: &mut [u32],
     ) -> Result<(), ArmError> {
+        let mut read = 0;
+        let collect = |batch: Vec<u32>, values: &mut [u32], read: &mut usize| {
+            values[*read..][..batch.len()].copy_from_slice(&batch);
+            *read += batch.len();
+        };
+
         // Anything already queued was requested first and has to stay ahead of these, which
         // appending to it does: the batch keeps its order and goes out as one list. It can only
         // hold writes -- a read is sent the moment it is queued -- so none of it adds to the reply
@@ -1293,7 +1299,7 @@ impl RawDapAccess for CmsisDap {
                     || response + in_response > capacity
                     || self.batch.len() == MAX_TRANSFERS_PER_PACKET)
             {
-                values.extend(self.process_batch_reads()?);
+                collect(self.process_batch_reads()?, values, &mut read);
                 request = HEADER_BYTES;
                 response = HEADER_BYTES;
             }
@@ -1307,7 +1313,7 @@ impl RawDapAccess for CmsisDap {
             });
         }
 
-        values.extend(self.process_batch_reads()?);
+        collect(self.process_batch_reads()?, values, &mut read);
 
         Ok(())
     }

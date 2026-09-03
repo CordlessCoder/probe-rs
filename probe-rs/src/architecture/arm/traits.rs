@@ -274,12 +274,16 @@ pub trait RawDapAccess {
     fn raw_access_batch(
         &mut self,
         accesses: &[(RegisterAddress, Option<u32>)],
-        values: &mut Vec<u32>,
+        values: &mut [u32],
     ) -> Result<(), ArmError> {
+        let mut read = 0;
         for &(address, value) in accesses {
             match value {
                 Some(value) => self.raw_write_register(address, value)?,
-                None => values.push(self.raw_read_register(address)?),
+                None => {
+                    values[read] = self.raw_read_register(address)?;
+                    read += 1;
+                }
             }
         }
 
@@ -417,12 +421,16 @@ pub trait DapAccess {
         &mut self,
         ap: &FullyQualifiedApAddress,
         accesses: &[(u64, Option<u32>)],
-        values: &mut Vec<u32>,
+        values: &mut [u32],
     ) -> Result<(), ArmError> {
+        let mut read = 0;
         for &(addr, value) in accesses {
             match value {
                 Some(value) => self.write_raw_ap_register(ap, addr, value)?,
-                None => values.push(self.read_raw_ap_register(ap, addr)?),
+                None => {
+                    values[read] = self.read_raw_ap_register(ap, addr)?;
+                    read += 1;
+                }
             }
         }
         Ok(())

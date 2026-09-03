@@ -116,12 +116,7 @@ where
             .map(|&address| Access32::Read(address))
             .collect::<Vec<_>>();
 
-        let mut read = Vec::with_capacity(addresses.len());
-        self.access_words_32(&accesses, &mut read)?;
-
-        values[..read.len()].copy_from_slice(&read);
-
-        Ok(())
+        self.access_words_32(&accesses, values)
     }
 
     /// Perform 32-bit reads and writes in order, in as few probe transactions as possible.
@@ -135,11 +130,17 @@ where
     /// selected. Issued one at a time, each read costs a round trip to the probe and each write
     /// costs the flush in front of it. Ordering between the accesses is preserved.
     ///
+    /// `values` takes one word per [`Access32::Read`] and has to be at least that long.
+    ///
     /// The default performs them one at a time.
-    fn access_words_32(&mut self, accesses: &[Access32], values: &mut Vec<u32>) -> Result<(), ERR> {
+    fn access_words_32(&mut self, accesses: &[Access32], values: &mut [u32]) -> Result<(), ERR> {
+        let mut read = 0;
         for access in accesses {
             match *access {
-                Access32::Read(address) => values.push(self.read_word_32(address)?),
+                Access32::Read(address) => {
+                    values[read] = self.read_word_32(address)?;
+                    read += 1;
+                }
                 Access32::Write(address, value) => self.write_word_32(address, value)?,
             }
         }
@@ -502,11 +503,7 @@ where
             .map_err(Error::from)
     }
 
-    fn access_words_32(
-        &mut self,
-        accesses: &[Access32],
-        values: &mut Vec<u32>,
-    ) -> Result<(), Error> {
+    fn access_words_32(&mut self, accesses: &[Access32], values: &mut [u32]) -> Result<(), Error> {
         self.memory_mut()
             .access_words_32(accesses, values)
             .map_err(Error::from)

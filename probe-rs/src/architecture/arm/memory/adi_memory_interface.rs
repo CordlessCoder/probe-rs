@@ -145,7 +145,7 @@ where
     fn access_words_32(
         &mut self,
         accesses: &[Access32],
-        values: &mut Vec<u32>,
+        values: &mut [u32],
     ) -> Result<(), ArmError> {
         let address_of = |access: &Access32| match *access {
             Access32::Read(address) => address,
@@ -163,9 +163,13 @@ where
         // A 64-bit address needs TAR2 set as well, which would put a second write between the
         // address and its access. Nothing needs that yet, so leave those to the one-at-a-time path.
         if accesses.iter().map(address_of).any(|a| a >> 32 != 0) {
+            let mut read = 0;
             for access in accesses {
                 match *access {
-                    Access32::Read(address) => values.push(self.read_word_32(address)?),
+                    Access32::Read(address) => {
+                        values[read] = self.read_word_32(address)?;
+                        read += 1;
+                    }
                     Access32::Write(address, value) => self.write_word_32(address, value)?,
                 }
             }
@@ -195,21 +199,11 @@ where
             })
             .collect::<Vec<_>>();
 
-        let mut read = Vec::with_capacity(reads);
         self.interface.read_raw_ap_registers_batched(
             &self.memory_ap.ap_address().clone(),
             &raw,
-            &mut read,
+            &mut values[..reads],
         )?;
-
-        if read.len() != reads {
-            return Err(ArmError::Probe(DebugProbeError::Other(format!(
-                "expected {reads} words from a batched access, got {}",
-                read.len()
-            ))));
-        }
-
-        values.extend_from_slice(&read);
 
         Ok(())
     }

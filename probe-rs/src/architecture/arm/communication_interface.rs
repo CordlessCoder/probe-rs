@@ -594,7 +594,7 @@ impl DapAccess for ArmCommunicationInterface {
         &mut self,
         ap: &FullyQualifiedApAddress,
         accesses: &[(u64, Option<u32>)],
-        values: &mut Vec<u32>,
+        values: &mut [u32],
     ) -> Result<(), ArmError> {
         let Some(&(first, _)) = accesses.first() else {
             return Ok(());

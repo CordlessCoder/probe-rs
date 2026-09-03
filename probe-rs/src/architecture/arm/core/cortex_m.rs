@@ -144,7 +144,7 @@ pub(crate) fn read_core_reg(
     // completes the transfer in a couple of its own clocks, and the two reads reach the wire tens
     // of microseconds apart, so the value is already there -- and the flag that comes back with it
     // says whether it was.
-    let mut answers = Vec::with_capacity(2);
+    let mut answers = [0u32; 2];
     memory.access_words_32(
         &[
             Access32::Write(Dcrsr::get_mmio_address(), dcrsr_val.into()),
@@ -203,7 +203,7 @@ pub(crate) fn write_core_regs(
         accesses.push(Access32::Read(Dhcsr::get_mmio_address()));
     }
 
-    let mut ready = Vec::with_capacity(registers.len());
+    let mut ready = vec![0u32; registers.len()];
     memory.access_words_32(&accesses, &mut ready)?;
 
     // Every transfer is still checked for having completed, just not before the next one is
