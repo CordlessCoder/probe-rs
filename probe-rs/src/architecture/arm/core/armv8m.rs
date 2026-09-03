@@ -95,7 +95,13 @@ impl<'probe> Armv8m<'probe> {
         if new_status == CoreStatus::Running {
             self.state.pc_written = false;
         }
-        super::update_core_status(&mut self.memory, &mut self.state.current_state, new_status);
+        let report = self.state.report_status(new_status);
+        super::update_core_status(
+            &mut self.memory,
+            &mut self.state.current_state,
+            new_status,
+            report,
+        );
     }
 
     fn wait_for_status(
@@ -126,6 +132,16 @@ impl CoreInterface for Armv8m<'_> {
     fn core_halted(&mut self) -> Result<bool, Error> {
         // Wait until halted state is active again.
         Ok(self.status()?.is_halted())
+    }
+
+    fn hold_status_reports(&mut self) {
+        self.state.hold_status_reports();
+    }
+
+    fn release_status_reports(&mut self) {
+        self.state.release_status_reports();
+        let status = self.state.current_state;
+        self.memory.update_core_status(status);
     }
 
     fn status(&mut self) -> Result<crate::core::CoreStatus, Error> {

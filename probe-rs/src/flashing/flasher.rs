@@ -310,6 +310,12 @@ impl Flasher {
             _operation: PhantomData,
         };
 
+        // One operation runs the algorithm once per sector or page, and the probe is told each
+        // time the core starts and stops so it can drive an indicator. Hold that for the length of
+        // the operation: the first change still goes out, so the indicator reports the target
+        // running, and the round trip is not paid again on every sector.
+        flasher.core.hold_status_reports();
+
         flasher.init(clock)?;
 
         Ok((flasher, &mut self.regions))
@@ -839,6 +845,14 @@ pub struct ActiveFlasher<'op, 'p, O: Operation> {
     flash_algorithm: &'op FlashAlgorithm,
     read_flasher_rtt: bool,
     _operation: PhantomData<O>,
+}
+
+impl<O: Operation> Drop for ActiveFlasher<'_, '_, O> {
+    fn drop(&mut self) {
+        // Whatever ended the operation, including an error part way through it, the probe is owed
+        // the state the core actually ended in.
+        self.core.release_status_reports();
+    }
 }
 
 impl<O: Operation> ActiveFlasher<'_, '_, O> {
