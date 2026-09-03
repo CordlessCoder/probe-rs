@@ -397,7 +397,12 @@ impl<'probe> Armv7ar<'probe> {
     }
 
     fn set_core_status(&mut self, new_status: CoreStatus) {
-        super::update_core_status(&mut self.memory, &mut self.state.current_state, new_status);
+        super::update_core_status(
+            &mut self.memory,
+            &mut self.state.current_state,
+            new_status,
+            true,
+        );
     }
 
     pub(crate) fn halted_access<R>(

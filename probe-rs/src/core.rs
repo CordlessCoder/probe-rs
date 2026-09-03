@@ -47,6 +47,20 @@ pub trait CoreInterface: MemoryInterface {
     /// Returns the current status of the core.
     fn status(&mut self) -> Result<CoreStatus, Error>;
 
+    /// Report only the next core status change to the probe, and none after it.
+    ///
+    /// The probe is told about status changes so it can drive an indicator, and telling it costs a
+    /// round trip. Code that halts and releases the core repeatedly -- a flash algorithm does it
+    /// once per sector erased and per page programmed -- pays that on every cycle for an indicator
+    /// that would only flicker. Letting the first change through keeps the indicator honest about
+    /// the target running, and [`CoreInterface::release_status_reports`] puts it back in step.
+    ///
+    /// Does nothing on architectures that do not report status to the probe.
+    fn hold_status_reports(&mut self) {}
+
+    /// Report every core status change again, and tell the probe the current one.
+    fn release_status_reports(&mut self) {}
+
     /// Try to halt the core. This function ensures the core is actually halted, and
     /// returns a [`DebugProbeError::Timeout`](crate::probe::DebugProbeError::Timeout) otherwise.
     fn halt(&mut self, timeout: Duration) -> Result<CoreInformation, Error>;
@@ -309,6 +323,18 @@ impl<'probe> Core<'probe> {
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn status(&mut self) -> Result<CoreStatus, Error> {
         self.inner.status()
+    }
+
+    /// Report only the next core status change to the probe, and none after it.
+    ///
+    /// See [`CoreInterface::hold_status_reports`].
+    pub fn hold_status_reports(&mut self) {
+        self.inner.hold_status_reports();
+    }
+
+    /// Report every core status change again, and tell the probe the current one.
+    pub fn release_status_reports(&mut self) {
+        self.inner.release_status_reports();
     }
 
     /// Read the value of a core register.
