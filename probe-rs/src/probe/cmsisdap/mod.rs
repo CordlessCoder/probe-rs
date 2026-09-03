@@ -153,6 +153,23 @@ const MAX_OPEN_ATTEMPTS: usize = 8;
 /// seen. Only paid on the recovery path.
 const BACKLOG_IDLE: Duration = Duration::from_millis(100);
 
+/// Whether an error says the probe answered with something that was not a reply to what was asked.
+///
+/// A timeout or a USB failure says the probe is gone or silent, which asking again does not fix.
+/// These say a reply arrived and made no sense as an answer to the question, which is what a
+/// backlog from an earlier session looks like.
+fn reply_is_not_ours(error: &CmsisDapError) -> bool {
+    matches!(
+        error,
+        CmsisDapError::Send {
+            source: SendError::CommandIdMismatch(..)
+                | SendError::UnexpectedAnswer
+                | SendError::NotEnoughData,
+            ..
+        }
+    )
+}
+
 /// What `new_from_device` asks the probe about itself.
 struct ProbeInfo {
     packet_size: u16,
@@ -168,21 +185,11 @@ impl CmsisDap {
         device.drain();
 
         // A probe that still owes replies from an earlier session answers the start of this one
-        // with the previous one's data, and `DAP_Info` cannot detect that by itself: every
-        // sub-command shares command ID 0x00 and the reply says nothing about which one it
-        // answers, so a stale packet count parses cleanly as a capability mask and the probe is
-        // reported as not supporting SWD. Only a reply from some other command identifies itself
-        // as out of place, so on one of those, drain properly and ask everything again.
+        // with the previous one's data. Drain properly and ask again for as long as the answers
+        // look like they belong to someone else.
         let mut info = Self::read_probe_info(&mut device);
         for _ in 1..MAX_OPEN_ATTEMPTS {
-            let stale = matches!(
-                info,
-                Err(CmsisDapError::Send {
-                    source: SendError::CommandIdMismatch(..),
-                    ..
-                })
-            );
-            if !stale {
+            if !matches!(&info, Err(e) if reply_is_not_ours(e)) {
                 break;
             }
 
@@ -234,6 +241,13 @@ impl CmsisDap {
             swo_buffer_size = Some(swo_size as usize);
             tracing::debug!("Probe SWO buffer size: {}", swo_size);
         }
+
+        // Nothing above can tell its own answer from one the probe still owed. Every `DAP_Info`
+        // sub-command shares command ID 0x00 and the reply does not say which one it answers, so
+        // a stale packet count reads as a capability mask and the probe comes out not supporting
+        // SWD. A command with a different ID does say: if anything was queued ahead of it, its
+        // reply arrives under the wrong ID, and everything read above came from the backlog.
+        commands::send_command(device, &HostStatusRequest::connected(false))?;
 
         Ok(ProbeInfo {
             packet_size,
