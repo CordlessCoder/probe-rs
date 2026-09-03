@@ -157,6 +157,24 @@ pub struct CortexMState {
     /// core again immediately. Writing the program counter moves the core off whatever it halted
     /// on, so that step has nothing left to step over.
     pc_written: bool,
+
+    /// Whether core status changes are still being reported to the probe.
+    status_reports: StatusReports,
+}
+
+/// Whether to pass core status changes on to the probe, which uses them to drive an indicator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusReports {
+    /// Every change is reported.
+    Live,
+
+    /// Only the first change is reported, and `sent` records whether it has been.
+    ///
+    /// A flash algorithm halts and releases the core once per sector erased and per page
+    /// programmed, and each change costs a round trip to tell the probe about. Letting the first
+    /// one through means the indicator still turns on when the target starts running; the ones
+    /// after it say nothing a person watching could read.
+    Held { sent: bool },
 }
 
 impl CortexMState {
@@ -169,6 +187,32 @@ impl CortexMState {
             semihosting_command: None,
             pending_step: false,
             pc_written: false,
+            status_reports: StatusReports::Live,
+        }
+    }
+
+    /// Report the next status change to the probe and then stop reporting them.
+    pub(crate) fn hold_status_reports(&mut self) {
+        self.status_reports = StatusReports::Held { sent: false };
+    }
+
+    /// Report every status change again.
+    pub(crate) fn release_status_reports(&mut self) {
+        self.status_reports = StatusReports::Live;
+    }
+
+    /// Whether a change to `new_status` should reach the probe, recording it if it does.
+    ///
+    /// Takes the new status so that a change which is not one does not use up the single report a
+    /// held state allows.
+    pub(crate) fn report_status(&mut self, new_status: CoreStatus) -> bool {
+        if self.current_state == new_status {
+            return false;
+        }
+
+        match &mut self.status_reports {
+            StatusReports::Live => true,
+            StatusReports::Held { sent } => !std::mem::replace(sent, true),
         }
     }
 
@@ -265,8 +309,9 @@ pub fn update_core_status<P: ArmMemoryInterface + ?Sized, T: core::ops::DerefMut
     probe: &mut T,
     current_status: &mut CoreStatus,
     new_status: CoreStatus,
+    report: bool,
 ) {
-    if *current_status != new_status {
+    if *current_status != new_status && report {
         probe.deref_mut().update_core_status(new_status);
     }
     *current_status = new_status;
