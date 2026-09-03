@@ -742,7 +742,15 @@ impl CoreInterface for Armv7m<'_> {
     }
 
     fn status(&mut self) -> Result<CoreStatus, Error> {
-        let dhcsr = Dhcsr(self.memory.read_word_32(Dhcsr::get_mmio_address())?);
+        // Ask for the fault status alongside the halt status. It is only wanted when the core
+        // turns out to be halted, but a read that rides along in the same request is free, and
+        // fetching it afterwards costs a round trip of its own.
+        let mut answers = [0u32; 2];
+        self.memory.read_words_32(
+            &[Dhcsr::get_mmio_address(), Dfsr::get_mmio_address()],
+            &mut answers,
+        )?;
+        let dhcsr = Dhcsr(answers[0]);
 
         if dhcsr.s_lockup() {
             tracing::debug!(
@@ -767,7 +775,7 @@ impl CoreInterface for Armv7m<'_> {
         }
 
         if dhcsr.s_halt() {
-            let dfsr = Dfsr(self.memory.read_word_32(Dfsr::get_mmio_address())?);
+            let dfsr = Dfsr(answers[1]);
 
             let mut reason = dfsr.halt_reason();
             reason = self.state.resolve_halt_reason(reason);
