@@ -500,6 +500,24 @@ impl CoreInterface for Armv6m<'_> {
         Ok(status.is_halted())
     }
 
+    fn write_core_regs(&mut self, registers: &[(RegisterId, RegisterValue)]) -> Result<(), Error> {
+        if !self.state.current_state.is_halted() {
+            return Err(Error::Arm(ArmError::CoreNotHalted));
+        }
+
+        let mut values = Vec::with_capacity(registers.len());
+        for &(address, value) in registers {
+            if address == self.program_counter().id {
+                self.state.note_pc_written();
+            }
+            values.push((address, value.try_into()?));
+        }
+
+        super::cortex_m::write_core_regs(&mut *self.memory, &values)?;
+
+        Ok(())
+    }
+
     fn hold_semihosting_checks(&mut self) {
         self.state.hold_semihosting_checks();
     }

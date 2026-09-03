@@ -58,6 +58,18 @@ pub trait CoreInterface: MemoryInterface {
     /// Does nothing on architectures that do not report status to the probe.
     fn hold_status_reports(&mut self) {}
 
+    /// Write several core registers.
+    ///
+    /// Implementations that can put the whole sequence into one probe transaction do so, which is
+    /// worth having wherever a set of registers is being staged before the core runs. The default
+    /// writes them one at a time.
+    fn write_core_regs(&mut self, registers: &[(RegisterId, RegisterValue)]) -> Result<(), Error> {
+        for &(address, value) in registers {
+            self.write_core_reg(address, value)?;
+        }
+        Ok(())
+    }
+
     /// Stop decoding a breakpoint halt as a possible semihosting call.
     ///
     /// Deciding costs a read of the program counter and a read of the instruction under it. Code
@@ -343,6 +355,16 @@ impl<'probe> Core<'probe> {
     /// See [`CoreInterface::hold_status_reports`].
     pub fn hold_status_reports(&mut self) {
         self.inner.hold_status_reports();
+    }
+
+    /// Write several core registers, in as few probe transactions as possible.
+    ///
+    /// See [`CoreInterface::write_core_regs`].
+    pub fn write_core_regs(
+        &mut self,
+        registers: &[(RegisterId, RegisterValue)],
+    ) -> Result<(), Error> {
+        self.inner.write_core_regs(registers)
     }
 
     /// Stop decoding a breakpoint halt as a possible semihosting call.

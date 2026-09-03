@@ -1039,33 +1039,47 @@ impl<O: Operation> ActiveFlasher<'_, '_, O> {
             ),
         ];
 
-        for (description, value) in registers {
-            if let Some(v) = value {
-                self.core.write_core_reg(description, v).map_err(|error| {
-                    FlashError::Core(Error::WriteRegister {
-                        register: description.to_string(),
-                        source: Box::new(error),
-                    })
-                })?;
+        // Stage the whole set in one request. Written one at a time, each register costs a round
+        // trip to the probe for the ready flag that the next one waits on.
+        let staged = registers
+            .iter()
+            .filter_map(|&(description, value)| value.map(|v| (description, v)))
+            .collect::<Vec<_>>();
 
-                if tracing::enabled!(Level::DEBUG) {
-                    let readback: RegisterValue =
-                        self.core.read_core_reg(description).map_err(|error| {
-                            FlashError::Core(Error::ReadRegister {
-                                register: description.to_string(),
-                                source: Box::new(error),
-                            })
-                        })?;
-                    let readback_val: u64 = readback.try_into().unwrap_or(0);
+        let writes = staged
+            .iter()
+            .map(|&(description, v)| (description.id, RegisterValue::from(v)))
+            .collect::<Vec<_>>();
 
-                    tracing::debug!(
-                        "content of {} {:#x}: {:#018x} should be: {:#018x}",
-                        description.name(),
-                        description.id.0,
-                        readback_val,
-                        v
-                    );
-                }
+        self.core.write_core_regs(&writes).map_err(|error| {
+            FlashError::Core(Error::WriteRegister {
+                register: staged
+                    .iter()
+                    .map(|(description, _)| description.name())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                source: Box::new(error),
+            })
+        })?;
+
+        if tracing::enabled!(Level::DEBUG) {
+            for (description, v) in staged {
+                let readback: RegisterValue =
+                    self.core.read_core_reg(description).map_err(|error| {
+                        FlashError::Core(Error::ReadRegister {
+                            register: description.to_string(),
+                            source: Box::new(error),
+                        })
+                    })?;
+                let readback_val: u64 = readback.try_into().unwrap_or(0);
+
+                tracing::debug!(
+                    "content of {} {:#x}: {:#018x} should be: {:#018x}",
+                    description.name(),
+                    description.id.0,
+                    readback_val,
+                    v
+                );
             }
         }
 

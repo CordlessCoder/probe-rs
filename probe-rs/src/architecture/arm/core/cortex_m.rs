@@ -183,6 +183,45 @@ pub(crate) fn write_core_reg(
     Ok(())
 }
 
+/// Write several core registers, sending the whole sequence to the probe as one request.
+///
+/// Each register costs a write of its value, a write selecting it, and a read of the ready flag.
+/// Sent one register at a time, the read in the middle is a round trip to the probe that the next
+/// register waits on.
+pub(crate) fn write_core_regs(
+    memory: &mut dyn ArmMemoryInterface,
+    registers: &[(RegisterId, u32)],
+) -> Result<(), ArmError> {
+    let mut accesses = Vec::with_capacity(registers.len() * 3);
+    for &(addr, value) in registers {
+        let mut dcrsr_val = Dcrsr(0);
+        dcrsr_val.set_regwnr(true);
+        dcrsr_val.set_regsel(addr.into());
+
+        accesses.push(Access32::Write(Dcrdr::get_mmio_address(), value));
+        accesses.push(Access32::Write(Dcrsr::get_mmio_address(), dcrsr_val.into()));
+        accesses.push(Access32::Read(Dhcsr::get_mmio_address()));
+    }
+
+    let mut ready = Vec::with_capacity(registers.len());
+    memory.access_words_32(&accesses, &mut ready)?;
+
+    // Every transfer is still checked for having completed, just not before the next one is
+    // queued. The core finishes one in a couple of its own clocks and the accesses reach the wire
+    // tens of microseconds apart, so it has. A flag that comes back clear says a write may not
+    // have landed, and does not say which, so redo the set one at a time.
+    if ready.iter().all(|&dhcsr| Dhcsr(dhcsr).s_regrdy()) {
+        return Ok(());
+    }
+
+    tracing::debug!("A core register transfer was not ready; rewriting them one at a time");
+    for &(addr, value) in registers {
+        write_core_reg(memory, addr, value)?;
+    }
+
+    Ok(())
+}
+
 /// Check if the current breakpoint is a semihosting call.
 ///
 /// Call this if you get some kind of breakpoint. Works on ARMv6-M, ARMv7-M and ARMv8-M.
