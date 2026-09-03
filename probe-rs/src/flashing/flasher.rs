@@ -1062,7 +1062,10 @@ impl<O: Operation> ActiveFlasher<'_, '_, O> {
             })
         })?;
 
-        if tracing::enabled!(Level::DEBUG) {
+        // Reading the registers back is four extra round trips per algorithm call, on every sector
+        // erased and every page programmed. At DEBUG that lands on anyone who turns logging on to
+        // find out why flashing is slow, and makes it slower without saying so.
+        if tracing::enabled!(Level::TRACE) {
             for (description, v) in staged {
                 let readback: RegisterValue =
                     self.core.read_core_reg(description).map_err(|error| {
@@ -1073,7 +1076,7 @@ impl<O: Operation> ActiveFlasher<'_, '_, O> {
                     })?;
                 let readback_val: u64 = readback.try_into().unwrap_or(0);
 
-                tracing::debug!(
+                tracing::trace!(
                     "content of {} {:#x}: {:#018x} should be: {:#018x}",
                     description.name(),
                     description.id.0,
