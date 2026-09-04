@@ -22,7 +22,8 @@ use crate::rpc::{
         },
         disassemble::disassemble as disassemble_handler,
         flash::{
-            boot, build, erase_all, erase_range, flash, load_region, new_flash_loader, verify,
+            boot, build, erase_all, erase_range, factory_reset, flash, load_region,
+            new_flash_loader, verify,
         },
         info::{target_info, target_metadata},
         memory::{read_bytes, read_memory, write_memory},
@@ -489,6 +490,7 @@ postcard_rpc::define_dispatch! {
         | LoadRegionEndpoint               | async | load_region                |
         | FlashEndpoint                    | async | flash                      |
         | EraseAllEndpoint                 | async | erase_all                  |
+        | FactoryResetEndpoint             | async | factory_reset              |
         | EraseRangeEndpoint               | async | erase_range                |
         | VerifyEndpoint                   | async | verify                     |
         | BootEndpoint                     | async | boot                       |

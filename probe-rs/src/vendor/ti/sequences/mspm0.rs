@@ -98,6 +98,13 @@ const RXCTL_RX_VALID: u32 = 1 << 0;
 /// The alternative, "Factory Reset" (`0x020A`), also erases NONMAIN and restores TI's defaults.
 /// That is a bigger hammer than an unreachable AHB-AP warrants.
 const DSSM_MASS_ERASE: u32 = 0x020C;
+/// DSSM "Factory Reset": erases MAIN *and* NONMAIN and repopulates NONMAIN with TI's defaults.
+///
+/// The only documented way back from a NONMAIN the boot code cannot validate — a bad `userCfgCRC`
+/// leaves the ROM refusing to start the application, enable debug, or invoke the BSL, and it
+/// honours a pending factory reset because it pattern-matches that field rather than trusting the
+/// structure it could not check (SLAU847 1.4.1.1).
+const DSSM_FACTORY_RESET: u32 = 0x020A;
 /// What the boot ROM leaves in `RXDATA` when it has serviced a command.
 const DSSM_RESPONSE_OK: u32 = 0x0001_0003;
 
@@ -188,16 +195,21 @@ impl MSPM0 {
         Ok(())
     }
 
-    /// Erase MAIN through the boot ROM's mailbox, recovering a device whose AHB-AP is gone.
+    /// Run one boot ROM mailbox command, named by `what` for the error messages.
     ///
     /// The mailbox is only read by the boot code, and only out of a BOOTRST, so the command has to
     /// be staged before the reset rather than issued after it. A system reset through the PWR-AP is
     /// a lower reset level and does not run the boot code, which leaves the reset pin as the only
-    /// way in from here (SLAAEO5 section 4).
-    fn dssm_mass_erase(&self, interface: &mut dyn ArmDebugInterface) -> Result<(), ArmError> {
+    /// way in when the AHB-AP is gone (SLAAEO5 section 4).
+    fn dssm_command(
+        &self,
+        interface: &mut dyn ArmDebugInterface,
+        command: u32,
+        what: &str,
+    ) -> Result<(), ArmError> {
         let sec_ap: FullyQualifiedApAddress = ApSel::SecAp.into();
 
-        interface.write_raw_ap_register(&sec_ap, TXCTL, DSSM_MASS_ERASE)?;
+        interface.write_raw_ap_register(&sec_ap, TXCTL, command)?;
         interface.write_raw_ap_register(&sec_ap, TXDATA, 0)?;
 
         // Drain anything an earlier command left in the receive side, or its answer will be
@@ -220,9 +232,9 @@ impl MSPM0 {
                 break;
             }
             if start.elapsed() > Duration::from_secs(2) {
-                return Err(ArmDebugSequenceError::custom(
-                    "MSPM0: the boot ROM did not answer the mass erase command",
-                )
+                return Err(ArmDebugSequenceError::custom(format!(
+                    "MSPM0: the boot ROM did not answer the {what} command"
+                ))
                 .into());
             }
             thread::sleep(Duration::from_millis(1));
@@ -232,22 +244,27 @@ impl MSPM0 {
         let response = interface.read_raw_ap_register(&sec_ap, RXDATA)?;
         let echoed = interface.read_raw_ap_register(&sec_ap, RXCTL)?;
 
-        if response != DSSM_RESPONSE_OK || echoed != DSSM_MASS_ERASE & 0xFF {
+        if response != DSSM_RESPONSE_OK || echoed != command & 0xFF {
             return Err(ArmDebugSequenceError::custom(format!(
-                "MSPM0: mass erase rejected, RXDATA {response:#010x} RXCTL {echoed:#010x}"
+                "MSPM0: {what} rejected, RXDATA {response:#010x} RXCTL {echoed:#010x}"
             ))
             .into());
         }
 
-        // Warn rather than inform, for two reasons. The default stderr filter is `WARN`, so an
-        // `info!` here is invisible next to the warnings above it and the recovery reads as a
-        // failure. And the device is not out of trouble yet: main flash is blank, which is itself
-        // an image the core faults on, so a session that ends here leaves the part exactly as
-        // unreachable as it found it.
+        Ok(())
+    }
+
+    /// Reset NONMAIN to TI's defaults, recovering a device the boot code will not start.
+    fn dssm_factory_reset(&self, interface: &mut dyn ArmDebugInterface) -> Result<(), ArmError> {
+        self.dssm_command(interface, DSSM_FACTORY_RESET, "factory reset")?;
+
+        // Warn rather than inform: the default stderr filter is `WARN`, so an `info!` reporting
+        // success is invisible beside any warning that preceded it, and a recovery then reads as a
+        // failure. The caveat is the same one mass erase carries — nothing is running yet.
         tracing::warn!(
-            "{}: main flash erased, device recovered. It is blank now, so the core will fault as \
-             soon as it is released — program the device in this session, or it will be \
-             unreachable again.",
+            "{}: NONMAIN reset to factory defaults and main flash erased. Both are blank now, so \
+             the core will fault as soon as it is released — program the device in this session, \
+             or it will be unreachable again.",
             self.name
         );
 
@@ -325,8 +342,28 @@ impl ArmDebugSequence for MSPM0 {
             .erase_all()
             .map_err(|MissingPermissions(desc)| ArmError::MissingPermissions(desc))?;
 
-        self.dssm_mass_erase(interface)?;
+        self.dssm_command(interface, DSSM_MASS_ERASE, "mass erase")?;
 
+        // Warn rather than inform, for two reasons. The default stderr filter is `WARN`, so an
+        // `info!` here is invisible next to the warnings above it and the recovery reads as a
+        // failure. And the device is not out of trouble yet: main flash is blank, which is itself
+        // an image the core faults on, so a session that ends here leaves the part exactly as
+        // unreachable as it found it.
+        tracing::warn!(
+            "{}: main flash erased, device recovered. It is blank now, so the core will fault as \
+             soon as it is released — program the device in this session, or it will be \
+             unreachable again.",
+            self.name
+        );
+
+        Err(ArmError::ReAttachRequired)
+    }
+
+    fn factory_reset(&self, interface: &mut dyn ArmDebugInterface) -> Result<(), ArmError> {
+        self.dssm_factory_reset(interface)?;
+
+        // The device has restarted out of a BOOTRST and nothing has been programmed, so whatever
+        // the caller had is gone along with the connection it had it through.
         Err(ArmError::ReAttachRequired)
     }
 

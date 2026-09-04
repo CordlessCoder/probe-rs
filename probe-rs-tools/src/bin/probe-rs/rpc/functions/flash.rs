@@ -7,7 +7,7 @@ use probe_rs::{
 };
 use probe_rs_rpc::flash::{
     BootInfo, BootRequest, BuildRequest, BuildResponse, BuildResult, EraseAllRequest,
-    EraseRangeRequest, FlashRequest, LoadRegionRequest, NewFlashLoaderRequest,
+    EraseRangeRequest, FactoryResetRequest, FlashRequest, LoadRegionRequest, NewFlashLoaderRequest,
     NewFlashLoaderResponse, Operation, ProgressEvent, VerifyRequest, VerifyResponse, VerifyResult,
 };
 use tokio::sync::mpsc::Sender;
@@ -197,6 +197,24 @@ fn flash_impl(
     )?;
 
     Ok(())
+}
+
+pub async fn factory_reset(
+    ctx: &mut RpcContext,
+    _header: VarHeader,
+    request: FactoryResetRequest,
+) -> NoResponse {
+    ctx.run_blocking::<ProgressEventTopic, _, _, _>(request, factory_reset_impl)
+        .await
+}
+
+fn factory_reset_impl(
+    ctx: RpcSpawnContext,
+    request: FactoryResetRequest,
+    _sender: Sender<ProgressEvent>,
+) -> NoResponse {
+    let mut session = ctx.session_blocking(request.sessid);
+    lift(session.sequence_factory_reset())
 }
 
 pub async fn erase_all(
