@@ -52,8 +52,8 @@ use probe_rs_rpc::disassemble::{DisassembleRequest, WireDisassembledInstruction}
 use probe_rs_rpc::file::{AppendFileRequest, TempFile};
 use probe_rs_rpc::flash::{
     BootInfo, BootRequest, BuildRequest, BuildResult, DownloadOptions, EraseAllRequest,
-    EraseRangeRequest, FlashRequest, LoadRegionRequest, NewFlashLoaderRequest, ProgressEvent,
-    VerifyRequest, VerifyResult,
+    EraseRangeRequest, FactoryResetRequest, FlashRequest, LoadRegionRequest, NewFlashLoaderRequest,
+    ProgressEvent, VerifyRequest, VerifyResult,
 };
 use probe_rs_rpc::format::FormatOptions;
 use probe_rs_rpc::info::{
@@ -93,12 +93,13 @@ use probe_rs_rpc::{
     CoreReadRegistersEndpoint, CoreRunEndpoint, CoreSetHwBpsEndpoint, CoreStatusEndpoint,
     CoreStepEndpoint, CoreWriteRegEndpoint, CoresStatusEndpoint, CreateRttClientEndpoint,
     CreateTempFileEndpoint, DisassembleEndpoint, EraseAllEndpoint, EraseRangeEndpoint,
-    EvaluateEndpoint, FlashEndpoint, GetRttChannelsEndpoint, HaltCoresEndpoint,
-    HandleSemihostingEndpoint, ListChipFamiliesEndpoint, ListProbesEndpoint, ListTestsEndpoint,
-    LoadChipFamilyEndpoint, LoadDebugInfoEndpoint, LoadRegionEndpoint, LoadSvdEndpoint,
-    MonitorEndpoint, NewFlashLoaderEndpoint, PollRttUpEndpoint, ProgressEventTopic,
-    ReadBytesEndpoint, ReadMemory8Endpoint, ReadMemory16Endpoint, ReadMemory32Endpoint,
-    ReadMemory64Endpoint, ResetCoreAndHaltEndpoint, ResetCoreEndpoint, ResetTargetEndpoint,
+    EvaluateEndpoint, FactoryResetEndpoint, FlashEndpoint, GetRttChannelsEndpoint,
+    HaltCoresEndpoint, HandleSemihostingEndpoint, ListChipFamiliesEndpoint, ListProbesEndpoint,
+    ListTestsEndpoint, LoadChipFamilyEndpoint, LoadDebugInfoEndpoint, LoadRegionEndpoint,
+    LoadSvdEndpoint, MonitorEndpoint, NewFlashLoaderEndpoint, PollRttUpEndpoint,
+    ProgressEventTopic, ReadBytesEndpoint, ReadMemory8Endpoint, ReadMemory16Endpoint,
+    ReadMemory32Endpoint, ReadMemory64Endpoint, ResetCoreAndHaltEndpoint, ResetCoreEndpoint,
+    ResetTargetEndpoint,
     ResolveSourceBreakpointsEndpoint, ResolveSourceLocationsEndpoint, ResumeCoresEndpoint,
     RpcError, RpcResult, RttDownEndpoint, RttTopic, RunTestEndpoint, ScopesEndpoint,
     SelectProbeEndpoint, SemihostingTopic, SerialTopic, SerialWriteEndpoint, SetVariableEndpoint,
@@ -1038,6 +1039,21 @@ impl SessionInterface {
                     sessid: self.sessid,
                     loader,
                     options,
+                },
+                on_msg,
+            )
+            .await
+    }
+
+    /// Reset the target's non-volatile configuration to factory default.
+    pub async fn factory_reset(
+        &self,
+        on_msg: impl AsyncFnMut(ProgressEvent),
+    ) -> Result<(), ClientError> {
+        self.client
+            .send_and_read_stream::<FactoryResetEndpoint, ProgressEventTopic, _>(
+                &FactoryResetRequest {
+                    sessid: self.sessid,
                 },
                 on_msg,
             )
