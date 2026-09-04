@@ -1,0 +1,1 @@
+With `--allow-erase-all`, probe-rs now recovers an MSPM0 whose AHB-AP has stopped responding by mass-erasing main flash through the boot ROM's mailbox. NONMAIN, and so the device's debug access policy, is left untouched.
