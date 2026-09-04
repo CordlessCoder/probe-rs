@@ -155,6 +155,7 @@ impl Cli {
             Subcommand::Attach(cmd) => cmd.run(client, utc_offset).await,
             Subcommand::Verify(cmd) => cmd.run(client).await,
             Subcommand::Erase(cmd) => cmd.run(client).await,
+            Subcommand::FactoryReset(cmd) => cmd.run(client).await,
             Subcommand::Trace(cmd) => cmd.run(&mut registry, &lister),
             Subcommand::Itm(cmd) => cmd.run(&mut registry, &lister),
             Subcommand::Chip(cmd) => cmd.run(client).await,
@@ -198,6 +199,8 @@ enum Subcommand {
     Verify(cmd::verify::Cmd),
     /// Erase all nonvolatile memory of attached target
     Erase(cmd::erase::Cmd),
+    /// Reset the attached target's non-volatile configuration to factory default
+    FactoryReset(cmd::factory_reset::Cmd),
     /// Flash and run an ELF program
     #[clap(name = "run")]
     Run(cmd::run::Cmd),
@@ -239,6 +242,7 @@ impl Subcommand {
             | Self::Attach(_)
             | Self::Run(_)
             | Self::Erase(_)
+            | Self::FactoryReset(_)
             | Self::Verify(_)
             | Self::Debug(_)
             | Self::DapServer(_) => true,
