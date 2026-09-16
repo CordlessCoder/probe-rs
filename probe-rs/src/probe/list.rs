@@ -155,6 +155,7 @@ impl ProbeLister for AllProbesLister {
         let mut fallback_error = ProbeCreationError::NotFound;
 
         for probe_ctor in DRIVERS.read().iter() {
+            let _span = tracing::debug_span!("open_probe", driver = %probe_ctor).entered();
             match probe_ctor.open(selector) {
                 Ok(link) => return Ok(Probe::from_specific_probe(link)),
                 Err(DebugProbeError::ProbeCouldNotBeCreated(ProbeCreationError::NotFound)) => {}
@@ -172,6 +173,7 @@ impl ProbeLister for AllProbesLister {
         let mut list = vec![];
 
         for driver in DRIVERS.read().iter() {
+            let _span = tracing::debug_span!("list_probes", driver = %driver).entered();
             list.extend(driver.list_probes_filtered(selector));
         }
 

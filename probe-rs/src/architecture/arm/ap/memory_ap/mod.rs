@@ -36,6 +36,7 @@ impl MemoryApIdentity {
         interface: &mut I,
         address: &FullyQualifiedApAddress,
     ) -> Result<Self, ArmError> {
+        let _span = tracing::debug_span!("identify_memory_ap", ap = ?address.ap()).entered();
         let idr_raw = interface.read_raw_ap_register(address, IDR::ADDRESS)?;
         if idr_raw == 0 {
             return Err(ArmError::ApDoesNotExist(address.clone()));

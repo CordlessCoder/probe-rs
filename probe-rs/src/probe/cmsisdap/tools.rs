@@ -26,6 +26,7 @@ const USB_CMSIS_DAP_SUBCLASS: u8 = 0;
 pub fn list_cmsisdap_devices() -> Vec<ProbeListItem> {
     tracing::debug!("Searching for CMSIS-DAP probes using nusb");
 
+    let nusb_span = tracing::debug_span!("list_usb_devices").entered();
     #[cfg_attr(not(feature = "cmsisdap_v1"), expect(unused_mut))]
     let mut probes: Vec<ProbeListItem> = match nusb::list_devices().wait() {
         Ok(devices) => devices
@@ -47,12 +48,16 @@ pub fn list_cmsisdap_devices() -> Vec<ProbeListItem> {
         }
     };
 
+    drop(nusb_span);
+
     #[cfg(feature = "cmsisdap_v1")]
     tracing::debug!(
         "Found {} CMSIS-DAP probes using nusb, searching HID",
         probes.len()
     );
 
+    #[cfg(feature = "cmsisdap_v1")]
+    let _hid_span = tracing::debug_span!("list_hid_devices").entered();
     #[cfg(feature = "cmsisdap_v1")]
     if let Ok(api) = hidapi::HidApi::new() {
         for device in api.device_list() {
@@ -463,9 +468,11 @@ pub fn open_device_from_selector(
 
         // Attempt to open provided VID/PID/SN with hidapi
 
+        let api_span = tracing::debug_span!("open_hid_api").entered();
         let Ok(hid_api) = HidApi::new() else {
             return Err(ProbeCreationError::NotFound);
         };
+        drop(api_span);
 
         let mut device_list = hid_api.device_list();
 
@@ -491,6 +498,7 @@ pub fn open_device_from_selector(
             })
             .ok_or(ProbeCreationError::NotFound)?;
 
+        let _open_span = tracing::debug_span!("open_hid_device").entered();
         let Ok(device) = device_info.open_device(&hid_api) else {
             return Err(ProbeCreationError::NotFound);
         };
