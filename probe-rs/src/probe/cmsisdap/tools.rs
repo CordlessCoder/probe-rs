@@ -27,6 +27,7 @@ const USB_CMSIS_DAP_SUBCLASS: u8 = 0;
 pub fn list_cmsisdap_devices() -> Vec<ProbeListItem> {
     tracing::debug!("Searching for CMSIS-DAP probes using nusb");
 
+    let nusb_span = tracing::debug_span!("list_usb_devices").entered();
     #[cfg_attr(not(feature = "cmsisdap_v1"), expect(unused_mut))]
     let mut probes: Vec<ProbeListItem> = match nusb::list_devices().wait() {
         Ok(devices) => devices
@@ -47,6 +48,8 @@ pub fn list_cmsisdap_devices() -> Vec<ProbeListItem> {
             vec![]
         }
     };
+
+    drop(nusb_span);
 
     #[cfg(feature = "cmsisdap_v1")]
     v1::list_hid_only_devices(&mut probes);

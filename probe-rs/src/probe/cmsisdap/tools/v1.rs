@@ -15,6 +15,7 @@ pub(super) fn list_hid_only_devices(probes: &mut Vec<ProbeListItem>) {
         probes.len()
     );
 
+    let _hid_span = tracing::debug_span!("list_hid_devices").entered();
     let Ok(api) = HidApi::new() else {
         return;
     };
@@ -83,9 +84,11 @@ pub(super) fn open_device(
 
     // Attempt to open provided VID/PID/SN with hidapi
 
+    let api_span = tracing::debug_span!("open_hid_api").entered();
     let Ok(hid_api) = HidApi::new() else {
         return Err(ProbeCreationError::NotFound);
     };
+    drop(api_span);
 
     let mut device_list = hid_api.device_list();
 
@@ -111,6 +114,7 @@ pub(super) fn open_device(
         })
         .ok_or(ProbeCreationError::NotFound)?;
 
+    let _open_span = tracing::debug_span!("open_hid_device").entered();
     let Ok(device) = device_info.open_device(&hid_api) else {
         return Err(ProbeCreationError::NotFound);
     };
