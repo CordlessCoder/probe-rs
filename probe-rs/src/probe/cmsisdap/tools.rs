@@ -13,6 +13,47 @@ use nusb::{
 };
 use std::io;
 
+/// The process-wide hidapi context.
+///
+/// hidapi permits one live context per process. Building one and refreshing one each walk every
+/// HID device on the system and cost the same, so listing pays that walk and opening reuses what
+/// listing enumerated rather than paying it again.
+#[cfg(feature = "cmsisdap_v1")]
+static HID_API: std::sync::Mutex<Option<HidApi>> = std::sync::Mutex::new(None);
+
+/// Run `f` against the shared hidapi context, building it on first use.
+///
+/// `refresh` re-enumerates first, which a caller wanting an up-to-date device list owes; one
+/// looking up a device that listing already reported does not. Returns `None` when hidapi is
+/// unavailable, which leaves the caller to report that no probe was found.
+#[cfg(feature = "cmsisdap_v1")]
+fn with_hid_api<T>(refresh: bool, f: impl FnOnce(&HidApi) -> T) -> Option<T> {
+    let mut context = HID_API.lock().unwrap_or_else(|e| e.into_inner());
+
+    match context.as_mut() {
+        // Building the context enumerated, so a refresh on the same call would repeat it.
+        None => {
+            let _span = tracing::debug_span!("open_hid_api").entered();
+            match HidApi::new() {
+                Ok(api) => *context = Some(api),
+                Err(error) => {
+                    tracing::debug!("could not initialise hidapi: {error}");
+                    return None;
+                }
+            }
+        }
+        Some(api) if refresh => {
+            if let Err(error) = api.refresh_devices() {
+                tracing::debug!("could not refresh the hidapi device list: {error}");
+                return None;
+            }
+        }
+        Some(_) => {}
+    }
+
+    Some(f(context.as_ref().expect("initialised above")))
+}
+
 const USB_CLASS_HID: u8 = 0x03;
 const USB_CMSIS_DAP_CLASS: u8 = 0xFF;
 const USB_CMSIS_DAP_SUBCLASS: u8 = 0;
@@ -69,7 +110,7 @@ pub fn list_cmsisdap_devices(selector: Option<&DebugProbeSelector>) -> Vec<Probe
     #[cfg(feature = "cmsisdap_v1")]
     let _hid_span = tracing::debug_span!("list_hid_devices").entered();
     #[cfg(feature = "cmsisdap_v1")]
-    if let Ok(api) = hidapi::HidApi::new() {
+    with_hid_api(true, |api| {
         for device in api.device_list() {
             if let Some(info) = get_cmsisdap_hid_info(device)
                 && selector.is_none_or(|s| s.matches_probe(&info))
@@ -88,7 +129,7 @@ pub fn list_cmsisdap_devices(selector: Option<&DebugProbeSelector>) -> Vec<Probe
                 }
             }
         }
-    }
+    });
 
     tracing::debug!("Found {} CMSIS-DAP probes total", probes.len());
     probes
@@ -478,63 +519,61 @@ pub fn open_device_from_selector(
             pid
         );
 
-        // Attempt to open provided VID/PID/SN with hidapi
+        // Attempt to open provided VID/PID/SN with hidapi.
+        //
+        // No refresh: the probe being opened was named by a listing that enumerated already, and
+        // re-enumerating walks every HID device on the system again.
+        with_hid_api(false, |hid_api| {
+            // We have to filter manually so that we can check the correct HID interface number.
+            // Using HidApi::open() will return the first device which matches PID and VID,
+            // which is not always what we want.
+            let device_info = hid_api
+                .device_list()
+                .find(|info| {
+                    let mut device_match = info.vendor_id() == vid && info.product_id() == pid;
 
-        let api_span = tracing::debug_span!("open_hid_api").entered();
-        let Ok(hid_api) = HidApi::new() else {
-            return Err(ProbeCreationError::NotFound);
-        };
-        drop(api_span);
+                    if let Some(sn) = sn {
+                        device_match &= Some(sn) == info.serial_number();
+                    }
 
-        let mut device_list = hid_api.device_list();
+                    if let Some(hid_interface) = hid_device_info
+                        .as_ref()
+                        .and_then(|info| info.interface.filter(|_| info.is_hid_interface))
+                    {
+                        device_match &= info.interface_number() == hid_interface as i32;
+                    }
 
-        // We have to filter manually so that we can check the correct HID interface number.
-        // Using HidApi::open() will return the first device which matches PID and VID,
-        // which is not always what we want.
-        let device_info = device_list
-            .find(|info| {
-                let mut device_match = info.vendor_id() == vid && info.product_id() == pid;
-
-                if let Some(sn) = sn {
-                    device_match &= Some(sn) == info.serial_number();
-                }
-
-                if let Some(hid_interface) = hid_device_info
-                    .as_ref()
-                    .and_then(|info| info.interface.filter(|_| info.is_hid_interface))
-                {
-                    device_match &= info.interface_number() == hid_interface as i32;
-                }
-
-                device_match
-            })
-            .ok_or(ProbeCreationError::NotFound)?;
-
-        let _open_span = tracing::debug_span!("open_hid_device").entered();
-        let Ok(device) = device_info.open_device(&hid_api) else {
-            return Err(ProbeCreationError::NotFound);
-        };
-
-        match device.get_product_string() {
-            Ok(Some(s)) if is_cmsis_dap(&s) => {
-                reject_probe_by_version(
-                    device_info.vendor_id(),
-                    device_info.product_id(),
-                    device_info.release_number(),
-                )?;
-                Ok(CmsisDapDevice::V1 {
-                    handle: device,
-                    report_size: hid_report_size(device_info),
-                    usb_timeout: DEFAULT_USB_TIMEOUT,
+                    device_match
                 })
+                .ok_or(ProbeCreationError::NotFound)?;
+
+            let _open_span = tracing::debug_span!("open_hid_device").entered();
+            let Ok(device) = device_info.open_device(hid_api) else {
+                return Err(ProbeCreationError::NotFound);
+            };
+
+            match device.get_product_string() {
+                Ok(Some(s)) if is_cmsis_dap(&s) => {
+                    reject_probe_by_version(
+                        device_info.vendor_id(),
+                        device_info.product_id(),
+                        device_info.release_number(),
+                    )?;
+                    Ok(CmsisDapDevice::V1 {
+                        handle: device,
+                        report_size: hid_report_size(device_info),
+                        usb_timeout: DEFAULT_USB_TIMEOUT,
+                    })
+                }
+                _ => {
+                    // Return NotFound if this VID:PID was not a valid CMSIS-DAP probe,
+                    // or if it couldn't be opened, so that other probe modules can
+                    // attempt to open it instead.
+                    Err(ProbeCreationError::NotFound)
+                }
             }
-            _ => {
-                // Return NotFound if this VID:PID was not a valid CMSIS-DAP probe,
-                // or if it couldn't be opened, so that other probe modules can
-                // attempt to open it instead.
-                Err(ProbeCreationError::NotFound)
-            }
-        }
+        })
+        .unwrap_or(Err(ProbeCreationError::NotFound))
     }
 }
 
