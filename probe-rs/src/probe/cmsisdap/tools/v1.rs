@@ -8,8 +8,11 @@ use crate::probe::{
 };
 use hidapi::HidApi;
 
-/// Adds the HID probes that are not in `probes` already.
-pub(super) fn list_hid_only_devices(probes: &mut Vec<ProbeListItem>) {
+/// Adds the HID probes that match `selector` and are not in `probes` already.
+pub(super) fn list_hid_only_devices(
+    probes: &mut Vec<ProbeListItem>,
+    selector: Option<&DebugProbeSelector>,
+) {
     tracing::debug!(
         "Found {} CMSIS-DAP probes using nusb, searching HID",
         probes.len()
@@ -20,7 +23,11 @@ pub(super) fn list_hid_only_devices(probes: &mut Vec<ProbeListItem>) {
         return;
     };
 
-    for info in api.device_list().filter_map(get_cmsisdap_hid_info) {
+    for info in api
+        .device_list()
+        .filter_map(get_cmsisdap_hid_info)
+        .filter(|info| selector.is_none_or(|s| s.matches_probe(info)))
+    {
         let duplicate = probes.iter().any(|p| {
             p.info.vendor_id == info.vendor_id
                 && p.info.product_id == info.product_id

@@ -118,7 +118,7 @@ impl ProbeFactory for CmsisDapFactory {
     }
 
     fn list_probes(&self) -> Vec<crate::probe::list::ProbeListItem> {
-        tools::list_cmsisdap_devices()
+        tools::list_cmsisdap_devices(None)
     }
 
     fn list_probes_filtered(
@@ -142,10 +142,9 @@ impl ProbeFactory for CmsisDapFactory {
                 },
             )];
         }
-        self.list_probes()
-            .into_iter()
-            .filter(|probe| selector.is_none_or(|s| s.matches_probe(&probe.info)))
-            .collect()
+        // Overridden so that the selector reaches the enumeration rather than being applied to
+        // its result: knowing which probe is wanted is what lets the HID scan be skipped.
+        tools::list_cmsisdap_devices(selector)
     }
 }
 
