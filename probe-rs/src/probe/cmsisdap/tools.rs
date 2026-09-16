@@ -23,7 +23,7 @@ const USB_CMSIS_DAP_SUBCLASS: u8 = 0;
 /// to permission or driver errors, so it falls back to listing only
 /// HID devices if it does not find any suitable devices.
 #[tracing::instrument(skip_all)]
-pub fn list_cmsisdap_devices() -> Vec<ProbeListItem> {
+pub fn list_cmsisdap_devices(selector: Option<&DebugProbeSelector>) -> Vec<ProbeListItem> {
     tracing::debug!("Searching for CMSIS-DAP probes using nusb");
 
     let nusb_span = tracing::debug_span!("list_usb_devices").entered();
@@ -41,6 +41,7 @@ pub fn list_cmsisdap_devices() -> Vec<ProbeListItem> {
                         accessibility,
                     })
             })
+            .filter(|probe| selector.is_none_or(|s| s.matches_probe(&probe.info)))
             .collect(),
         Err(e) => {
             tracing::warn!("error listing devices with nusb: {e}");
@@ -49,6 +50,15 @@ pub fn list_cmsisdap_devices() -> Vec<ProbeListItem> {
     };
 
     drop(nusb_span);
+
+    // Enumerating HID walks every HID device on the system, which costs far more than the USB
+    // walk above. A caller that named one probe needs no other entry, and a probe answering on
+    // a bulk interface is opened through nusb, so nothing below would add to what it asked for.
+    #[cfg(feature = "cmsisdap_v1")]
+    if selector.is_some() && probes.iter().any(|probe| !probe.info.is_hid_interface) {
+        tracing::debug!("Selected probe speaks CMSIS-DAP v2, skipping the HID scan");
+        return probes;
+    }
 
     #[cfg(feature = "cmsisdap_v1")]
     tracing::debug!(
@@ -61,7 +71,9 @@ pub fn list_cmsisdap_devices() -> Vec<ProbeListItem> {
     #[cfg(feature = "cmsisdap_v1")]
     if let Ok(api) = hidapi::HidApi::new() {
         for device in api.device_list() {
-            if let Some(info) = get_cmsisdap_hid_info(device) {
+            if let Some(info) = get_cmsisdap_hid_info(device)
+                && selector.is_none_or(|s| s.matches_probe(&info))
+            {
                 if !probes.iter().any(|p| {
                     p.info.vendor_id == info.vendor_id
                         && p.info.product_id == info.product_id
