@@ -101,6 +101,77 @@ impl<'probe> Armv8m<'probe> {
         );
     }
 
+    /// Steps one instruction, returning the program counter only if it had to be read.
+    ///
+    /// Resuming steps first and discards the result, so the read that only the return value
+    /// needs is left to the caller that wants it.
+    fn step_instruction(&mut self) -> Result<Option<RegisterValue>, Error> {
+        // First check if we stopped on a breakpoint, because this requires special handling before we can continue.
+        let breakpoint_at_pc = if matches!(
+            self.state.current_state,
+            CoreStatus::Halted(HaltReason::Breakpoint(_))
+        ) {
+            let pc_before_step = self.read_core_reg(self.program_counter().into())?;
+            self.enable_breakpoints(false)?;
+            Some(pc_before_step)
+        } else {
+            None
+        };
+
+        // Only arm the pending step once the write has landed.
+        exit_halt(&mut *self.memory, true)?;
+        self.state.begin_step();
+
+        // The single-step might put the core in lockup state. Lockup isn't considered "halted"
+        // so we can't use `wait_for_core_halted` here.
+        // So we wait for halted OR lockup, and if we entered lockup we halt.
+        let status = match self.wait_for_status(Duration::from_millis(100), |s| {
+            matches!(s, CoreStatus::Halted(_) | CoreStatus::LockedUp)
+        }) {
+            Ok(status) => status,
+            Err(err) => {
+                self.state.clear_pending_step();
+                return Err(err);
+            }
+        };
+        if status == CoreStatus::LockedUp {
+            self.halt(Duration::from_millis(100))?;
+        }
+
+        let Some(pc_before_step) = breakpoint_at_pc else {
+            self.state.semihosting_command = None;
+            self.state.pc_written = false;
+            return Ok(None);
+        };
+
+        let mut pc_after_step = self.read_core_reg(self.program_counter().into())?;
+        // If we were stopped on a software breakpoint, then we need to manually advance the PC, or else we will be stuck here forever.
+        // A `b .` (branch to itself) also leaves the PC unchanged, so only skip a real `BKPT`.
+        if pc_before_step == pc_after_step
+            && !self
+                .hw_breakpoints()?
+                .contains(&pc_before_step.try_into().ok())
+            && pc_before_step
+                .try_into()
+                .is_ok_and(|pc: u64| super::cortex_m::is_bkpt_at(self, pc))
+        {
+            tracing::debug!(
+                "Encountered a breakpoint instruction @ {}. We need to manually advance the program counter to the next instruction.",
+                pc_after_step
+            );
+            // Advance the program counter by the architecture specific byte size of the BKPT instruction.
+            pc_after_step.increment_address(2)?;
+            self.write_core_reg(self.program_counter().into(), pc_after_step)?;
+        }
+        // Re-enable breakpoints before we continue.
+        self.enable_breakpoints(true)?;
+
+        self.state.semihosting_command = None;
+        self.state.pc_written = false;
+
+        Ok(Some(pc_after_step))
+    }
+
     /// Polls until `predicate` accepts the core status, and returns that status.
     fn wait_for_status(
         &mut self,
@@ -274,7 +345,7 @@ impl CoreInterface for Armv8m<'_> {
         // since we halted, the core is no longer on that instruction and there is nothing to
         // step over.
         if !self.state.pc_written {
-            self.step()?;
+            self.step_instruction()?;
             self.state.clear_pending_step();
         }
         self.state.pc_written = false;
@@ -349,72 +420,12 @@ impl CoreInterface for Armv8m<'_> {
     }
 
     fn step(&mut self) -> Result<CoreInformation, Error> {
-        // First check if we stopped on a breakpoint, because this requires special handling before we can continue.
-        let breakpoint_at_pc = if matches!(
-            self.state.current_state,
-            CoreStatus::Halted(HaltReason::Breakpoint(_))
-        ) {
-            let pc_before_step = self.read_core_reg(self.program_counter().into())?;
-            self.enable_breakpoints(false)?;
-            Some(pc_before_step)
-        } else {
-            None
+        let pc = match self.step_instruction()? {
+            Some(pc) => pc,
+            None => self.read_core_reg(self.program_counter().into())?,
         };
 
-        // Only arm the pending step once the write has landed.
-        exit_halt(&mut *self.memory, true)?;
-        self.state.begin_step();
-
-        // The single-step might put the core in lockup state. Lockup isn't considered "halted"
-        // so we can't use `wait_for_core_halted` here.
-        // So we wait for halted OR lockup, and if we entered lockup we halt.
-        let status = match self.wait_for_status(Duration::from_millis(100), |s| {
-            matches!(s, CoreStatus::Halted(_) | CoreStatus::LockedUp)
-        }) {
-            Ok(status) => status,
-            Err(err) => {
-                self.state.clear_pending_step();
-                return Err(err);
-            }
-        };
-        if status == CoreStatus::LockedUp {
-            self.halt(Duration::from_millis(100))?;
-        }
-
-        // Try to read the new program counter.
-        let mut pc_after_step = self.read_core_reg(self.program_counter().into())?;
-
-        // Re-enable breakpoints before we continue.
-        if let Some(pc_before_step) = breakpoint_at_pc {
-            // If we were stopped on a software breakpoint, then we need to manually advance the PC, or else we will be stuck here forever.
-            // A `b .` (branch to itself) also leaves the PC unchanged, so only skip a real `BKPT`.
-            if pc_before_step == pc_after_step
-                && !self
-                    .hw_breakpoints()?
-                    .contains(&pc_before_step.try_into().ok())
-                && pc_before_step
-                    .try_into()
-                    .is_ok_and(|pc: u64| super::cortex_m::is_bkpt_at(self, pc))
-            {
-                tracing::debug!(
-                    "Encountered a breakpoint instruction @ {}. We need to manually advance the program counter to the next instruction.",
-                    pc_after_step
-                );
-                // Advance the program counter by the architecture specific byte size of the BKPT instruction.
-                pc_after_step.increment_address(2)?;
-                self.write_core_reg(self.program_counter().into(), pc_after_step)?;
-            }
-            self.enable_breakpoints(true)?;
-        }
-
-        self.state.semihosting_command = None;
-
-        // The core halted again, and any PC write above was this function's own doing.
-        self.state.pc_written = false;
-
-        Ok(CoreInformation {
-            pc: pc_after_step.try_into()?,
-        })
+        Ok(CoreInformation { pc: pc.try_into()? })
     }
 
     fn read_core_reg(&mut self, address: RegisterId) -> Result<RegisterValue, Error> {
