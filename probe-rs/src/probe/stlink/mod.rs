@@ -1407,7 +1407,7 @@ impl ArmDebugInterface for StlinkArmDebug {
         &mut self,
         access_port: &FullyQualifiedApAddress,
     ) -> Result<Box<dyn ArmMemoryInterface + '_>, ArmError> {
-        let mem_ap = MemoryAp::new(self, access_port)?;
+        let mem_ap = MemoryAp::open(self, access_port)?;
         let interface = StLinkMemoryInterface {
             probe: self,
             current_ap: mem_ap,

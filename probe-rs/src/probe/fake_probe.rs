@@ -4,7 +4,7 @@ use crate::{
     architecture::arm::{
         ArmDebugInterface, ArmError, DapAccess, FullyQualifiedApAddress, RegisterAddress,
         SwoAccess,
-        ap::memory_ap::mock::MockMemoryAp,
+        ap::memory_ap::{MemoryAp, mock::MockMemoryAp},
         armv8m::Dhcsr,
         communication_interface::SwdSequence,
         dp::{DpAddress, DpRegisterAddress},
@@ -754,7 +754,8 @@ impl ArmDebugInterface for FakeArmInterface {
     ) -> Result<Box<dyn ArmMemoryInterface + '_>, ArmError> {
         match self.probe.memory_ap {
             MockedAp::MemoryAp(ref mut _memory_ap) => {
-                let memory = ADIMemoryInterface::new(self, access_port_address)?;
+                let memory_ap = MemoryAp::open(self, access_port_address)?;
+                let memory = ADIMemoryInterface::new(self, memory_ap);
 
                 Ok(Box::new(memory) as _)
             }

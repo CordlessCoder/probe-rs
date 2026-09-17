@@ -31,16 +31,12 @@ impl<'interface, APA> ADIMemoryInterface<'interface, APA>
 where
     APA: DapAccess,
 {
-    /// Creates a new MemoryInterface for given AccessPort.
-    pub fn new(
-        interface: &'interface mut APA,
-        access_port_address: &FullyQualifiedApAddress,
-    ) -> Result<ADIMemoryInterface<'interface, APA>, ArmError> {
-        let memory_ap = MemoryAp::new(interface, access_port_address)?;
-        Ok(Self {
+    /// Creates a new MemoryInterface for an opened AccessPort.
+    pub fn new(interface: &'interface mut APA, memory_ap: MemoryAp) -> Self {
+        Self {
             interface,
             memory_ap,
-        })
+        }
     }
 }
 
@@ -848,7 +844,9 @@ mod tests {
     use crate::{
         MemoryInterface,
         architecture::arm::{
-            FullyQualifiedApAddress, ap::memory_ap::mock::MockMemoryAp, memory::ADIMemoryInterface,
+            FullyQualifiedApAddress,
+            ap::memory_ap::{MemoryAp, mock::MockMemoryAp},
+            memory::ADIMemoryInterface,
         },
     };
 
@@ -857,7 +855,9 @@ mod tests {
         fn new_mock(
             mock: &'interface mut MockMemoryAp,
         ) -> ADIMemoryInterface<'interface, MockMemoryAp> {
-            Self::new(mock, &FullyQualifiedApAddress::v1_with_default_dp(0)).unwrap()
+            let address = FullyQualifiedApAddress::v1_with_default_dp(0);
+            let memory_ap = MemoryAp::open(mock, &address).unwrap();
+            Self::new(mock, memory_ap)
         }
 
         fn mock_memory(&self) -> &[u8] {

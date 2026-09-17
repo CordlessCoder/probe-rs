@@ -3,6 +3,7 @@ use crate::{
     architecture::arm::{
         ApAddress, ArmError, DapAccess, FullyQualifiedApAddress, RegisterAddress, SwoAccess,
         SwoConfig, ap,
+        ap::memory_ap::{MemoryAp, MemoryApIdentity},
         dp::{
             Ctrl, DPIDR, DebugPortId, DebugPortVersion, DpAccess, DpAddress, DpRegisterAddress,
             Select1, SelectV1, SelectV3,
@@ -181,6 +182,9 @@ pub(crate) struct DpState {
     pub debug_port_version: DebugPortVersion,
 
     pub(crate) current_select: SelectCache,
+
+    /// What each memory AP under this debug port reported about itself.
+    pub(crate) ap_identities: HashMap<ApAddress, MemoryApIdentity>,
 }
 
 impl DpState {
@@ -188,6 +192,7 @@ impl DpState {
         Self {
             debug_port_version: DebugPortVersion::Unsupported(0xFF),
             current_select: SelectCache::DPv1(SelectV1(0)),
+            ap_identities: HashMap::new(),
         }
     }
 }
@@ -632,7 +637,10 @@ impl ArmDebugInterface for ArmCommunicationInterface {
         access_port_address: &FullyQualifiedApAddress,
     ) -> Result<Box<dyn ArmMemoryInterface + '_>, ArmError> {
         let memory_interface: Box<dyn ArmMemoryInterface + '_> = match access_port_address.ap() {
-            ApAddress::V1(_) => Box::new(ADIMemoryInterface::new(self, access_port_address)?),
+            ApAddress::V1(_) => {
+                let ap = self.open_memory_ap(access_port_address)?;
+                Box::new(ADIMemoryInterface::new(self, ap))
+            }
             ApAddress::V2(_) => ap::v2::new_memory_interface(self, access_port_address)?,
         };
         Ok(memory_interface)
@@ -774,6 +782,43 @@ impl ArmCommunicationInterface {
         };
 
         Box::new(interface)
+    }
+
+    /// Opens the memory AP at `address`, reusing what it has already reported about itself.
+    ///
+    /// Identifying an AP costs a bank switch each way plus two reads, and says the same thing every
+    /// time, so it is done once per AP per debug port. What is kept describes the AP; how it is
+    /// configured is still read and written on every open.
+    pub(crate) fn open_memory_ap(
+        &mut self,
+        address: &FullyQualifiedApAddress,
+    ) -> Result<MemoryAp, ArmError> {
+        let known = self
+            .dps
+            .get(&address.dp())
+            .and_then(|dp| dp.ap_identities.get(address.ap()).copied());
+
+        let Some(identity) = known else {
+            let identity = MemoryApIdentity::read(self, address)?;
+            let ap = MemoryAp::new(self, address, identity)?;
+            self.select_dp(address.dp())?
+                .ap_identities
+                .insert(address.ap().clone(), identity);
+            return Ok(ap);
+        };
+
+        match MemoryAp::new(self, address, identity) {
+            Ok(ap) => Ok(ap),
+            // An AP that has been powered down since it was identified answers nothing, and with
+            // the IDR read skipped there is nothing left to notice that. Ask it again, so the
+            // failure is reported against the AP rather than against one of its registers.
+            Err(_) => {
+                if let Some(dp) = self.dps.get_mut(&address.dp()) {
+                    dp.ap_identities.remove(address.ap());
+                }
+                MemoryAp::open(self, address)
+            }
+        }
     }
 
     fn select_dp(&mut self, dp: DpAddress) -> Result<&mut DpState, ArmError> {

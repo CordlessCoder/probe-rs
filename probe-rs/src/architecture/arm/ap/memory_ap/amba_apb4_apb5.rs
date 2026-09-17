@@ -25,13 +25,11 @@ impl AmbaApb4Apb5 {
     pub fn new<P: DapAccess>(
         probe: &mut P,
         address: FullyQualifiedApAddress,
+        cfg: CFG,
     ) -> Result<Self, ArmError> {
-        // CFG shares an AP register bank with the IDR the caller just read, and CSW shares one
-        // with the write below, so reading CFG first halves the SELECT writes.
-        let cfg = probe.read_raw_ap_register(&address, CFG::ADDRESS)?;
         let csw = probe.read_raw_ap_register(&address, CSW::ADDRESS)?;
 
-        let (csw, cfg) = (csw.try_into()?, cfg.try_into()?);
+        let csw = csw.try_into()?;
 
         let me = Self { address, csw, cfg };
         let mut csw = me.csw;

@@ -13,12 +13,44 @@ mod amba_axi3_axi4;
 mod amba_axi5;
 
 use crate::architecture::arm::ap::{
-    AccessPortError, AddressIncrement, ApRegister, BASE, BASE2, BaseAddrFormat, DRW, DataSize, TAR,
-    TAR2,
+    AccessPortError, AddressIncrement, ApRegister, ApType, BASE, BASE2, BaseAddrFormat, CFG, DRW,
+    DataSize, IDR, TAR, TAR2,
 };
 
 use super::{AccessPortType, ApAccess, ApRegAccess};
 use crate::architecture::arm::{ArmError, DapAccess, FullyQualifiedApAddress, ap::CSW};
+
+/// What a memory AP reports about itself, as opposed to how it is configured.
+///
+/// IDR and CFG describe the access port's hardware rather than its state, so they hold for as long
+/// as the debug port is up and are worth reading once per AP instead of once per memory interface.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MemoryApIdentity {
+    ap_type: ApType,
+    cfg: CFG,
+}
+
+impl MemoryApIdentity {
+    /// Reads IDR and CFG, which share an AP register bank.
+    pub(crate) fn read<I: DapAccess>(
+        interface: &mut I,
+        address: &FullyQualifiedApAddress,
+    ) -> Result<Self, ArmError> {
+        let idr_raw = interface.read_raw_ap_register(address, IDR::ADDRESS)?;
+        if idr_raw == 0 {
+            return Err(ArmError::ApDoesNotExist(address.clone()));
+        }
+        let idr: IDR = idr_raw.try_into()?;
+        tracing::debug!("reading IDR: {:x?}", idr);
+
+        let cfg = interface.read_raw_ap_register(address, CFG::ADDRESS)?;
+
+        Ok(Self {
+            ap_type: idr.TYPE(),
+            cfg: cfg.try_into()?,
+        })
+    }
+}
 
 /// Implements all default registers of a memory AP to the given type.
 ///
@@ -223,23 +255,26 @@ macro_rules! memory_aps {
         })*
 
         impl MemoryAp {
+            /// Configures the access port that `identity` names.
             pub(crate) fn new<I: DapAccess>(
                 interface: &mut I,
                 address: &FullyQualifiedApAddress,
+                identity: MemoryApIdentity,
             ) -> Result<Self, ArmError> {
-                use $crate::architecture::arm::ap::{IDR, ApRegister};
-                let idr_raw = interface.read_raw_ap_register(address, IDR::ADDRESS)?;
-                if idr_raw == 0 {
-                    return Err(ArmError::ApDoesNotExist(address.clone()));
-                }
-                let idr: IDR = idr_raw.try_into()?;
-                tracing::debug!("reading IDR: {:x?}", idr);
-                use crate::architecture::arm::ap::ApType;
-                Ok(match idr.TYPE() {
+                Ok(match identity.ap_type {
                     ApType::JtagComAp => return Err(ArmError::WrongApType),
-                    $(ApType::$variant => <$type>::new(interface, address.clone())?.into(),)*
+                    $(ApType::$variant => <$type>::new(interface, address.clone(), identity.cfg)?.into(),)*
                     ApType::Unknown(_) => return Err(ArmError::WrongApType),
                 })
+            }
+
+            /// Identifies the AP at `address` and configures it.
+            pub(crate) fn open<I: DapAccess>(
+                interface: &mut I,
+                address: &FullyQualifiedApAddress,
+            ) -> Result<Self, ArmError> {
+                let identity = MemoryApIdentity::read(interface, address)?;
+                Self::new(interface, address, identity)
             }
         }
     }

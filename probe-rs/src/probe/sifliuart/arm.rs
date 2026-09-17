@@ -187,7 +187,7 @@ impl ArmDebugInterface for SifliUartArmDebug {
         &mut self,
         access_port: &FullyQualifiedApAddress,
     ) -> Result<Box<dyn ArmMemoryInterface + '_>, ArmError> {
-        let memory_ap = MemoryAp::new(self, access_port)?;
+        let memory_ap = MemoryAp::open(self, access_port)?;
         let interface = SifliUartMemoryInterface {
             probe: self,
             current_ap: memory_ap,

@@ -237,7 +237,7 @@ impl ArmDebugInterface for BlackMagicProbeArmDebug {
             return Ok(Box::new(ap::v2::RootMemoryInterface::new(self, access_port.dp())?) as _);
         }
 
-        let mut current_ap = MemoryAp::new(self, access_port)?;
+        let mut current_ap = MemoryAp::open(self, access_port)?;
 
         // Construct a CSW to pass to the AP when accessing memory.
         let csw: CSW = match &mut current_ap {
