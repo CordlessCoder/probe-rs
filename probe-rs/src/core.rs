@@ -74,6 +74,18 @@ pub trait CoreInterface: MemoryInterface {
     /// Report every core status change again, and tell the probe the current one.
     fn release_status_reports(&mut self) {}
 
+    /// Write several core registers.
+    ///
+    /// Implementations that can put the whole sequence into one probe transaction do so, which is
+    /// worth having wherever a set of registers is being staged before the core runs. The default
+    /// writes them one at a time.
+    fn write_core_regs(&mut self, registers: &[(RegisterId, RegisterValue)]) -> Result<(), Error> {
+        for &(address, value) in registers {
+            self.write_core_reg(address, value)?;
+        }
+        Ok(())
+    }
+
     /// Try to halt the core. This function ensures the core is actually halted, and
     /// returns a [`DebugProbeError::Timeout`](crate::probe::DebugProbeError::Timeout) otherwise.
     fn halt(&mut self, timeout: Duration) -> Result<CoreInformation, Error>;
@@ -360,6 +372,16 @@ impl<'probe> Core<'probe> {
     /// Report every core status change again, and tell the probe the current one.
     pub fn release_status_reports(&mut self) {
         self.inner.release_status_reports();
+    }
+
+    /// Write several core registers, in as few probe transactions as possible.
+    ///
+    /// See [`CoreInterface::write_core_regs`].
+    pub fn write_core_regs(
+        &mut self,
+        registers: &[(RegisterId, RegisterValue)],
+    ) -> Result<(), Error> {
+        self.inner.write_core_regs(registers)
     }
 
     /// Read the value of a core register.
