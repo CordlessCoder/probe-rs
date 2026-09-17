@@ -18,7 +18,7 @@ use crate::{
         MemoryMappedRegister, RegisterId, RegisterValue, VectorCatchCondition,
     },
     error::Error,
-    memory::{CoreMemoryInterface, valid_32bit_address},
+    memory::{CoreMemoryInterface, Operation, OperationKind, valid_32bit_address},
 };
 use bitfield::bitfield;
 use std::{
@@ -853,7 +853,22 @@ impl CoreInterface for Armv7m<'_> {
     }
 
     fn status(&mut self) -> Result<CoreStatus, Error> {
-        let dhcsr = Dhcsr(self.memory.read_word_32(Dhcsr::get_mmio_address())?);
+        // Ask for the fault status alongside the halt status. It is only wanted when the core
+        // turns out to be halted, but a read that rides along in the same request is free, and
+        // fetching it afterwards costs a round trip of its own.
+        let mut halt_status = 0u32;
+        let mut fault_status = 0u32;
+        self.memory.execute_operations(&mut [
+            Operation::new(
+                Dhcsr::get_mmio_address(),
+                OperationKind::Read32(std::slice::from_mut(&mut halt_status)),
+            ),
+            Operation::new(
+                Dfsr::get_mmio_address(),
+                OperationKind::Read32(std::slice::from_mut(&mut fault_status)),
+            ),
+        ])?;
+        let dhcsr = Dhcsr(halt_status);
 
         if dhcsr.s_lockup() {
             tracing::debug!(
@@ -878,7 +893,7 @@ impl CoreInterface for Armv7m<'_> {
         }
 
         if dhcsr.s_halt() {
-            let dfsr = Dfsr(self.memory.read_word_32(Dfsr::get_mmio_address())?);
+            let dfsr = Dfsr(fault_status);
 
             let mut reason = dfsr.halt_reason();
             reason = self.state.resolve_halt_reason(reason);
