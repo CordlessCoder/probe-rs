@@ -96,6 +96,7 @@ pub fn new_memory_interface<'i>(
     if ap_address.0.is_none() {
         Ok(Box::new(RootMemoryInterface::new(iface, address.dp())?))
     } else {
-        Ok(Box::new(ADIMemoryInterface::new(iface, address)?))
+        let ap = iface.open_memory_ap(address)?;
+        Ok(Box::new(ADIMemoryInterface::new(iface, ap)))
     }
 }
