@@ -697,6 +697,93 @@ impl<'probe> Armv7m<'probe> {
         );
     }
 
+    /// Steps one instruction, returning the program counter only if it had to be read.
+    ///
+    /// Resuming steps first and discards the result, so the read that only the return value
+    /// needs is left to the caller that wants it.
+    fn step_instruction(&mut self) -> Result<Option<RegisterValue>, Error> {
+        // First check if we stopped on a breakpoint, because this requires special handling before we can continue.
+        let breakpoint_at_pc = if matches!(
+            self.state.current_state,
+            CoreStatus::Halted(HaltReason::Breakpoint(_))
+        ) {
+            let pc_before_step = self.read_core_reg(self.program_counter().into())?;
+            self.enable_breakpoints(false)?;
+            Some(pc_before_step)
+        } else {
+            None
+        };
+
+        let mut dhcsr = Dhcsr(self.memory.read_word_32(Dhcsr::get_mmio_address())?);
+
+        // Follow the rules of the ... ARMv7-M Architecture reference, C1.6 Debug System Registers - DHCSR, with respect to setting maskints
+        if !dhcsr.c_debugen() {
+            tracing::warn!("Attempting to STEP while DHCSR->C_DEBUGEN is false");
+        }
+        if !dhcsr.c_maskints() {
+            dhcsr.set_c_maskints(true); // This must be reset to false when we run() again.
+            dhcsr.enable_write();
+            self.memory
+                .write_word_32(Dhcsr::get_mmio_address(), dhcsr.into())?;
+            self.memory.flush()?;
+        }
+
+        // Leave halted state.
+        // Step one instruction.
+        self.state.begin_step();
+        dhcsr.set_c_step(true);
+        dhcsr.set_c_halt(false);
+        dhcsr.enable_write();
+        self.memory
+            .write_word_32(Dhcsr::get_mmio_address(), dhcsr.into())?;
+        self.memory.flush()?;
+
+        // The single-step might put the core in lockup state. Lockup isn't considered "halted"
+        // so we can't use `wait_for_core_halted` here.
+        // So we wait for halted OR lockup, and if we entered lockup we halt.
+        let status = match self.wait_for_status(Duration::from_millis(100), |s| {
+            matches!(s, CoreStatus::Halted(_) | CoreStatus::LockedUp)
+        }) {
+            Ok(status) => status,
+            Err(err) => {
+                self.state.clear_pending_step();
+                return Err(err);
+            }
+        };
+        if status == CoreStatus::LockedUp {
+            self.halt(Duration::from_millis(100))?;
+        }
+
+        let Some(pc_before_step) = breakpoint_at_pc else {
+            self.state.semihosting_command = None;
+            self.state.pc_written = false;
+            return Ok(None);
+        };
+
+        let mut pc_after_step = self.read_core_reg(self.program_counter().into())?;
+        // If we were stopped on a software breakpoint, then we need to manually advance the PC, or else we will be stuck here forever.
+        if pc_before_step == pc_after_step
+            && !self
+                .hw_breakpoints()?
+                .contains(&pc_before_step.try_into().ok())
+        {
+            tracing::debug!(
+                "Encountered a breakpoint instruction @ {}. We need to manually advance the program counter to the next instruction.",
+                pc_after_step
+            );
+            // Advance the program counter by the architecture specific byte size of the BKPT instruction.
+            pc_after_step.increment_address(2)?;
+            self.write_core_reg(self.program_counter().into(), pc_after_step)?;
+        }
+        // Re-enable breakpoints before we continue.
+        self.enable_breakpoints(true)?;
+
+        self.state.semihosting_command = None;
+        self.state.pc_written = false;
+
+        Ok(Some(pc_after_step))
+    }
+
     /// Reads FP_CTRL, rejecting the revisions whose comparator encoding is not implemented.
     fn read_fp_ctrl(&mut self) -> Result<FpCtrl, Error> {
         let reg = FpCtrl::from(self.memory.read_word_32(FpCtrl::get_mmio_address())?);
@@ -879,7 +966,7 @@ impl CoreInterface for Armv7m<'_> {
 
     fn run(&mut self) -> Result<(), Error> {
         if !self.state.pc_written {
-            self.step()?;
+            self.step_instruction()?;
         }
         self.state.clear_pending_step();
 
@@ -970,86 +1057,12 @@ impl CoreInterface for Armv7m<'_> {
     }
 
     fn step(&mut self) -> Result<CoreInformation, Error> {
-        // First check if we stopped on a breakpoint, because this requires special handling before we can continue.
-        let breakpoint_at_pc = if matches!(
-            self.state.current_state,
-            CoreStatus::Halted(HaltReason::Breakpoint(_))
-        ) {
-            let pc_before_step = self.read_core_reg(self.program_counter().into())?;
-            self.enable_breakpoints(false)?;
-            Some(pc_before_step)
-        } else {
-            None
+        let pc = match self.step_instruction()? {
+            Some(pc) => pc,
+            None => self.read_core_reg(self.program_counter().into())?,
         };
 
-        let mut dhcsr = Dhcsr(self.memory.read_word_32(Dhcsr::get_mmio_address())?);
-
-        // Follow the rules of the ... ARMv7-M Architecture reference, C1.6 Debug System Registers - DHCSR, with respect to setting maskints
-        if !dhcsr.c_debugen() {
-            tracing::warn!("Attempting to STEP while DHCSR->C_DEBUGEN is false");
-        }
-        if !dhcsr.c_maskints() {
-            dhcsr.set_c_maskints(true); // This must be reset to false when we run() again.
-            dhcsr.enable_write();
-            self.memory
-                .write_word_32(Dhcsr::get_mmio_address(), dhcsr.into())?;
-            self.memory.flush()?;
-        }
-
-        // Leave halted state.
-        // Step one instruction.
-        self.state.begin_step();
-        dhcsr.set_c_step(true);
-        dhcsr.set_c_halt(false);
-        dhcsr.enable_write();
-        self.memory
-            .write_word_32(Dhcsr::get_mmio_address(), dhcsr.into())?;
-        self.memory.flush()?;
-
-        // The single-step might put the core in lockup state. Lockup isn't considered "halted"
-        // so we can't use `wait_for_core_halted` here.
-        // So we wait for halted OR lockup, and if we entered lockup we halt.
-        let status = match self.wait_for_status(Duration::from_millis(100), |s| {
-            matches!(s, CoreStatus::Halted(_) | CoreStatus::LockedUp)
-        }) {
-            Ok(status) => status,
-            Err(err) => {
-                self.state.clear_pending_step();
-                return Err(err);
-            }
-        };
-        if status == CoreStatus::LockedUp {
-            self.halt(Duration::from_millis(100))?;
-        }
-
-        // Try to read the new program counter.
-        let mut pc_after_step = self.read_core_reg(self.program_counter().into())?;
-
-        // Re-enable breakpoints before we continue.
-        if let Some(pc_before_step) = breakpoint_at_pc {
-            // If we were stopped on a software breakpoint, then we need to manually advance the PC, or else we will be stuck here forever.
-            if pc_before_step == pc_after_step
-                && !self
-                    .hw_breakpoints()?
-                    .contains(&pc_before_step.try_into().ok())
-            {
-                tracing::debug!(
-                    "Encountered a breakpoint instruction @ {}. We need to manually advance the program counter to the next instruction.",
-                    pc_after_step
-                );
-                // Advance the program counter by the architecture specific byte size of the BKPT instruction.
-                pc_after_step.increment_address(2)?;
-                self.write_core_reg(self.program_counter().into(), pc_after_step)?;
-            }
-            self.enable_breakpoints(true)?;
-        }
-
-        self.state.semihosting_command = None;
-        self.state.pc_written = false;
-
-        Ok(CoreInformation {
-            pc: pc_after_step.try_into()?,
-        })
+        Ok(CoreInformation { pc: pc.try_into()? })
     }
 
     fn read_core_reg(&mut self, address: RegisterId) -> Result<RegisterValue, Error> {
