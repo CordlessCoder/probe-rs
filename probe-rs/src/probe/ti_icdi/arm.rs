@@ -17,7 +17,7 @@ use crate::probe::ti_icdi::gdb_interface::GdbRemoteInterface;
 use crate::probe::{BitSequence, DebugProbeError, Probe};
 use zerocopy::IntoBytes;
 
-/// AHB3 MEM-AP IDR used to satisfy [`MemoryAp::new`] for a probe that has no DAP.
+/// AHB3 MEM-AP IDR used to satisfy [`MemoryAp::open`] for a probe that has no DAP.
 const FAKE_IDR: u32 = 0x24770031;
 const FAKE_CSW: u32 = 0x23000052;
 const FAKE_CFG: u32 = 0x00000000;
@@ -184,7 +184,7 @@ impl ArmDebugInterface for IcdiArmDebug {
         &mut self,
         access_port: &FullyQualifiedApAddress,
     ) -> Result<Box<dyn ArmMemoryInterface + '_>, ArmError> {
-        let memory_ap = MemoryAp::new(self, access_port)?;
+        let memory_ap = MemoryAp::open(self, access_port)?;
         Ok(Box::new(IcdiMemoryInterface {
             probe: self,
             current_ap: memory_ap,
