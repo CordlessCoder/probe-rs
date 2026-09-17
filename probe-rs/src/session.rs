@@ -1008,25 +1008,25 @@ impl Session {
     }
 
     /// Clears all hardware breakpoints on all cores
+    ///
+    /// The cores are left running. Each architecture halts around its own breakpoint registers
+    /// where it has to: ARM reaches them over the debug bus, RISC-V and Xtensa halt and resume
+    /// inside their own breakpoint accessors.
     pub fn clear_all_hw_breakpoints(&mut self) -> Result<(), Error> {
-        self.halted_access(|session| {
-            { 0..session.cores.len() }.try_for_each(|core| {
-                tracing::info!("Clearing breakpoints for core {core}");
+        { 0..self.cores.len() }.try_for_each(|core| {
+            tracing::info!("Clearing breakpoints for core {core}");
 
-                match session.core(core) {
-                    Ok(mut core) => core.clear_all_hw_breakpoints(),
-                    Err(Error::CoreDisabled(_)) => Ok(()),
-                    Err(Error::Riscv(
-                        crate::architecture::riscv::communication_interface::RiscvError::Timeout,
-                    )) => {
-                        tracing::warn!(
-                            "Core {core} attach or breakpoint clear timed out, skipping"
-                        );
-                        Ok(())
-                    }
-                    Err(err) => Err(err),
+            match self.core(core) {
+                Ok(mut core) => core.clear_all_hw_breakpoints(),
+                Err(Error::CoreDisabled(_)) => Ok(()),
+                Err(Error::Riscv(
+                    crate::architecture::riscv::communication_interface::RiscvError::Timeout,
+                )) => {
+                    tracing::warn!("Core {core} attach or breakpoint clear timed out, skipping");
+                    Ok(())
                 }
-            })
+                Err(err) => Err(err),
+            }
         })
     }
 
