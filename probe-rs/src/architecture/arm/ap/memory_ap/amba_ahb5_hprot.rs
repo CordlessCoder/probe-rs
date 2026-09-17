@@ -23,8 +23,10 @@ impl AmbaAhb5Hprot {
         probe: &mut P,
         address: FullyQualifiedApAddress,
     ) -> Result<Self, ArmError> {
-        let csw = probe.read_raw_ap_register(&address, CSW::ADDRESS)?;
+        // CFG shares an AP register bank with the IDR the caller just read, and CSW shares one
+        // with the write below, so reading CFG first halves the SELECT writes.
         let cfg = probe.read_raw_ap_register(&address, CFG::ADDRESS)?;
+        let csw = probe.read_raw_ap_register(&address, CSW::ADDRESS)?;
         let (csw, cfg) = (csw.try_into()?, cfg.try_into()?);
 
         let me = Self { address, csw, cfg };
