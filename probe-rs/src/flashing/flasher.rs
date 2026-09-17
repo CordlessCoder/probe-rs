@@ -1039,36 +1039,50 @@ impl<O: Operation> ActiveFlasher<'_, '_, O> {
             ),
         ];
 
-        for (description, value) in registers {
-            if let Some(v) = value {
-                self.core.write_core_reg(description, v).map_err(|error| {
-                    FlashError::Core(Error::WriteRegister {
-                        register: description.to_string(),
-                        source: Box::new(error),
-                    })
-                })?;
+        // Stage the whole set in one request. Written one at a time, each register costs a round
+        // trip to the probe for the ready flag that the next one waits on.
+        let staged = registers
+            .iter()
+            .filter_map(|&(description, value)| value.map(|v| (description, v)))
+            .collect::<Vec<_>>();
 
-                // Reading the register back is an extra round trip per register staged, on every
-                // sector erased and every page programmed. At DEBUG that lands on anyone who turns
-                // logging on to find out why flashing is slow, and makes it slower without saying so.
-                if tracing::enabled!(Level::TRACE) {
-                    let readback: RegisterValue =
-                        self.core.read_core_reg(description).map_err(|error| {
-                            FlashError::Core(Error::ReadRegister {
-                                register: description.to_string(),
-                                source: Box::new(error),
-                            })
-                        })?;
-                    let readback_val: u64 = readback.try_into().unwrap_or(0);
+        let writes = staged
+            .iter()
+            .map(|&(description, v)| (description.id, RegisterValue::from(v)))
+            .collect::<Vec<_>>();
 
-                    tracing::trace!(
-                        "content of {} {:#x}: {:#018x} should be: {:#018x}",
-                        description.name(),
-                        description.id.0,
-                        readback_val,
-                        v
-                    );
-                }
+        self.core.write_core_regs(&writes).map_err(|error| {
+            FlashError::Core(Error::WriteRegister {
+                register: staged
+                    .iter()
+                    .map(|(description, _)| description.name())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                source: Box::new(error),
+            })
+        })?;
+
+        // Reading the register back is an extra round trip per register staged, on every
+        // sector erased and every page programmed. At DEBUG that lands on anyone who turns
+        // logging on to find out why flashing is slow, and makes it slower without saying so.
+        if tracing::enabled!(Level::TRACE) {
+            for (description, v) in staged {
+                let readback: RegisterValue =
+                    self.core.read_core_reg(description).map_err(|error| {
+                        FlashError::Core(Error::ReadRegister {
+                            register: description.to_string(),
+                            source: Box::new(error),
+                        })
+                    })?;
+                let readback_val: u64 = readback.try_into().unwrap_or(0);
+
+                tracing::trace!(
+                    "content of {} {:#x}: {:#018x} should be: {:#018x}",
+                    description.name(),
+                    description.id.0,
+                    readback_val,
+                    v
+                );
             }
         }
 

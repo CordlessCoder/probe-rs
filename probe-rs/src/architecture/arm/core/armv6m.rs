@@ -601,6 +601,28 @@ impl CoreInterface for Armv6m<'_> {
         self.memory.update_core_status(status);
     }
 
+    fn write_core_regs(&mut self, registers: &[(RegisterId, RegisterValue)]) -> Result<(), Error> {
+        if !self.state.current_state.is_halted() {
+            return Err(Error::Arm(ArmError::CoreNotHalted));
+        }
+
+        let mut values = Vec::with_capacity(registers.len());
+        for &(address, value) in registers {
+            values.push((address, value.try_into()?));
+        }
+
+        super::cortex_m::write_core_regs(&mut *self.memory, &values)?;
+
+        if registers
+            .iter()
+            .any(|&(address, _)| address == self.program_counter().id)
+        {
+            self.state.pc_written = true;
+        }
+
+        Ok(())
+    }
+
     fn status(&mut self) -> Result<crate::core::CoreStatus, Error> {
         // Ask for the fault status alongside the halt status. It is only wanted when the core
         // turns out to be halted, but a read that rides along in the same request is free, and
