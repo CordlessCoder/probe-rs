@@ -697,6 +697,24 @@ impl<'probe> Armv7m<'probe> {
         );
     }
 
+    /// Reads FP_CTRL, rejecting the revisions whose comparator encoding is not implemented.
+    fn read_fp_ctrl(&mut self) -> Result<FpCtrl, Error> {
+        let reg = FpCtrl::from(self.memory.read_word_32(FpCtrl::get_mmio_address())?);
+
+        if reg.rev() > 1 {
+            tracing::warn!(
+                "This chip uses FPBU revision {}, which is not yet supported. HW breakpoints are not available.",
+                reg.rev()
+            );
+            return Err(Error::Arm(ArmError::Other(format!(
+                "This chip uses FPBU revision {}, which is not yet supported. HW breakpoints are not available.",
+                reg.rev()
+            ))));
+        }
+
+        Ok(reg)
+    }
+
     /// Polls until `predicate` accepts the core status, and returns that status.
     fn wait_for_status(
         &mut self,
@@ -1056,53 +1074,34 @@ impl CoreInterface for Armv7m<'_> {
     }
 
     fn available_breakpoint_units(&mut self) -> Result<u32, Error> {
-        let raw_val = self.memory.read_word_32(FpCtrl::get_mmio_address())?;
-
-        let reg = FpCtrl::from(raw_val);
-
-        if reg.rev() == 0 || reg.rev() == 1 {
-            Ok(reg.num_code())
-        } else {
-            tracing::warn!(
-                "This chip uses FPBU revision {}, which is not yet supported. HW breakpoints are not available.",
-                reg.rev()
-            );
-            Err(Error::Arm(ArmError::Other(format!(
-                "This chip uses FPBU revision {}, which is not yet supported. HW breakpoints are not available.",
-                reg.rev()
-            ))))
-        }
+        Ok(self.read_fp_ctrl()?.num_code())
     }
 
     /// See docs on the [`CoreInterface::hw_breakpoints`] trait.
     fn hw_breakpoints(&mut self) -> Result<Vec<Option<u64>>, Error> {
+        let ctrl_reg = self.read_fp_ctrl()?;
+        // The comparators are consecutive, so one read covers all of them.
+        let mut comparators = vec![0; ctrl_reg.num_code() as usize];
+        if !comparators.is_empty() {
+            self.memory
+                .read_32(FpRev1CompX::get_mmio_address(), &mut comparators)?;
+        }
+
         let mut breakpoints = vec![];
-        let num_hw_breakpoints = self.available_breakpoint_units()? as usize;
-        { 0..num_hw_breakpoints }.try_for_each(|bp_unit_index| {
-            let raw_val = self.memory.read_word_32(FpCtrl::get_mmio_address())?;
-            let ctrl_reg = FpCtrl::from(raw_val);
-            // FpRev1 and FpRev2 needs different decoding of the register value, but the location where we read from is the same ...
-            let reg_addr = FpRev1CompX::get_mmio_address() + (bp_unit_index * size_of::<u32>()) as u64;
-            // The raw breakpoint address as read from memory.
-            let register_value = self.memory.read_word_32(reg_addr)?;
-            // The breakpoint address after it has been adjusted for FpRev 1 or 2.
-            let breakpoint:u32;
-            if register_value & 0b1 == 0b1 {
+        for register_value in comparators {
+            if register_value & 0b1 != 0b1 {
                 // We only care about `enabled` breakpoints.
-                if ctrl_reg.rev() == 0 {
-                    breakpoint = FpRev1CompX::get_breakpoint_comparator(register_value)?;
-                } else if ctrl_reg.rev() == 1 {
-                    breakpoint = FpRev2CompX::from(register_value).bpaddr() << 1;
-                } else {
-                    tracing::warn!("This chip uses FPBU revision {}, which is not yet supported. HW breakpoints are not available.", ctrl_reg.rev());
-                    return Err(Error::Other(format!("This chip uses FPBU revision {}, which is not yet supported. HW breakpoints are not available.", ctrl_reg.rev())));
-                }
-                breakpoints.push(Some(breakpoint as u64));
-            } else {
                 breakpoints.push(None);
+                continue;
             }
-            Ok(())
-        })?;
+            // FpRev1 and FpRev2 need different decoding of the register value.
+            let breakpoint = if ctrl_reg.rev() == 0 {
+                FpRev1CompX::get_breakpoint_comparator(register_value)?
+            } else {
+                FpRev2CompX::from(register_value).bpaddr() << 1
+            };
+            breakpoints.push(Some(breakpoint as u64));
+        }
         Ok(breakpoints)
     }
 

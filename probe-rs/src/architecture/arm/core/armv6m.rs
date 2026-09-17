@@ -819,12 +819,16 @@ impl CoreInterface for Armv6m<'_> {
 
     /// See docs on the [`CoreInterface::hw_breakpoints`] trait
     fn hw_breakpoints(&mut self) -> Result<Vec<Option<u64>>, Error> {
-        let mut breakpoints = vec![];
         let num_hw_breakpoints = self.available_breakpoint_units()? as usize;
-        for bp_unit_index in 0..num_hw_breakpoints {
-            let reg_addr = BpCompx::get_mmio_address() + (bp_unit_index * size_of::<u32>()) as u64;
-            // The raw breakpoint address as read from memory
-            let register_value = self.memory.read_word_32(reg_addr)?;
+        // The comparators are consecutive, so one read covers all of them.
+        let mut comparators = vec![0; num_hw_breakpoints];
+        if !comparators.is_empty() {
+            self.memory
+                .read_32(BpCompx::get_mmio_address(), &mut comparators)?;
+        }
+
+        let mut breakpoints = vec![];
+        for register_value in comparators {
             if BpCompx::from(register_value).enable() {
                 let breakpoint = BpCompx::get_breakpoint_comparator(register_value)?;
                 breakpoints.push(Some(breakpoint as u64));
