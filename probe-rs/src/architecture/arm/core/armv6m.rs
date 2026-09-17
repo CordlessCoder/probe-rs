@@ -468,29 +468,32 @@ impl<'probe> Armv6m<'probe> {
         );
     }
 
+    /// Polls until `predicate` accepts the core status, and returns that status.
     fn wait_for_status(
         &mut self,
         timeout: Duration,
         predicate: impl Fn(CoreStatus) -> bool,
-    ) -> Result<(), Error> {
+    ) -> Result<CoreStatus, Error> {
         let start = Instant::now();
 
-        while !predicate(self.status()?) {
+        loop {
+            let status = self.status()?;
+            if predicate(status) {
+                return Ok(status);
+            }
             if start.elapsed() >= timeout {
                 return Err(Error::Arm(ArmError::Timeout));
             }
             // Wait a bit before polling again.
             std::thread::sleep(Duration::from_millis(1));
         }
-
-        Ok(())
     }
 }
 
 impl CoreInterface for Armv6m<'_> {
     fn wait_for_core_halted(&mut self, timeout: Duration) -> Result<(), Error> {
         // Wait until halted state is active again.
-        self.wait_for_status(timeout, |s| s.is_halted())
+        self.wait_for_status(timeout, |s| s.is_halted()).map(|_| ())
     }
 
     fn core_halted(&mut self) -> Result<bool, Error> {
@@ -742,13 +745,16 @@ impl CoreInterface for Armv6m<'_> {
         // The single-step might put the core in lockup state. Lockup isn't considered "halted"
         // so we can't use `wait_for_core_halted` here.
         // So we wait for halted OR lockup, and if we entered lockup we halt.
-        if let Err(err) = self.wait_for_status(Duration::from_millis(100), |s| {
+        let status = match self.wait_for_status(Duration::from_millis(100), |s| {
             matches!(s, CoreStatus::Halted(_) | CoreStatus::LockedUp)
         }) {
-            self.state.clear_pending_step();
-            return Err(err);
-        }
-        if self.status()? == CoreStatus::LockedUp {
+            Ok(status) => status,
+            Err(err) => {
+                self.state.clear_pending_step();
+                return Err(err);
+            }
+        };
+        if status == CoreStatus::LockedUp {
             self.halt(Duration::from_millis(100))?;
         }
 
