@@ -126,7 +126,11 @@ impl<'a> Icepick<'a> {
             .inspect_err(|e| tracing::error!("Unable to select target 0: {e}"))?;
 
         if protocol == DefaultProtocol::CJtag {
-            this.ctag_to_jtag()?;
+            if std::env::var_os("PROBE_RS_JLINK_CJTAG").is_some() {
+                tracing::warn!("BENCH EXPERIMENT: leaving cJTAG activation to the probe");
+            } else {
+                this.ctag_to_jtag()?;
+            }
         }
 
         let tap_count = this
