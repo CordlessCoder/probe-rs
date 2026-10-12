@@ -193,7 +193,7 @@ impl ProbeFactory for JLinkFactory {
             swd_settings: SwdSettings::default(),
             jtag_state: JtagChainState::default(),
             reset_line: ResetLine::default(),
-            force_legacy_jtag_command: selector.product_id == 0x0101,
+            force_legacy_jtag_command: false,
 
             jtag_tms_bits: vec![],
             jtag_tdi_bits: vec![],
@@ -207,6 +207,11 @@ impl ProbeFactory for JLinkFactory {
         };
         this.fill_capabilities()?;
         this.fill_interfaces()?;
+
+        // The USB product ID does not identify the model: SEGGER puts many models behind one,
+        // and 0x0101 covers at least the EDU, the ARM Lite and the Ultra. The firmware string
+        // names the model.
+        this.force_legacy_jtag_command = needs_legacy_jtag_command(&this.read_firmware_version()?);
 
         this.supported_protocols = if this.caps.contains(Capability::SelectIf) {
             this.interfaces
@@ -744,9 +749,9 @@ impl JLink {
         // version 5 and above, which adds the 3rd command. Unfortunately we cannot reliably use the
         // HW version to determine this since some embedded J-Link probes have a HW version of
         // 1.0.0, but still support SWD, so we use the `SELECT_IF` capability instead.
-        // J-Link ARM Lite V8 (USB PID 0x0101) reports SELECT_IF, but returns an
-        // all-low TDO stream for HW_JTAG3 on macOS. HW_JTAG2 scans the same target
-        // chain correctly, matching SEGGER J-Link Commander/GDB Server.
+        // A J-Link ARM Lite V8 reports SELECT_IF, but returns an all-low TDO stream for
+        // HW_JTAG3. HW_JTAG2 scans the same target chain correctly. See
+        // `needs_legacy_jtag_command`.
         let cmd = if self.caps.contains(Capability::SelectIf) && !self.force_legacy_jtag_command {
             // Use the new JTAG3 command, make sure to select the JTAG interface mode
             has_status_byte = true;
@@ -1470,6 +1475,15 @@ impl fmt::Display for HardwareType {
     }
 }
 
+/// Whether a probe needs the legacy `HW_JTAG2` transfer command.
+///
+/// A J-Link ARM Lite V8 answers `HW_JTAG3` with an all-low TDO stream, so probe-rs finds no TAPs
+/// (probe-rs/probe-rs#4066). Only that model is known to be affected. The match covers every
+/// Lite variant, so its siblings keep the behaviour they have today.
+fn needs_legacy_jtag_command(firmware_version: &str) -> bool {
+    firmware_version.contains("Lite")
+}
+
 const VID_SEGGER: u16 = 0x1366;
 
 // Information about the product IDs is taken from the udev rules file provided by Segger.
@@ -1508,6 +1522,21 @@ fn is_jlink(info: &DeviceInfo) -> bool {
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn an_arm_lite_is_kept_on_the_legacy_jtag_command() {
+        assert!(super::needs_legacy_jtag_command(
+            "J-Link ARM Lite V8 compiled Mar 14 2018 16:03:26"
+        ));
+    }
+
+    #[test]
+    fn another_model_sharing_the_product_id_is_not() {
+        // A J-Link Ultra also enumerates as 1366:0101.
+        assert!(!super::needs_legacy_jtag_command(
+            "J-Link Ultra V4 compiled Sep 22 2022 15:00:10"
+        ));
+    }
+
     #[test]
     fn shift_all_uses_chunk_size() {
         use crate::probe::BitbangJtag;
