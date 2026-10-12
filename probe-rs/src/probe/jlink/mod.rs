@@ -50,6 +50,10 @@ use crate::{
 
 const SWO_BUFFER_SIZE: u16 = 128;
 const TIMEOUT_DEFAULT: Duration = Duration::from_millis(500);
+/// TMS edges in the IEEE 1149.7 selection escape sequence.
+const CJTAG_SELECTION_ESCAPE_EDGES: usize = 6;
+/// How long each escape-sequence pin level is held.
+const CJTAG_ESCAPE_EDGE_DWELL: Duration = Duration::from_millis(1);
 
 /// Factory to create [`JLink`] probes.
 #[derive(Debug)]
@@ -194,6 +198,7 @@ impl ProbeFactory for JLinkFactory {
             jtag_state: JtagChainState::default(),
             reset_line: ResetLine::default(),
             force_legacy_jtag_command: false,
+            cjtag_activating: false,
 
             jtag_tms_bits: vec![],
             jtag_tdi_bits: vec![],
@@ -325,6 +330,9 @@ enum Command {
     ResetTrst = 0x02,
     SetSpeed = 0x05,
     SelectIf = 0xC7,
+    /// Sets an interface parameter. Seen only in captures; the meaning of each parameter is
+    /// not known.
+    Unknown0e = 0x0E,
     SetKsPower = 0x08,
     HwClock = 0xC8,
     HwTms0 = 0xC9,
@@ -396,6 +404,8 @@ pub struct JLink {
     jtag_response: BitVec,
     jtag_state: JtagChainState,
     force_legacy_jtag_command: bool,
+    /// Set while the cJTAG activation runs, so its own scans do not retrigger it.
+    cjtag_activating: bool,
 
     /// max number of bits in a transfer chunk, when using JTAG
     jtag_chunk_size: usize,
@@ -744,6 +754,86 @@ impl JLink {
         Ok(())
     }
 
+    /// Clocks `count` bits of `tms` with TDI held low, taking the first byte's least
+    /// significant bit first, which is the order the wire format uses.
+    fn shift_tms_pattern(&mut self, tms: &[u8], count: usize) -> Result<(), JlinkError> {
+        for bit in 0..count {
+            self.jtag_tms_bits.push(tms[bit / 8] >> (bit % 8) & 1 == 1);
+            self.jtag_tdi_bits.push(false);
+            self.jtag_capture_tdo.push(false);
+        }
+        self.flush_jtag()
+    }
+
+    /// Sets one of the interface parameters SEGGER's software writes around a cJTAG
+    /// activation. The encoding is transcribed from a capture of that software, and what each
+    /// parameter means is not known.
+    fn cjtag_set(&mut self, param: u32, value: u32) -> Result<(), JlinkError> {
+        let mut cmd = vec![Command::Unknown0e as u8];
+        cmd.extend(param.to_le_bytes());
+        cmd.extend(value.to_le_bytes());
+        cmd.extend((Interface::CJtag as u32).to_le_bytes());
+        cmd.extend(0u32.to_le_bytes());
+        self.write_cmd(&cmd)?;
+        let status = self.read_u32()?;
+        tracing::trace!("cJTAG: parameter {param:#04x} = {value} returned {status}");
+        Ok(())
+    }
+
+    /// Brings an IEEE 1149.7 target up in OScan1.
+    ///
+    /// The firmware frames OScan1 itself once the cJTAG interface is selected, but the
+    /// activation is the host's to drive. An escape sequence is TMS edges while TCK is held
+    /// high, which no scan command can express, so it goes out as individual pin commands.
+    /// The writes after it move the adapter through its command levels and leave the scan
+    /// format set; the last is the documented `WriteOScan1(0x1B, 0, 6)`.
+    fn cjtag_activate(&mut self) -> Result<(), JlinkError> {
+        tracing::debug!("cJTAG: activating OScan1");
+        self.cjtag_activating = true;
+        let result = self.cjtag_activate_inner();
+        self.cjtag_activating = false;
+        result
+    }
+
+    fn cjtag_activate_inner(&mut self) -> Result<(), JlinkError> {
+        self.cjtag_set(0x09, 0)?;
+        self.cjtag_set(0x08, 0)?;
+
+        // Test-Logic-Reset, then one clock into Run-Test/Idle: the last of the 201 bits is low.
+        let mut reset = [0xFFu8; 26];
+        reset[25] = 0x00;
+        self.shift_tms_pattern(&reset, 201)?;
+
+        let pin = |this: &mut Self, cmd: Command| -> Result<(), JlinkError> {
+            this.write_cmd(&[cmd as u8])?;
+            // Each edge has to be held long enough for the adapter to count it.
+            std::thread::sleep(CJTAG_ESCAPE_EDGE_DWELL);
+            Ok(())
+        };
+        pin(self, Command::HwTck0)?;
+        pin(self, Command::HwTms0)?;
+        pin(self, Command::HwTck1)?;
+        for edge in 0..CJTAG_SELECTION_ESCAPE_EDGES {
+            let level = if edge % 2 == 0 {
+                Command::HwTms1
+            } else {
+                Command::HwTms0
+            };
+            pin(self, level)?;
+        }
+
+        self.shift_tms_pattern(&[0x00; 4], 32)?;
+        self.cjtag_set(0x0A, 0)?;
+        self.shift_tms_pattern(&[0xAD, 0x65, 0x59, 0x16, 0x16, 0x80, 0x01], 50)?;
+        self.cjtag_set(0x0A, 0)?;
+        self.cjtag_set(0x08, 1)?;
+        self.shift_tms_pattern(&[0x01, 0xD6, 0x00], 18)?;
+        self.cjtag_set(0x0A, 0)?;
+        self.shift_tms_pattern(&[0x1B], 6)?;
+
+        Ok(())
+    }
+
     fn flush_jtag(&mut self) -> Result<(), JlinkError> {
         if self.jtag_tms_bits.is_empty() {
             return Ok(());
@@ -761,10 +851,8 @@ impl JLink {
         // version 5 and above, which adds the 3rd command. Unfortunately we cannot reliably use the
         // HW version to determine this since some embedded J-Link probes have a HW version of
         // 1.0.0, but still support SWD, so we use the `SELECT_IF` capability instead.
-        // A J-Link ARM Lite V8 reports SELECT_IF, but returns an all-low TDO stream for
-        // HW_JTAG3. HW_JTAG2 scans the same target chain correctly. See
-        // `needs_legacy_jtag_command`.
-        let cmd = if self.caps.contains(Capability::SelectIf) && !self.force_legacy_jtag_command {
+        let legacy = self.force_legacy_jtag_command && self.interface != Interface::CJtag;
+        let cmd = if self.caps.contains(Capability::SelectIf) && !legacy {
             // Use the new JTAG3 command, make sure to select the JTAG interface mode
             has_status_byte = true;
             Command::HwJtag3
@@ -773,6 +861,15 @@ impl JLink {
             // FIXME is HW_JTAG relevant at all?
             Command::HwJtag2
         };
+
+        // Holding TMS high long enough to reach Test-Logic-Reset returns a 1149.7 adapter to
+        // its power-up two-pin state, so the activation has to be redone afterwards.
+        let tap_reset = self.interface == Interface::CJtag
+            && !self.cjtag_activating
+            && self
+                .jtag_tms_bits
+                .split(|&tms| !tms)
+                .any(|run| run.len() >= 5);
 
         let tms_bit_count = self.jtag_tms_bits.len();
         let tdi_bit_count = self.jtag_tdi_bits.len();
@@ -826,6 +923,10 @@ impl JLink {
             if capture {
                 self.jtag_response.push(bit);
             }
+        }
+
+        if tap_reset {
+            self.cjtag_activate()?;
         }
 
         Ok(())
@@ -1070,6 +1171,10 @@ impl DebugProbe for JLink {
                 WireProtocol::CJtag => Interface::CJtag,
             };
 
+            if jlink_interface == Interface::CJtag {
+                // SEGGER's software writes this one before it selects the interface.
+                self.cjtag_set(0x0F, 0)?;
+            }
             self.select_interface(jlink_interface)?;
         }
 
@@ -1094,7 +1199,10 @@ impl DebugProbe for JLink {
         }
 
         match self.protocol {
-            WireProtocol::Jtag | WireProtocol::CJtag => {
+            WireProtocol::Jtag if self.interface == Interface::CJtag => {
+                // cJTAG has no TRST pin.
+            }
+            WireProtocol::Jtag => {
                 // try some JTAG stuff
 
                 tracing::debug!("Resetting JTAG chain using trst");
@@ -1105,6 +1213,9 @@ impl DebugProbe for JLink {
 
                 // We are ready to debug.
             }
+            WireProtocol::CJtag => {
+                // cJTAG has no TRST pin.
+            }
         }
 
         self.write_cmd(&[Command::HwReset1 as u8])?;
@@ -1113,6 +1224,12 @@ impl DebugProbe for JLink {
         // Set a default speed if not already set
         if self.speed_khz == 0 {
             self.set_speed(400)?;
+        }
+
+        if self.interface == Interface::CJtag {
+            // SEGGER's own software runs the sequence twice before it talks to the target.
+            self.cjtag_activate()?;
+            self.cjtag_activate()?;
         }
 
         tracing::debug!("Attached successfully");
