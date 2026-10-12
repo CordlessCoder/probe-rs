@@ -462,7 +462,9 @@ impl JLink {
 
         self.write_cmd(&[Command::SelectIf as u8, 0xFF])?;
 
-        self.interfaces = self.read_u32().map(Interfaces::from_bits_warn)?;
+        let raw = self.read_u32()?;
+        tracing::debug!("J-Link: supported interface mask: {raw:#010x}");
+        self.interfaces = Interfaces::from_bits_warn(raw);
 
         Ok(())
     }
@@ -547,6 +549,11 @@ impl JLink {
         } else {
             Err(JlinkError::InterfaceNotSupported(intf))
         }
+    }
+
+    /// Whether the selected interface drives the JTAG state machine, in four pins or two.
+    fn drives_jtag(&self) -> bool {
+        matches!(self.interface, Interface::Jtag | Interface::CJtag)
     }
 
     fn require_interface_selected(&self, intf: Interface) -> Result<(), JlinkError> {
@@ -742,7 +749,12 @@ impl JLink {
             return Ok(());
         }
 
-        self.require_interface_selected(Interface::Jtag)?;
+        if !self.drives_jtag() {
+            return Err(JlinkError::WrongInterfaceSelected {
+                selected: self.interface,
+                needed: Interface::Jtag,
+            });
+        }
 
         let mut has_status_byte = false;
         // There's 3 commands for doing a JTAG transfer. The older 2 are obsolete with hardware
@@ -1050,7 +1062,12 @@ impl DebugProbe for JLink {
         if self.caps.contains(Capability::SelectIf) {
             let jlink_interface = match self.protocol {
                 WireProtocol::Swd => Interface::Swd,
-                WireProtocol::Jtag | WireProtocol::CJtag => Interface::Jtag,
+                WireProtocol::Jtag if std::env::var_os("PROBE_RS_JLINK_CJTAG").is_some() => {
+                    tracing::warn!("BENCH EXPERIMENT: selecting the cJTAG interface");
+                    Interface::CJtag
+                }
+                WireProtocol::Jtag => Interface::Jtag,
+                WireProtocol::CJtag => Interface::CJtag,
             };
 
             self.select_interface(jlink_interface)?;
@@ -1227,7 +1244,7 @@ impl BitbangSwd for JLink {
     where
         S: IntoIterator<Item = IoSequenceItem>,
     {
-        if self.interface != Interface::Jtag {
+        if !self.drives_jtag() {
             return self.perform_swdio_transfer(swdio);
         }
 
