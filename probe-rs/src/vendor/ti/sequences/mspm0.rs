@@ -18,7 +18,10 @@
 //! `tools/iar/low_power_mode_patch/*.dmac` `_InhibitSleepForceActive()`).
 
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
+use crate::architecture::arm::ap::{ApRegister, IDR};
 use crate::architecture::arm::dp::DpAddress;
 use crate::architecture::arm::memory::ArmMemoryInterface;
 use crate::architecture::arm::sequences::{ArmDebugSequence, cortex_m_wait_for_reset};
@@ -28,6 +31,9 @@ use probe_rs_target::CoreType;
 /// Access Port Select values used by this sequence.
 #[derive(Debug, Clone, Copy)]
 enum ApSel {
+    /// AHB-AP: memory access to the core. It lives in power domain PD1, so it is missing while
+    /// the device is in a low-power state.
+    AhbAp = 0,
     /// PWR-AP: controls the power and reset state of the CPU for debug purposes.
     PwrAp = 4,
 }
@@ -50,6 +56,8 @@ const SPREC: u64 = 0xF0;
 const DPREC0_FORCEACTIVE: u32 = 1 << 3;
 /// `DPREC0.RST CTL` (bits 16:14) set to `100b`, selecting halt-on-reset.
 const DPREC0_HALT_ON_RESET: u32 = 0b100 << 14;
+/// The whole `DPREC0.RST CTL` field. Its default is `000b` (SLAAEO5 table 3-2).
+const DPREC0_RST_CTL: u32 = 0b111 << 14;
 /// `DPREC0.DEBUGPOWER`.
 ///
 /// Documented as Reserved in SLAAEO5 table 3-3, but set by both of TI's toolchain patches.
@@ -110,6 +118,27 @@ impl MSPM0 {
         interface.write_raw_ap_register(&pwr_ap, SPREC, value)
     }
 
+    /// Whether the AHB-AP answers.
+    ///
+    /// `FORCEACTIVE` needs a moment to bring PD1 back up, so this polls rather than reading once.
+    /// Treating a slow wake as an absent AP would put us straight back into resetting a device
+    /// that was only asleep.
+    fn ahb_ap_responds(&self, interface: &mut dyn DapAccess) -> bool {
+        let ahb_ap: FullyQualifiedApAddress = ApSel::AhbAp.into();
+
+        let start = Instant::now();
+        loop {
+            if matches!(interface.read_raw_ap_register(&ahb_ap, IDR::ADDRESS), Ok(idr) if idr != 0)
+            {
+                return true;
+            }
+            if start.elapsed() > Duration::from_millis(10) {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// Recover a device whose `DPREC0` sticky bits are set.
     ///
     /// The meaning of bits 23:21 is undocumented; this reproduces what TI's packs do.
@@ -160,11 +189,21 @@ impl ArmDebugSequence for MSPM0 {
 
         if dprec0 & DPREC0_STICKY == 0 {
             self.write_dprec0(interface, DPREC0_DEBUG_ENABLE)?;
-        } else {
-            self.recover_sticky(interface)?;
+            return Ok(());
         }
 
-        Ok(())
+        // The sticky bits are set on any device that has been in a low-power state, not only on
+        // one that needs recovering, so finding them set is not on its own a reason to reset the
+        // device. Write what the recovery would write and see whether the AHB-AP comes back:
+        // `FORCEACTIVE` is what makes it discoverable again (SLAAEO5 section 3.1). Only when it
+        // stays missing is there something wrong, and only then is a system reset worth its cost.
+        self.write_dprec0(interface, DPREC0_DEBUG_ENABLE | DPREC0_STICKY)?;
+
+        if self.ahb_ap_responds(interface) {
+            return Ok(());
+        }
+
+        self.recover_sticky(interface)
     }
 
     fn debug_core_stop(
@@ -180,10 +219,15 @@ impl ArmDebugSequence for MSPM0 {
 
         // Hand low-power control back to the application. Leaving INHIBITSLEEP set would keep the
         // part awake and burning current until its next reset.
+        //
+        // Put RST CTL back to its default too. Halt-on-reset applies to "any form of reset
+        // performed on it post-configuration" (SLAAEO5 3.2.2), so leaving it selected stops the
+        // core on the next reset with no debugger present to release it. `debug_port_start`
+        // selects it again on the next attach.
         let dprec0 = self.read_dprec0(interface)?;
         self.write_dprec0(
             interface,
-            dprec0 & !(DPREC0_INHIBITSLEEP | DPREC0_FORCEACTIVE),
+            dprec0 & !(DPREC0_INHIBITSLEEP | DPREC0_FORCEACTIVE | DPREC0_RST_CTL),
         )?;
 
         Ok(())
@@ -221,6 +265,7 @@ impl ArmDebugSequence for MSPM0 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use probe_rs_target::{ApAddress, CoreAccessOptions};
 
     /// The values TI's Keil packs and IAR macros write, pinned so a change to the bit definitions
     /// above cannot silently alter what goes on the wire.
@@ -229,6 +274,14 @@ mod tests {
         assert_eq!(DPREC0_DEBUG_ENABLE, 0x0019_0008);
         assert_eq!(DPREC0_DEBUG_ENABLE | DPREC0_STICKY, 0x00F9_0008);
         assert_eq!(DPREC0_FORCEACTIVE, 0x0000_0008);
+    }
+
+    /// `debug_core_stop` has to clear the whole RST CTL field, not just the bit `DPREC0_DEBUG_ENABLE`
+    /// happens to set, or the device is left in some other reset mode instead of the default.
+    #[test]
+    fn clearing_rst_ctl_selects_the_default_reset_mode() {
+        assert_eq!(DPREC0_HALT_ON_RESET & DPREC0_RST_CTL, DPREC0_HALT_ON_RESET);
+        assert_eq!(DPREC0_DEBUG_ENABLE & !DPREC0_RST_CTL, 0x0018_0008);
     }
 
     #[test]
@@ -246,6 +299,41 @@ mod tests {
                 "{name} should use the short recovery sequence"
             );
         }
+    }
+
+    /// `ahb_ap_responds` polls AP 0, so a part that put its core anywhere else would be read at
+    /// the wrong address, look absent, and be reset for having slept.
+    #[test]
+    fn every_builtin_mspm0_core_is_on_the_ahb_ap() {
+        let registry = crate::config::Registry::from_builtin_families();
+
+        let mut checked = 0;
+        for family in registry.families() {
+            for chip in &family.variants {
+                // The same prefixes `vendor/ti/mod.rs` matches on to select this sequence.
+                if !chip.name.starts_with("MSPM0") && !chip.name.starts_with("MSPS") {
+                    continue;
+                }
+
+                for core in &chip.cores {
+                    let CoreAccessOptions::Arm(options) = &core.core_access_options else {
+                        panic!("{}: core {} is not an ARM core", chip.name, core.name);
+                    };
+
+                    assert!(
+                        matches!(options.ap, ApAddress::V1(ap) if ap == ApSel::AhbAp as u8),
+                        "{}: core {} is on {:?}, not the AHB-AP",
+                        chip.name,
+                        core.name,
+                        options.ap
+                    );
+
+                    checked += 1;
+                }
+            }
+        }
+
+        assert!(checked > 0, "no built-in MSPM0 variants to check");
     }
 
     /// Guards the chip-name prefix matching in `vendor/ti/mod.rs`: every built-in MSPM0 target must
