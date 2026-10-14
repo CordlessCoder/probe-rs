@@ -149,6 +149,11 @@ pub enum RequestError {
         request: jtag::sequence::SequenceRequest,
     },
 
+    /// Failed to send the SWD sequence to the probe with the following request: {request:?}
+    SwdSequence {
+        request: swd::sequence::SequenceRequest,
+    },
+
     /// The JTAG `{name}` scan chain is either too long or otherwise broken. Expected next bit to be {expected_bit}
     BrokenScanChain {
         name: &'static str,
