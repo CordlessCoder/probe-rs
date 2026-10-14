@@ -57,12 +57,12 @@ impl SWJPinsRequestBuilder {
         self
     }
 
-    pub fn _swdio_tms(&mut self, value: bool) -> &mut Self {
+    pub fn swdio_tms(&mut self, value: bool) -> &mut Self {
         self.swdio_tms = Some(value);
         self
     }
 
-    pub fn _swclk_tck(&mut self, value: bool) -> &mut Self {
+    pub fn swclk_tck(&mut self, value: bool) -> &mut Self {
         self.swclk_tck = Some(value);
         self
     }

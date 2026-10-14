@@ -17,12 +17,18 @@ use super::{
         general::connect::{ConnectRequest, ConnectResponse},
         jtag::sequence::{Sequence as JtagSequence, SequenceRequest as JtagSequenceRequest},
         swd::sequence::{Sequence as SwdSequence, SequenceRequest as SwdSequenceRequest},
-        swj::sequence::SequenceRequest as SwjSequenceRequest,
+        swj::{
+            pins::{SWJPinsRequestBuilder, SWJPinsResponse},
+            sequence::SequenceRequest as SwjSequenceRequest,
+        },
     },
 };
 use probe_rs_target::ScanChainElement;
 
 use crate::probe::{BitSequence, DebugProbeError, JtagBatch, JtagChain, TapState, WireProtocol};
+
+/// How long each escape-sequence pin level is held.
+const ESCAPE_EDGE_DWELL: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// Frames held with TMS high to reset the TAP from inside OScan1.
 ///
@@ -257,6 +263,93 @@ impl CmsisDap {
         }
 
         Ok(tdo)
+    }
+
+    /// Bring the target up in OScan1 through the escape-sequence route.
+    ///
+    /// This is what the working two-pin path does, and it is not the documented command window.
+    /// A capture of it shows a burst of TMSC edges with TCKC held high, which no clocked command
+    /// can express, followed by clocked patterns carrying the command levels.
+    ///
+    /// The patterns are transcribed from that capture. Needs the probe in SWD mode, because the
+    /// bits go out as SWD sequences on the same two wires.
+    pub fn cjtag_activate_by_escape(&mut self, edges: usize) -> Result<(), DebugProbeError> {
+        tracing::debug!("cJTAG: escape activation, {edges} edges");
+
+        // Test-Logic-Reset, then one clock into Run-Test/Idle: the last of the 201 bits is low.
+        let mut reset = [0xFFu8; 26];
+        reset[25] = 0x00;
+        self.cjtag_drive_swd_bits(&reset, 201)?;
+
+        self.cjtag_pins(Some(false), None)?;
+        self.cjtag_pins(None, Some(false))?;
+        self.cjtag_pins(Some(true), None)?;
+        for edge in 0..edges {
+            self.cjtag_pins(None, Some(edge % 2 == 0))?;
+        }
+
+        // The command levels, ending with the scan format set to OScan1.
+        self.cjtag_drive_swd_bits(&[0x00; 4], 32)?;
+        self.cjtag_drive_swd_bits(&[0xAD, 0x65, 0x59, 0x16, 0x16, 0x80, 0x01], 50)?;
+        self.cjtag_drive_swd_bits(&[0x01, 0xD6, 0x00], 18)?;
+        self.cjtag_drive_swd_bits(&[0x1B], 6)?;
+
+        Ok(())
+    }
+
+    /// Bench probe: drive just the escape sequence, with no clocked patterns around it, so a
+    /// capture shows the pin writes alone.
+    pub fn cjtag_escape_only(&mut self, edges: usize) -> Result<(), DebugProbeError> {
+        self.cjtag_pins(Some(false), None)?;
+        self.cjtag_pins(None, Some(false))?;
+        self.cjtag_pins(Some(true), None)?;
+
+        for edge in 0..edges {
+            self.cjtag_pins(None, Some(edge % 2 == 0))?;
+        }
+
+        Ok(())
+    }
+
+    /// Clock `bits` of `data` on TMSC as SWD sequences, least significant bit of each byte first.
+    fn cjtag_drive_swd_bits(&mut self, data: &[u8], bits: usize) -> Result<(), DebugProbeError> {
+        let mut driven = BitVec::<u8, Lsb0>::from_slice(data);
+        driven.truncate(bits);
+
+        let mut sequences = Vec::new();
+        for chunk in driven.chunks(64) {
+            let mut part = BitVec::new();
+            part.extend(chunk.iter().map(|b| *b));
+            sequences.push(SwdSequence::output(&part)?);
+        }
+
+        self.send_swd_sequences(SwdSequenceRequest::new(sequences)?)?;
+
+        Ok(())
+    }
+
+    /// Set TCKC and TMSC directly, leaving a pin alone where the level is `None`.
+    fn cjtag_pins(
+        &mut self,
+        swclk: Option<bool>,
+        swdio: Option<bool>,
+    ) -> Result<(), DebugProbeError> {
+        let mut builder = SWJPinsRequestBuilder::new();
+
+        if let Some(level) = swclk {
+            builder.swclk_tck(level);
+        }
+        if let Some(level) = swdio {
+            builder.swdio_tms(level);
+        }
+
+        commands::send_command(&mut self.device, &builder.build()).map(|_: SWJPinsResponse| ())?;
+
+        // Each edge has to be held long enough for the target to count it. The working path
+        // paces these about a millisecond apart, which a USB round trip already is.
+        std::thread::sleep(ESCAPE_EDGE_DWELL);
+
+        Ok(())
     }
 
     /// Read the first TAP's IDCODE over OScan1, the way the J-Link does it.
