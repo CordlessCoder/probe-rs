@@ -39,6 +39,8 @@ use crate::{
     },
 };
 
+pub mod cjtag;
+
 use commands::{
     CmsisDapDevice, Status,
     general::{
@@ -55,7 +57,12 @@ use commands::{
             SequenceResponse as JtagSequenceResponse,
         },
     },
-    swd,
+    swd::{
+        self,
+        sequence::{
+            SequenceRequest as SwdSequenceRequest, SequenceResponse as SwdSequenceResponse,
+        },
+    },
     swj::{
         clock::SWJClockRequest,
         pins::{SWJPinsRequestBuilder, SWJPinsResponse},
@@ -542,6 +549,20 @@ impl CmsisDap {
             JtagSequenceResponse(Status::DapOk, tdo) => Ok(tdo),
             JtagSequenceResponse(Status::DapError, _) => {
                 Err(CmsisDapError::ErrorResponse(RequestError::JtagSequence {
+                    request,
+                }))
+            }
+        })
+    }
+
+    /// Clock SWCLK with SWDIO driven or released, and return whatever the released runs read.
+    ///
+    /// The bits come back concatenated, in the order the capturing sequences were given.
+    fn send_swd_sequences(&mut self, request: SwdSequenceRequest) -> Result<BitVec, CmsisDapError> {
+        commands::send_command(&mut self.device, &request).and_then(|v| match v {
+            SwdSequenceResponse(Status::DapOk, swdio) => Ok(swdio),
+            SwdSequenceResponse(Status::DapError, _) => {
+                Err(CmsisDapError::ErrorResponse(RequestError::SwdSequence {
                     request,
                 }))
             }
