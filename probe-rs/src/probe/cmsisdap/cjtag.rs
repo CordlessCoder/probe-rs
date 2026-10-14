@@ -13,9 +13,10 @@ use bitvec::prelude::*;
 use super::{
     CmsisDap,
     commands::{
-        CmsisDapError,
+        self, CmsisDapError,
         jtag::sequence::{Sequence as JtagSequence, SequenceRequest as JtagSequenceRequest},
         swd::sequence::{Sequence as SwdSequence, SequenceRequest as SwdSequenceRequest},
+        swj::pins::{SWJPinsRequestBuilder, SWJPinsResponse},
     },
 };
 use crate::probe::{DebugProbeError, WireProtocol};
@@ -82,6 +83,11 @@ impl CmsisDap {
 
     /// Open the command window and issue one command as its two DR scans.
     fn cjtag_command(&mut self, cp0: usize, cp1: usize) -> Result<(), DebugProbeError> {
+        // The inert opcode is BYPASS, which is all ones, and all ones is what a shift produces
+        // when TDI is high. A two-pin adapter ties TDI high for us; a board with all four wires
+        // does not, and in SWD mode nothing else drives it, so the shift would load zeros.
+        self.cjtag_hold_tdi_high()?;
+
         let mut tms = TapPattern::from_test_logic_reset();
         tms.ir_scan(ICEPICK_IR_LEN);
         tms.zero_bit_scan();
@@ -153,6 +159,41 @@ impl CmsisDap {
         Ok(tdo)
     }
 
+    /// Load `instruction` into the instruction register over OScan1, from Run-Test/Idle and
+    /// back to it.
+    ///
+    /// A TAP reset would select IDCODE for free and also put a 1149.7 adapter back in two-pin,
+    /// undoing the activation — so the instruction has to be shifted in. OScan1 carries TDI, so
+    /// this is the one thing two-pin can do that the activation itself cannot.
+    pub fn cjtag_shift_ir(&mut self, instruction: u32) -> Result<(), DebugProbeError> {
+        let mut frames = vec![(true, false), (true, false), (false, false), (false, false)];
+
+        for bit in 0..ICEPICK_IR_LEN {
+            let last = bit == ICEPICK_IR_LEN - 1;
+            frames.push((last, instruction >> bit & 1 == 1));
+        }
+
+        frames.extend([(true, false), (false, false)]);
+
+        self.cjtag_shift(&frames)?;
+
+        Ok(())
+    }
+
+    /// Read `bits` out of the selected data register over OScan1, from Run-Test/Idle.
+    ///
+    /// Stays in Shift-DR at the end rather than exiting, which costs nothing here and keeps the
+    /// frame count equal to the bit count.
+    pub fn cjtag_read_dr(&mut self, bits: usize) -> Result<BitVec, DebugProbeError> {
+        let mut frames = vec![(true, false), (false, false), (false, false)];
+        frames.extend(std::iter::repeat_n((false, false), bits));
+
+        let tdo = self.cjtag_shift(&frames)?;
+
+        // The first three frames are the walk to Shift-DR and carry no register data.
+        Ok(tdo[3..].to_bitvec())
+    }
+
     /// Whether this probe answers `DAP_SWD_Sequence` at all.
     ///
     /// No capability bit reports it, so the only way to find out is to send one. A probe that
@@ -167,6 +208,13 @@ impl CmsisDap {
                 Ok(false)
             }
         }
+    }
+
+    /// Drive TDI high and leave it there, so an instruction shift loads BYPASS.
+    fn cjtag_hold_tdi_high(&mut self) -> Result<(), DebugProbeError> {
+        let request = SWJPinsRequestBuilder::new().tdi(true).build();
+        commands::send_command(&mut self.device, &request).map(|_: SWJPinsResponse| ())?;
+        Ok(())
     }
 
     /// Clock `tms` out as SWD sequences, for a probe connected in SWD mode.

@@ -52,7 +52,7 @@ impl SWJPinsRequestBuilder {
         self
     }
 
-    pub fn _tdi(&mut self, value: bool) -> &mut Self {
+    pub fn tdi(&mut self, value: bool) -> &mut Self {
         self.tdi = Some(value);
         self
     }
