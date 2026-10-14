@@ -14,7 +14,10 @@ use super::{
     CmsisDap,
     commands::{
         self, CmsisDapError, RequestError,
-        general::connect::{ConnectRequest, ConnectResponse},
+        general::{
+            connect::{ConnectRequest, ConnectResponse},
+            execute::PinBurstRequest,
+        },
         jtag::sequence::{Sequence as JtagSequence, SequenceRequest as JtagSequenceRequest},
         swd::sequence::{Sequence as SwdSequence, SequenceRequest as SwdSequenceRequest},
         swj::{
@@ -25,6 +28,7 @@ use super::{
 };
 use probe_rs_target::ScanChainElement;
 
+use crate::architecture::arm::Pins;
 use crate::probe::{BitSequence, DebugProbeError, JtagBatch, JtagChain, TapState, WireProtocol};
 
 /// How long each escape-sequence pin level is held.
@@ -265,7 +269,7 @@ impl CmsisDap {
 
         for pass in 0..passes {
             tracing::debug!("cJTAG: interleaved activation, pass {pass}");
-            self.cjtag_escape_only(edges)?;
+            self.cjtag_escape_fast(edges)?;
             self.cjtag_dr_scans(&[1, 1, 1, STFMT, OSCAN1, 1, 2, 2])?;
         }
 
@@ -349,6 +353,39 @@ impl CmsisDap {
         self.cjtag_drive_swd_bits(&[0x01, 0xD6, 0x00], 18)?;
         self.cjtag_drive_swd_bits(&[0x1B], 6)?;
 
+        Ok(())
+    }
+
+    /// Drive the escape sequence as one packet, so the edges land microseconds apart.
+    ///
+    /// `DAP_SWJ_Pins` one per packet puts edges a millisecond apart, which is a USB round trip.
+    /// The working two-pin path places them about 1.1 us apart, and that is only reachable by
+    /// handing the probe several writes at once.
+    pub fn cjtag_escape_fast(&mut self, edges: usize) -> Result<(), DebugProbeError> {
+        let mut writes = Vec::with_capacity(edges + 3);
+
+        let mut clock = Pins(0);
+        clock.set_swclk_tck(true);
+        let mut data = Pins(0);
+        data.set_swdio_tms(true);
+
+        // TCKC low, TMSC low, TCKC high: the state an escape sequence starts from.
+        writes.push((Pins(0), clock));
+        writes.push((Pins(0), data));
+        writes.push((clock, clock));
+
+        for edge in 0..edges {
+            let level = if edge % 2 == 0 { data } else { Pins(0) };
+            writes.push((level, data));
+        }
+
+        self.send_pin_burst(PinBurstRequest::new(writes)?)?;
+
+        Ok(())
+    }
+
+    fn send_pin_burst(&mut self, request: PinBurstRequest) -> Result<(), DebugProbeError> {
+        commands::send_command(&mut self.device, &request)?;
         Ok(())
     }
 
