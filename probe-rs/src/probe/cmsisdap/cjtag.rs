@@ -83,9 +83,10 @@ impl CmsisDap {
 
     /// Open the command window and issue one command as its two DR scans.
     fn cjtag_command(&mut self, cp0: usize, cp1: usize) -> Result<(), DebugProbeError> {
-        // The inert opcode is BYPASS, which is all ones, and all ones is what a shift produces
-        // when TDI is high. A two-pin adapter ties TDI high for us; a board with all four wires
-        // does not, and in SWD mode nothing else drives it, so the shift would load zeros.
+        // The inert opcode is BYPASS, which is all ones, and all ones is what an instruction
+        // shift produces when TDI is high. A two-pin adapter ties TDI high itself; a board that
+        // brings out all four wires does not, and neither mode drives it otherwise, so the shift
+        // would load zeros — which is not an inert instruction.
         self.cjtag_hold_tdi_high()?;
 
         let mut tms = TapPattern::from_test_logic_reset();
@@ -97,6 +98,12 @@ impl CmsisDap {
         tms.dr_scan(cp1);
 
         // Which command can carry the pattern depends on how the probe connected.
+        let rendered: String = tms.tms.iter().map(|b| if *b { '1' } else { '0' }).collect();
+        tracing::debug!(
+            "cJTAG command {cp0}/{cp1}, {} clocks: {rendered}",
+            tms.tms.len()
+        );
+
         if self.protocol == Some(WireProtocol::Swd) {
             self.cjtag_drive_bits_swd(&tms.tms)?;
         } else {
@@ -194,6 +201,29 @@ impl CmsisDap {
         Ok(tdo[3..].to_bitvec())
     }
 
+    /// Bench probe: clock `count` TCK cycles with TMS high, as one JTAG sequence and nothing
+    /// else, so a capture can be compared against the number asked for.
+    pub fn cjtag_emit_tms_run(&mut self, count: u8) -> Result<(), DebugProbeError> {
+        let sequences = vec![JtagSequence::new(count, false, true, [0; 8])?];
+        self.send_jtag_sequences(JtagSequenceRequest::new(sequences)?)?;
+        Ok(())
+    }
+
+    /// Bench probe: emit TMS-high runs of each length in `counts`, separated by one low clock,
+    /// as a single request. The capture then shows every length against what was asked for.
+    pub fn cjtag_sweep_tms_runs(&mut self, counts: &[u8]) -> Result<(), DebugProbeError> {
+        let mut sequences = Vec::new();
+
+        for count in counts {
+            sequences.push(JtagSequence::new(*count, false, true, [0; 8])?);
+            sequences.push(JtagSequence::new(1, false, false, [0; 8])?);
+        }
+
+        self.send_jtag_sequences(JtagSequenceRequest::new(sequences)?)?;
+
+        Ok(())
+    }
+
     /// Whether this probe answers `DAP_SWD_Sequence` at all.
     ///
     /// No capability bit reports it, so the only way to find out is to send one. A probe that
@@ -256,6 +286,14 @@ impl CmsisDap {
                 sequences.push(JtagSequence::new(part.len() as u8, false, part[0], [0; 8])?);
             }
         }
+
+        tracing::debug!(
+            "cJTAG: {} JTAG sequences, runs {:?}",
+            sequences.len(),
+            tms.chunk_by(|a, b| a == b)
+                .map(|r| (r[0] as u8, r.len()))
+                .collect::<Vec<_>>()
+        );
 
         self.send_jtag_sequences(JtagSequenceRequest::new(sequences)?)?;
 
