@@ -13,10 +13,9 @@ use bitvec::prelude::*;
 use super::{
     CmsisDap,
     commands::{
-        self, CmsisDapError,
+        CmsisDapError,
         jtag::sequence::{Sequence as JtagSequence, SequenceRequest as JtagSequenceRequest},
         swd::sequence::{Sequence as SwdSequence, SequenceRequest as SwdSequenceRequest},
-        swj::pins::{SWJPinsRequestBuilder, SWJPinsResponse},
     },
 };
 use crate::probe::{DebugProbeError, WireProtocol};
@@ -38,6 +37,14 @@ const APFC_STANDARD_PINS: usize = 9;
 /// Five is enough by the state machine. The working path uses fifty, so match it rather than
 /// leave a difference that has to be ruled out later.
 const TAP_RESET_CLOCKS: usize = 50;
+
+/// TDI data for a sequence that only cares about TMS.
+///
+/// All ones, not all zeros: `DAP_JTAG_Sequence` drives TDI from these bytes, so zeros would shift
+/// zeros into the instruction register. The cJTAG command window wants an inert opcode there, and
+/// BYPASS is all ones (SWCU185G 6.2.1) — which is also what the four-pin path that works on this
+/// part sends.
+const TDI_HIGH: [u8; 8] = [0xFF; 8];
 
 /// The ICEPick's instruction register length, which is what an all-ones shift fills with BYPASS.
 const ICEPICK_IR_LEN: usize = 6;
@@ -83,12 +90,6 @@ impl CmsisDap {
 
     /// Open the command window and issue one command as its two DR scans.
     fn cjtag_command(&mut self, cp0: usize, cp1: usize) -> Result<(), DebugProbeError> {
-        // The inert opcode is BYPASS, which is all ones, and all ones is what an instruction
-        // shift produces when TDI is high. A two-pin adapter ties TDI high itself; a board that
-        // brings out all four wires does not, and neither mode drives it otherwise, so the shift
-        // would load zeros — which is not an inert instruction.
-        self.cjtag_hold_tdi_high()?;
-
         let mut tms = TapPattern::from_test_logic_reset();
         tms.ir_scan(ICEPICK_IR_LEN);
         tms.zero_bit_scan();
@@ -240,13 +241,6 @@ impl CmsisDap {
         }
     }
 
-    /// Drive TDI high and leave it there, so an instruction shift loads BYPASS.
-    fn cjtag_hold_tdi_high(&mut self) -> Result<(), DebugProbeError> {
-        let request = SWJPinsRequestBuilder::new().tdi(true).build();
-        commands::send_command(&mut self.device, &request).map(|_: SWJPinsResponse| ())?;
-        Ok(())
-    }
-
     /// Clock `tms` out as SWD sequences, for a probe connected in SWD mode.
     ///
     /// `DAP_JTAG_Sequence` is only available once the probe has connected in JTAG mode, and the
@@ -283,7 +277,12 @@ impl CmsisDap {
         for run in tms.chunk_by(|a, b| a == b) {
             // A sequence carries at most 64 clocks.
             for part in run.chunks(64) {
-                sequences.push(JtagSequence::new(part.len() as u8, false, part[0], [0; 8])?);
+                sequences.push(JtagSequence::new(
+                    part.len() as u8,
+                    false,
+                    part[0],
+                    TDI_HIGH,
+                )?);
             }
         }
 
