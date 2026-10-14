@@ -125,6 +125,17 @@ impl CmsisDap {
     /// Taking clock counts rather than command pairs is what lets a sequence read off a working
     /// capture be replayed exactly, including a scan that pairs across a group boundary.
     fn cjtag_scans(&mut self, scans: &[u64]) -> Result<(), DebugProbeError> {
+        self.cjtag_open_window()?;
+        self.cjtag_dr_scans(
+            &std::iter::once(1)
+                .chain(scans.iter().copied())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Reset the TAP, load the inert opcode, and raise the control level with two zero-bit
+    /// scans. Leaves the window open; the level locks on the next Shift-DR.
+    fn cjtag_open_window(&mut self) -> Result<(), DebugProbeError> {
         // What `debug_port_setup` sends before it builds the ICEPick: a line reset that puts the
         // SWJ pins into a known state. Without it the command window is being opened from
         // whatever the previous caller left behind.
@@ -158,8 +169,14 @@ impl CmsisDap {
             chain.run(batch)?;
         }
 
-        // The first Shift-DR locks the level, then the command parts follow.
-        for clocks in std::iter::once(1).chain(scans.iter().copied()) {
+        Ok(())
+    }
+
+    /// Run `scans` as data-register scans of those clock counts, through an open window.
+    fn cjtag_dr_scans(&mut self, scans: &[u64]) -> Result<(), DebugProbeError> {
+        let mut chain = JtagChain::new(self);
+
+        for clocks in scans.iter().copied() {
             let mut batch = JtagBatch::new();
             let bits = BitSequence::from_u64(clocks as usize, 0xff);
             chain.exchange_dr(&mut batch, &bits);
@@ -242,10 +259,14 @@ impl CmsisDap {
         edges: usize,
         passes: usize,
     ) -> Result<(), DebugProbeError> {
+        // The window is opened once. The working path does not reload the inert opcode before
+        // each repeat — it escapes and sends the group again, and nothing else.
+        self.cjtag_open_window()?;
+
         for pass in 0..passes {
             tracing::debug!("cJTAG: interleaved activation, pass {pass}");
             self.cjtag_escape_only(edges)?;
-            self.cjtag_scans(&[1, 1, STFMT, OSCAN1, 1, 2, 2])?;
+            self.cjtag_dr_scans(&[1, 1, 1, STFMT, OSCAN1, 1, 2, 2])?;
         }
 
         Ok(())
