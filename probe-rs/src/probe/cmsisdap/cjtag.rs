@@ -389,6 +389,21 @@ impl CmsisDap {
         Ok(())
     }
 
+    /// Bench probe: drive TMSC low, then release it for `cycles` clocks.
+    ///
+    /// This is how to see whether the probe really stops driving the wire for the cycle OScan1
+    /// gives the target. A released line with any pull-up on it rises; a line still driven low
+    /// stays flat. Driving low first is what makes the two cases tell apart — releasing a line
+    /// that is already high shows nothing either way.
+    pub fn cjtag_release_test(&mut self, cycles: usize) -> Result<BitVec, DebugProbeError> {
+        let mut low = BitVec::new();
+        low.extend(std::iter::repeat_n(false, 8));
+
+        let sequences = vec![SwdSequence::output(&low)?, SwdSequence::input(cycles)?];
+
+        Ok(self.send_swd_sequences(SwdSequenceRequest::new(sequences)?)?)
+    }
+
     /// Bench probe: drive just the escape sequence, with no clocked patterns around it, so a
     /// capture shows the pin writes alone.
     pub fn cjtag_escape_only(&mut self, edges: usize) -> Result<(), DebugProbeError> {
