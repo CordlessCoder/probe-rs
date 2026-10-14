@@ -89,7 +89,11 @@ impl CmsisDap {
     /// two-pin state, so anything that resets the TAP undoes this.
     pub fn cjtag_activate(&mut self) -> Result<(), DebugProbeError> {
         tracing::debug!("cJTAG: selecting OScan1");
-        self.cjtag_command(STFMT, OSCAN1)
+        // The scan sequence a working two-pin activation puts on the wire, read off a capture:
+        // after the scan that locks the control level, these clock counts. Pairing them gives
+        // `STC1` with SEDGE set, then `STFMT` selecting OScan1, then two more commands, the last
+        // of which pairs across the group boundary.
+        self.cjtag_scans(&[1, 1, STFMT, OSCAN1, 1, 2, 2])
     }
 
     /// Switch the target to four-pin JTAG, the same way `ctag_to_jtag` does.
@@ -112,6 +116,15 @@ impl CmsisDap {
     ///
     /// The clock count of each DR scan is the command's value (SWCU185G 6.2.1).
     fn cjtag_command(&mut self, cp0: u64, cp1: u64) -> Result<(), DebugProbeError> {
+        self.cjtag_scans(&[cp0, cp1])
+    }
+
+    /// Open the command window once, then run `scans` as data-register scans of those clock
+    /// counts, which is the form a cJTAG command takes.
+    ///
+    /// Taking clock counts rather than command pairs is what lets a sequence read off a working
+    /// capture be replayed exactly, including a scan that pairs across a group boundary.
+    fn cjtag_scans(&mut self, scans: &[u64]) -> Result<(), DebugProbeError> {
         // What `debug_port_setup` sends before it builds the ICEPick: a line reset that puts the
         // SWJ pins into a known state. Without it the command window is being opened from
         // whatever the previous caller left behind.
@@ -146,7 +159,7 @@ impl CmsisDap {
         }
 
         // The first Shift-DR locks the level, then the command parts follow.
-        for clocks in [1, cp0, cp1] {
+        for clocks in std::iter::once(1).chain(scans.iter().copied()) {
             let mut batch = JtagBatch::new();
             let bits = BitSequence::from_u64(clocks as usize, 0xff);
             chain.exchange_dr(&mut batch, &bits);
@@ -215,6 +228,27 @@ impl CmsisDap {
         ]);
 
         Ok(self.send_jtag_sequences(JtagSequenceRequest::new(sequences)?)?)
+    }
+
+    /// Bring the target up in OScan1 the way the working two-pin path does: an escape sequence
+    /// and the command group, repeated.
+    ///
+    /// Both halves are measured. The escape is six TMSC edges with TCKC held high, driven from
+    /// pin writes and confirmed on the wire at the pacing the working path uses. The group is the
+    /// scan sequence that path sends, also read off a capture, and this reproduces it scan for
+    /// scan. What the capture additionally shows is that the two alternate, five times over.
+    pub fn cjtag_activate_interleaved(
+        &mut self,
+        edges: usize,
+        passes: usize,
+    ) -> Result<(), DebugProbeError> {
+        for pass in 0..passes {
+            tracing::debug!("cJTAG: interleaved activation, pass {pass}");
+            self.cjtag_escape_only(edges)?;
+            self.cjtag_scans(&[1, 1, STFMT, OSCAN1, 1, 2, 2])?;
+        }
+
+        Ok(())
     }
 
     /// Reconnect the probe in SWD mode, keeping the target where it is.
