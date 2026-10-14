@@ -16,27 +16,24 @@ use super::{
         CmsisDapError,
         jtag::sequence::{Sequence as JtagSequence, SequenceRequest as JtagSequenceRequest},
         swd::sequence::{Sequence as SwdSequence, SequenceRequest as SwdSequenceRequest},
+        swj::sequence::SequenceRequest as SwjSequenceRequest,
     },
 };
-use crate::probe::{DebugProbeError, WireProtocol};
+use probe_rs_target::ScanChainElement;
+
+use crate::probe::{BitSequence, DebugProbeError, JtagBatch, JtagChain, TapState};
 
 /// `STFMT`, Store Scan Format (SWCU185G Table 6-4).
-const STFMT: usize = 3;
+const STFMT: u64 = 3;
 
 /// The `OSCAN1` operand of `STFMT`.
-const OSCAN1: usize = 9;
+const OSCAN1: u64 = 9;
 
 /// `STC2`, Store Conditional 2 bit (SWCU185G Table 6-4).
-const STC2: usize = 2;
+const STC2: u64 = 2;
 
 /// The `STC2` operand that sets APFC to the standard pin function, which is four-pin JTAG.
-const APFC_STANDARD_PINS: usize = 9;
-
-/// Clocks held with TMS high to reach Test-Logic-Reset from anywhere.
-///
-/// Five is enough by the state machine. The working path uses fifty, so match it rather than
-/// leave a difference that has to be ruled out later.
-const TAP_RESET_CLOCKS: usize = 50;
+const APFC_STANDARD_PINS: u64 = 9;
 
 /// TDI data for a sequence that only cares about TMS.
 ///
@@ -46,8 +43,14 @@ const TAP_RESET_CLOCKS: usize = 50;
 /// part sends.
 const TDI_HIGH: [u8; 8] = [0xFF; 8];
 
-/// The ICEPick's instruction register length, which is what an all-ones shift fills with BYPASS.
+/// The ICEPick's instruction register length.
 const ICEPICK_IR_LEN: usize = 6;
+
+/// BYPASS, the inert opcode the command window wants loaded first (SWCU185G 6.2.1).
+const ICEPICK_BYPASS: u32 = 0x3F;
+
+/// The ICEPick's IDCODE instruction.
+const ICEPICK_IDCODE: u32 = 0x04;
 
 /// JTAG bits per `DAP_SWD_Sequence` request.
 ///
@@ -89,62 +92,114 @@ impl CmsisDap {
     }
 
     /// Open the command window and issue one command as its two DR scans.
-    fn cjtag_command(&mut self, cp0: usize, cp1: usize) -> Result<(), DebugProbeError> {
-        let mut tms = TapPattern::from_test_logic_reset();
-        tms.ir_scan(ICEPICK_IR_LEN);
-        tms.zero_bit_scan();
-        tms.zero_bit_scan();
-        tms.dr_scan(1);
-        tms.dr_scan(cp0);
-        tms.dr_scan(cp1);
+    ///
+    /// This drives the chain through probe-rs's own JTAG operations, the same ones
+    /// `ti::sequences::icepick::ctag_to_jtag` uses to switch this part to four pin. Hand-rolling
+    /// the TMS pattern reproduced the right bits on the wire and still did not take, so the only
+    /// difference left worth removing was the machinery itself.
+    ///
+    /// The clock count of each DR scan is the command's value (SWCU185G 6.2.1).
+    fn cjtag_command(&mut self, cp0: u64, cp1: u64) -> Result<(), DebugProbeError> {
+        // What `debug_port_setup` sends before it builds the ICEPick: a line reset that puts the
+        // SWJ pins into a known state. Without it the command window is being opened from
+        // whatever the previous caller left behind.
+        self.send_swj_sequences(SwjSequenceRequest::new(
+            &0x0007_FFFF_FFFF_FFFFu64.to_le_bytes(),
+            51,
+        )?)?;
 
-        // Which command can carry the pattern depends on how the probe connected.
-        let rendered: String = tms.tms.iter().map(|b| if *b { '1' } else { '0' }).collect();
-        tracing::debug!(
-            "cJTAG command {cp0}/{cp1}, {} clocks: {rendered}",
-            tms.tms.len()
-        );
+        let mut chain = JtagChain::new(self);
+        // Deliberately no `set_chain` here. `Icepick::new` opens the window with the chain
+        // unset and only configures it after scanning, so an instruction shift sends exactly the
+        // bits given with no padding. Setting it first pads them and the command changes.
+        // A reset leaves an inert opcode in the instruction register, and BYPASS is shifted in
+        // after it because that is what the working path does.
+        let mut batch = JtagBatch::new();
+        chain.tap_reset(&mut batch);
+        chain.run(batch)?;
 
-        if self.protocol == Some(WireProtocol::Swd) {
-            self.cjtag_drive_bits_swd(&tms.tms)?;
-        } else {
-            self.cjtag_drive_bits(&tms.tms)?;
+        let bypass = BitSequence::from_bytes(&ICEPICK_BYPASS.to_le_bytes(), ICEPICK_IR_LEN);
+        let mut batch = JtagBatch::new();
+        chain.shift_ir(&mut batch, &bypass);
+        chain.run_test_idle(&mut batch, 0);
+        chain.run(batch)?;
+
+        // Two zero-bit scans raise the control level; a scan that reaches Update-DR without
+        // touching Shift-DR is what counts, and entering Pause-DR is one way there.
+        for _ in 0..2 {
+            let mut batch = JtagBatch::new();
+            batch.enter(TapState::PauseDr);
+            batch.enter(TapState::RunTestIdle);
+            chain.run(batch)?;
+        }
+
+        // The first Shift-DR locks the level, then the command parts follow.
+        for clocks in [1, cp0, cp1] {
+            let mut batch = JtagBatch::new();
+            let bits = BitSequence::from_u64(clocks as usize, 0xff);
+            chain.exchange_dr(&mut batch, &bits);
+            chain.run_test_idle(&mut batch, 0);
+            chain.run(batch)?;
         }
 
         Ok(())
     }
 
-    /// Read the first TAP's IDCODE over four-pin JTAG, without resetting the TAP.
+    /// Read the first TAP's IDCODE through probe-rs's own chain operations.
     ///
-    /// A chain scan cannot be used as a detector here: it resets the TAP, and five TMS-high
-    /// clocks put a 1149.7 adapter back in its power-up two-pin state, undoing the very switch
-    /// it is meant to be checking. This navigates from Run-Test/Idle instead, which is where
-    /// [`Self::cjtag_switch_to_four_pin`] leaves it, and reads the register the reset selected.
+    /// The same shape as `icepick::scan_jtag`: select IDCODE, then exchange a data register of
+    /// the expected width. Going through `JtagChain` rather than raw sequences keeps the chain's
+    /// own state tracking in step, which raw sequences quietly bypass.
+    pub fn cjtag_chain_idcode(&mut self) -> Result<BitVec, DebugProbeError> {
+        let mut chain = JtagChain::new(self);
+        // The chain operations pad IR against the configured chain, so it has to be told what
+        // is on it before any of them. `Icepick::new` does the same once it has scanned; at this
+        // point only the ICEPick is attached, which is what the power-up state gives us.
+        chain.set_chain(&[ScanChainElement {
+            name: Some("ICEPICK".to_owned()),
+            ir_len: Some(ICEPICK_IR_LEN as u8),
+        }]);
+
+        // BYPASS first, then IDCODE, which is what `ctag_to_jtag` does on its way out: the
+        // BYPASS load is there so later state transitions cannot disturb the instruction
+        // register. Shifting IDCODE straight after the command skips that.
+        for instruction in [ICEPICK_BYPASS, ICEPICK_IDCODE] {
+            let bits = BitSequence::from_bytes(&instruction.to_le_bytes(), ICEPICK_IR_LEN);
+            let mut batch = JtagBatch::new();
+            chain.shift_ir(&mut batch, &bits);
+            chain.run_test_idle(&mut batch, 0);
+            chain.run(batch)?;
+        }
+
+        let mut batch = JtagBatch::new();
+        let handle = chain.exchange_dr(&mut batch, &BitSequence::from_u64(32, 0));
+        chain.run_test_idle(&mut batch, 0);
+        let mut results = chain.run(batch)?;
+
+        let bits = results.take(handle).map_err(|error| {
+            DebugProbeError::Other(format!("no IDCODE came back from the chain: {error:?}"))
+        })?;
+
+        Ok(bits.iter().collect())
+    }
+
+    /// Read the chain's TDO over four-pin JTAG from Run-Test/Idle, without resetting the TAP.
+    ///
+    /// A chain scan cannot serve as a detector here: it resets the TAP, and that returns a 1149.7
+    /// adapter to two-pin, undoing the switch being checked.
     pub fn cjtag_four_pin_idcode(&mut self, reset_first: bool) -> Result<BitVec, DebugProbeError> {
         let mut sequences = Vec::new();
 
-        // Nothing here knows where the last caller left the TAP, and from Test-Logic-Reset the
-        // navigation below goes nowhere: TMS high holds that state, and the two low clocks only
-        // reach Run-Test/Idle. Resetting makes the start known — at the cost of putting a 1149.7
-        // adapter back in two-pin, which is why it is the caller's choice.
         if reset_first {
-            sequences.push(JtagSequence::new(
-                TAP_RESET_CLOCKS as u8,
-                false,
-                true,
-                [0; 8],
-            )?);
-            sequences.push(JtagSequence::new(1, false, false, [0; 8])?);
+            sequences.push(JtagSequence::new(6, false, true, TDI_HIGH)?);
+            sequences.push(JtagSequence::new(1, false, false, TDI_HIGH)?);
         }
 
         sequences.extend([
-            // Run-Test/Idle to Shift-DR.
-            JtagSequence::new(1, false, true, [0; 8])?,
-            JtagSequence::new(2, false, false, [0; 8])?,
-            // Enough for several TAPs: the bits come out of the one nearest TDO first, so a
-            // 32-bit read sees whichever device is last in the chain and nothing else.
-            JtagSequence::new(64, true, false, [0; 8])?,
-            JtagSequence::new(64, true, false, [0; 8])?,
+            JtagSequence::new(1, false, true, TDI_HIGH)?,
+            JtagSequence::new(2, false, false, TDI_HIGH)?,
+            JtagSequence::new(64, true, false, TDI_HIGH)?,
+            JtagSequence::new(64, true, false, TDI_HIGH)?,
         ]);
 
         Ok(self.send_jtag_sequences(JtagSequenceRequest::new(sequences)?)?)
@@ -152,10 +207,8 @@ impl CmsisDap {
 
     /// Shift `frames` of `(tms, tdi)` through an activated target, one OScan1 frame each.
     ///
-    /// Returns one TDO bit per frame, in order.
-    ///
-    /// OScan1 spends three TCKC cycles on a JTAG bit: the host drives the inverse of TDI, then
-    /// TMS, then releases the wire for the target to answer on.
+    /// Returns one TDO bit per frame, in order. Needs the probe connected in SWD mode, because
+    /// releasing the wire for the target's cycle is what `DAP_SWD_Sequence` exists to do.
     pub fn cjtag_shift(&mut self, frames: &[(bool, bool)]) -> Result<BitVec, DebugProbeError> {
         let mut tdo = BitVec::new();
 
@@ -240,115 +293,6 @@ impl CmsisDap {
             }
         }
     }
-
-    /// Clock `tms` out as SWD sequences, for a probe connected in SWD mode.
-    ///
-    /// `DAP_JTAG_Sequence` is only available once the probe has connected in JTAG mode, and the
-    /// OScan1 read needs SWD mode so the wire can be released. This keeps both halves in one
-    /// mode and one command family.
-    fn cjtag_drive_bits_swd(&mut self, tms: &[bool]) -> Result<(), DebugProbeError> {
-        let mut sequences = Vec::new();
-
-        for part in tms.chunks(64) {
-            let mut driven = BitVec::new();
-            driven.extend(part.iter().copied());
-            sequences.push(SwdSequence::output(&driven)?);
-        }
-
-        self.send_swd_sequences(SwdSequenceRequest::new(sequences)?)?;
-
-        Ok(())
-    }
-
-    /// Clock `tms` out, one bit per TCK.
-    ///
-    /// This goes out as `DAP_JTAG_Sequence` rather than `DAP_SWJ_Sequence`, which looks like the
-    /// natural fit and is not. Measured on an MCU-Link: a 43-bit `DAP_SWJ_Sequence` put 42 clocks
-    /// on the wire, losing one from the middle of a run, while `DAP_JTAG_Sequence` delivers its
-    /// counts exactly — the four-pin switch in `ctag_to_jtag` rides on it and lands 1, 2 and 9
-    /// bit scans on the nose. A cJTAG command *is* a clock count, so a lost clock is a different
-    /// command.
-    ///
-    /// `DAP_JTAG_Sequence` holds TMS fixed for a whole sequence, so the pattern goes out as one
-    /// sequence per run of equal bits.
-    fn cjtag_drive_bits(&mut self, tms: &[bool]) -> Result<(), DebugProbeError> {
-        let mut sequences = Vec::new();
-
-        for run in tms.chunk_by(|a, b| a == b) {
-            // A sequence carries at most 64 clocks.
-            for part in run.chunks(64) {
-                sequences.push(JtagSequence::new(
-                    part.len() as u8,
-                    false,
-                    part[0],
-                    TDI_HIGH,
-                )?);
-            }
-        }
-
-        tracing::debug!(
-            "cJTAG: {} JTAG sequences, runs {:?}",
-            sequences.len(),
-            tms.chunk_by(|a, b| a == b)
-                .map(|r| (r[0] as u8, r.len()))
-                .collect::<Vec<_>>()
-        );
-
-        self.send_jtag_sequences(JtagSequenceRequest::new(sequences)?)?;
-
-        Ok(())
-    }
-}
-
-/// A TMS pattern for the TAP, built scan by scan.
-///
-/// cJTAG commands are counted in clocks spent in Shift-DR, so the pattern is the payload and
-/// getting a state wrong is the whole bug. Every method here starts and ends in Run-Test/Idle, so
-/// they compose, and the tests walk the result through the TAP model rather than trusting the
-/// counting.
-struct TapPattern {
-    tms: Vec<bool>,
-}
-
-impl TapPattern {
-    /// Start by resetting the TAP, from any state, ending in Run-Test/Idle.
-    fn from_test_logic_reset() -> Self {
-        let mut tms = vec![true; TAP_RESET_CLOCKS];
-        tms.push(false);
-        Self { tms }
-    }
-
-    /// An IR scan spending `clocks` clocks in Shift-IR.
-    ///
-    /// The cJTAG command window wants an inert opcode in the instruction register first
-    /// (SWCU185G 6.2.1). A reset leaves IDCODE there, which the standard also accepts, but the
-    /// path that is known to work on this part shifts BYPASS explicitly — so do that.
-    fn ir_scan(&mut self, clocks: usize) {
-        self.tms.extend([true, true, false]);
-        self.tms.extend(std::iter::repeat_n(false, clocks));
-        self.tms.extend([true, true, false]);
-    }
-
-    /// A scan that reaches Update-DR without ever entering Shift-DR, which is what increments
-    /// the control level (SWCU185G 6.2.1).
-    ///
-    /// The standard allows going through Pause-DR or skipping it. This takes the Pause-DR route
-    /// because that is the one measured working on this part.
-    fn zero_bit_scan(&mut self) {
-        self.tms
-            .extend([true, false, true, false, true, true, false]);
-    }
-
-    /// A DR scan spending `clocks` clocks in Shift-DR, from Run-Test/Idle and back to it.
-    ///
-    /// The count is the payload of a cJTAG command, so it has to mean what probe-rs's own
-    /// lowering means by an n-bit exchange: enter Shift-DR, clock `clocks` bits with TMS low
-    /// except the last, which exits.
-    fn dr_scan(&mut self, clocks: usize) {
-        self.tms.extend([true, false]);
-        self.tms.extend(std::iter::repeat_n(false, clocks));
-        self.tms.extend([true, true, false]);
-    }
 }
 
 /// Turn `(tms, tdi)` pairs into the sequences one OScan1 frame each takes.
@@ -374,110 +318,6 @@ fn oscan1_frames(frames: &[(bool, bool)]) -> Result<Vec<SwdSequence>, CmsisDapEr
 mod tests {
     use super::*;
     use crate::probe::cmsisdap::commands::Request;
-
-    use crate::probe::jtag::FullTapState;
-
-    /// Walk a pattern through the TAP model and report the state after each clock.
-    fn walk(pattern: TapPattern) -> Vec<FullTapState> {
-        let mut state = FullTapState::TestLogicReset;
-        pattern
-            .tms
-            .iter()
-            .map(|tms| {
-                state = state.step(*tms);
-                state
-            })
-            .collect()
-    }
-
-    /// The control level only counts a scan that reaches Update-DR without shifting, so a zero
-    /// bit scan that touches Shift-DR silently locks the level one command early.
-    #[test]
-    fn a_zero_bit_scan_captures_without_shifting() {
-        let mut pattern = TapPattern::from_test_logic_reset();
-        pattern.zero_bit_scan();
-
-        let states = walk(pattern);
-
-        assert!(states.contains(&FullTapState::CaptureDr), "never captured");
-        assert!(states.contains(&FullTapState::UpdateDr), "never updated");
-        assert!(!states.contains(&FullTapState::ShiftDr), "entered Shift-DR");
-        assert_eq!(states.last(), Some(&FullTapState::RunTestIdle));
-    }
-
-    /// The clock count in Shift-DR *is* the command, so this is the assertion the whole
-    /// activation rests on.
-    #[test]
-    fn a_dr_scan_spends_exactly_its_count_in_shift_dr() {
-        for clocks in 0..=31 {
-            let mut pattern = TapPattern::from_test_logic_reset();
-            pattern.dr_scan(clocks);
-
-            let states = walk(pattern);
-            let shifted = states
-                .iter()
-                .filter(|state| **state == FullTapState::ShiftDr)
-                .count();
-
-            assert_eq!(shifted, clocks, "{clocks} clocks asked for");
-            assert_eq!(states.last(), Some(&FullTapState::RunTestIdle));
-        }
-    }
-
-    /// The way into Shift-DR is probe-rs's to define, not mine to hand-derive — the proven
-    /// four-pin path uses it and this has to agree.
-    #[test]
-    fn the_scan_enters_shift_dr_the_way_the_rest_of_the_tree_does() {
-        use crate::probe::TapState;
-
-        let mut pattern = TapPattern { tms: Vec::new() };
-        pattern.dr_scan(4);
-
-        let path = TapState::RunTestIdle.path_to(TapState::ShiftDr);
-        assert_eq!(&pattern.tms[..path.len()], path);
-    }
-
-    /// The reset has to be long enough from any starting state, and has to end in Run-Test/Idle
-    /// rather than in Test-Logic-Reset, where a scan would go nowhere.
-    #[test]
-    fn the_reset_lands_in_run_test_idle() {
-        let states = walk(TapPattern::from_test_logic_reset());
-        assert_eq!(states.last(), Some(&FullTapState::RunTestIdle));
-    }
-
-    /// The command window, checked against a capture of the path that is known to work on this
-    /// part. `ctag_to_jtag` drives the same window over the same probe; these are the bits it
-    /// put on the wire, read off a logic analyser, with its reset prefix left out.
-    ///
-    /// A cJTAG command is a clock count, so this is the assertion that matters: a pattern that
-    /// walks the TAP correctly but counts differently is a different command.
-    #[test]
-    fn the_window_matches_the_measured_working_pattern() {
-        let mut pattern = TapPattern { tms: Vec::new() };
-        pattern.ir_scan(ICEPICK_IR_LEN);
-        pattern.zero_bit_scan();
-        pattern.zero_bit_scan();
-        pattern.dr_scan(1);
-        pattern.dr_scan(STC2);
-        pattern.dr_scan(APFC_STANDARD_PINS);
-
-        let rendered: String = pattern
-            .tms
-            .iter()
-            .map(|b| if *b { '1' } else { '0' })
-            .collect();
-
-        let measured = concat!(
-            "110000000110",   // IR, 6 bits: BYPASS
-            "1010110",        // zero-bit scan, through Pause-DR
-            "1010110",        // zero-bit scan
-            "100110",         // DR 1 bit, which locks the control level
-            "1000110",        // DR 2 bits: CP0, STC2
-            "10000000000110", // DR 9 bits: CP1, the standard pin function
-        );
-
-        assert_eq!(rendered, measured);
-    }
 
     /// What one frame puts on the wire, read out of the encoded request.
     fn encoded(tms: bool, tdi: bool) -> Vec<u8> {
