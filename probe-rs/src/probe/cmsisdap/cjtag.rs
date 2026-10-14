@@ -13,7 +13,8 @@ use bitvec::prelude::*;
 use super::{
     CmsisDap,
     commands::{
-        CmsisDapError,
+        self, CmsisDapError, RequestError,
+        general::connect::{ConnectRequest, ConnectResponse},
         jtag::sequence::{Sequence as JtagSequence, SequenceRequest as JtagSequenceRequest},
         swd::sequence::{Sequence as SwdSequence, SequenceRequest as SwdSequenceRequest},
         swj::sequence::SequenceRequest as SwjSequenceRequest,
@@ -21,7 +22,7 @@ use super::{
 };
 use probe_rs_target::ScanChainElement;
 
-use crate::probe::{BitSequence, DebugProbeError, JtagBatch, JtagChain, TapState};
+use crate::probe::{BitSequence, DebugProbeError, JtagBatch, JtagChain, TapState, WireProtocol};
 
 /// `STFMT`, Store Scan Format (SWCU185G Table 6-4).
 const STFMT: u64 = 3;
@@ -203,6 +204,39 @@ impl CmsisDap {
         ]);
 
         Ok(self.send_jtag_sequences(JtagSequenceRequest::new(sequences)?)?)
+    }
+
+    /// Reconnect the probe in SWD mode, keeping the target where it is.
+    ///
+    /// The command window rides on JTAG operations, and the OScan1 read needs the probe able to
+    /// release the wire, which only the SWD commands do. `DAP_Connect` reconfigures the probe's
+    /// pins and clocks nothing, so the target does not notice.
+    pub fn cjtag_reconnect_as_swd(&mut self) -> Result<(), DebugProbeError> {
+        let used = commands::send_command(&mut self.device, &ConnectRequest::Swd).and_then(
+            |v| match v {
+                ConnectResponse::SuccessfulInitForSWD => Ok(WireProtocol::Swd),
+                ConnectResponse::SuccessfulInitForJTAG => Ok(WireProtocol::Jtag),
+                ConnectResponse::InitFailed => {
+                    Err(CmsisDapError::ErrorResponse(RequestError::InitFailed {
+                        protocol: Some(WireProtocol::Swd),
+                    }))
+                }
+            },
+        )?;
+
+        self.protocol = Some(used);
+        tracing::debug!("cJTAG: reconnected as {used}");
+
+        Ok(())
+    }
+
+    /// Reconnect the probe in JTAG mode. The counterpart of [`Self::cjtag_reconnect_as_swd`],
+    /// for checking whether reconnecting is what disturbs the target.
+    pub fn cjtag_reconnect_as_jtag(&mut self) -> Result<(), DebugProbeError> {
+        commands::send_command(&mut self.device, &ConnectRequest::Jtag)
+            .map(|_: ConnectResponse| ())?;
+        self.protocol = Some(WireProtocol::Jtag);
+        Ok(())
     }
 
     /// Shift `frames` of `(tms, tdi)` through an activated target, one OScan1 frame each.
