@@ -24,6 +24,11 @@ use probe_rs_target::ScanChainElement;
 
 use crate::probe::{BitSequence, DebugProbeError, JtagBatch, JtagChain, TapState, WireProtocol};
 
+/// Frames held with TMS high to reset the TAP from inside OScan1.
+///
+/// The measured working read uses nine; ten is the same thing with a frame to spare.
+const OSCAN1_RESET_FRAMES: usize = 10;
+
 /// `STFMT`, Store Scan Format (SWCU185G Table 6-4).
 const STFMT: u64 = 3;
 
@@ -252,6 +257,34 @@ impl CmsisDap {
         }
 
         Ok(tdo)
+    }
+
+    /// Read the first TAP's IDCODE over OScan1, the way the J-Link does it.
+    ///
+    /// Taken frame for frame from a capture of a working two-pin read: a TAP reset carried out
+    /// *as OScan1 frames*, then a zero-bit instruction scan, then the walk to Shift-DR.
+    ///
+    /// Resetting the TAP this way is safe even though a run of TMS-high clocks normally returns
+    /// a 1149.7 adapter to its power-up two-pin state. In OScan1 a frame is three cycles and TMS
+    /// is only the middle one, so TMSC never carries the long high run the adapter watches for.
+    ///
+    /// The reset also makes an instruction shift unnecessary: IEEE 1149.1 leaves IDCODE selected
+    /// after one.
+    pub fn cjtag_read_idcode(&mut self) -> Result<BitVec, DebugProbeError> {
+        let mut frames = vec![(true, false); OSCAN1_RESET_FRAMES];
+
+        // Run-Test/Idle, then Select-DR, Capture-DR, Shift-DR.
+        frames.extend([
+            (false, false),
+            (true, false),
+            (false, false),
+            (false, false),
+        ]);
+
+        // The register itself, with TMS low so the TAP stays in Shift-DR.
+        frames.extend(std::iter::repeat_n((false, false), 32));
+
+        self.cjtag_shift(&frames)
     }
 
     /// Load `instruction` into the instruction register over OScan1, from Run-Test/Idle and
