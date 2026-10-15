@@ -276,6 +276,30 @@ impl CmsisDap {
         Ok(())
     }
 
+    /// Replay the measured activation structure exactly: escapes and command groups in the
+    /// counts and order a working two-pin read puts on the wire, and nothing else.
+    ///
+    /// The difference from every other activation here is what is *absent*. A capture of the
+    /// working path shows no chain scan, no instruction shift and no TAP reset before the
+    /// groups: the three one-clock scans that open each group are the whole window. Opening one
+    /// the way `cjtag_open_window` does adds a 256-clock chain scan and two instruction scans
+    /// that the working path never sends.
+    ///
+    /// The structure is escape 10, then escape 34, two groups, escape 34, two groups, escape 7,
+    /// one group. Five groups, three escapes between them.
+    pub fn cjtag_activate_replay(&mut self) -> Result<(), DebugProbeError> {
+        tracing::debug!("cJTAG: replaying the measured activation");
+
+        for (edges, groups) in [(10usize, 0), (34, 2), (34, 2), (7, 1)] {
+            self.cjtag_escape_fast(edges)?;
+            for _ in 0..groups {
+                self.cjtag_dr_scans(&[1, 1, 1, STFMT, OSCAN1, 1, 2, 2])?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Reconnect the probe in SWD mode, keeping the target where it is.
     ///
     /// The command window rides on JTAG operations, and the OScan1 read needs the probe able to
@@ -547,20 +571,7 @@ impl CmsisDap {
     /// The reset also makes an instruction shift unnecessary: IEEE 1149.1 leaves IDCODE selected
     /// after one.
     pub fn cjtag_read_idcode(&mut self) -> Result<BitVec, DebugProbeError> {
-        let mut frames = vec![(true, false); OSCAN1_RESET_FRAMES];
-
-        // Run-Test/Idle, then Select-DR, Capture-DR, Shift-DR.
-        frames.extend([
-            (false, false),
-            (true, false),
-            (false, false),
-            (false, false),
-        ]);
-
-        // The register itself, with TMS low so the TAP stays in Shift-DR.
-        frames.extend(std::iter::repeat_n((false, false), 32));
-
-        self.cjtag_shift(&frames)
+        self.cjtag_shift(&oscan1_idcode_frames())
     }
 
     /// Load `instruction` into the instruction register over OScan1, from Run-Test/Idle and
@@ -636,6 +647,30 @@ impl CmsisDap {
             }
         }
     }
+}
+
+/// The frames an OScan1 IDCODE read shifts: a TAP reset carried out as frames, the walk to
+/// Shift-DR, then the register.
+///
+/// Public so a caller can compare the TDO it got against the TMS that went out. A released wire
+/// reads back the level the host last drove, so a TDO equal to this TMS is an undriven wire and
+/// not an answer. That is the single most misread result on this path, and eyeballing it has gone
+/// wrong three times.
+pub fn oscan1_idcode_frames() -> Vec<(bool, bool)> {
+    let mut frames = vec![(true, false); OSCAN1_RESET_FRAMES];
+
+    // Run-Test/Idle, then Select-DR, Capture-DR, Shift-DR.
+    frames.extend([
+        (false, false),
+        (true, false),
+        (false, false),
+        (false, false),
+    ]);
+
+    // The register itself, with TMS low so the TAP stays in Shift-DR.
+    frames.extend(std::iter::repeat_n((false, false), 32));
+
+    frames
 }
 
 /// The cJTAG command window as one frame list per request: the reset and inert opcode, the two
