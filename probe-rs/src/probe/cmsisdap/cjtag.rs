@@ -577,9 +577,9 @@ impl CmsisDap {
     /// Taken frame for frame from a capture of a working two-pin read: a TAP reset carried out
     /// *as OScan1 frames*, then a zero-bit instruction scan, then the walk to Shift-DR.
     ///
-    /// Resetting the TAP this way is safe even though a run of TMS-high clocks normally returns
-    /// a 1149.7 adapter to its power-up two-pin state. In OScan1 a frame is three cycles and TMS
-    /// is only the middle one, so TMSC never carries the long high run the adapter watches for.
+    /// Resetting the TAP this way needs TDI driven high throughout. TMS being only the middle
+    /// cycle of three does not by itself keep TMSC low: the other two cycles carry nTDI and the
+    /// released wire, both of which sit high unless TDI is driven. See `oscan1_idcode_frames`.
     ///
     /// The reset also makes an instruction shift unnecessary: IEEE 1149.1 leaves IDCODE selected
     /// after one.
@@ -670,7 +670,15 @@ impl CmsisDap {
 /// not an answer. That is the single most misread result on this path, and eyeballing it has gone
 /// wrong three times.
 pub fn oscan1_idcode_frames() -> Vec<(bool, bool)> {
-    let mut frames = vec![(true, false); OSCAN1_RESET_FRAMES];
+    // TDI high, which puts nTDI low and breaks the run of high cycles on TMSC.
+    //
+    // A frame is nTDI, TMS, then the released cycle. With TMS high for a TAP reset and TDI low,
+    // nTDI is high and the released cycle floats high, so all three cycles are high and ten
+    // reset frames hold TMSC high for thirty-one clocks. That is the run a 1149.7 adapter
+    // watches for, and it returns the part to its power-up two-pin state, undoing the
+    // activation before the read has shifted anything. A working read never holds TMSC high
+    // for more than five clocks and drives TDI during the reset frames to achieve it.
+    let mut frames = vec![(true, true); OSCAN1_RESET_FRAMES];
 
     // Run-Test/Idle, then Select-DR, Capture-DR, Shift-DR.
     frames.extend([
