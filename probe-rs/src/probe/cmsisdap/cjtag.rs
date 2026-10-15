@@ -39,6 +39,12 @@ const ESCAPE_EDGE_DWELL: std::time::Duration = std::time::Duration::from_millis(
 /// The measured working read uses nine; ten is the same thing with a frame to spare.
 const OSCAN1_RESET_FRAMES: usize = 10;
 
+/// Escape edges per activation pass, measured off a working two-pin read.
+const ESCAPE_EDGES: usize = 10;
+
+/// How many times the working path repeats the escape and the command group.
+const ACTIVATION_PASSES: usize = 5;
+
 /// `STFMT`, Store Scan Format (SWCU185G Table 6-4).
 const STFMT: u64 = 3;
 
@@ -97,7 +103,17 @@ impl CmsisDap {
         // after the scan that locks the control level, these clock counts. Pairing them gives
         // `STC1` with SEDGE set, then `STFMT` selecting OScan1, then two more commands, the last
         // of which pairs across the group boundary.
-        self.cjtag_scans(&[1, 1, STFMT, OSCAN1, 1, 2, 2])
+        self.cjtag_activate_with_operand(OSCAN1)
+    }
+
+    /// Activate with a chosen `STFMT` operand instead of [`OSCAN1`].
+    ///
+    /// The operand is read off SWCU185G Table 6-4 and has never been confirmed on hardware. The
+    /// target leaves four-pin for our command, which only says some format was selected, not
+    /// which one. A format that is not OScan1 would look exactly like this: the part stops
+    /// answering on four pins and ignores everything we then send as OScan1 frames.
+    pub fn cjtag_activate_with_operand(&mut self, operand: u64) -> Result<(), DebugProbeError> {
+        self.cjtag_scans(&[1, 1, STFMT, operand, 1, 2, 2])
     }
 
     /// Switch the target to four-pin JTAG, the same way `ctag_to_jtag` does.
@@ -276,25 +292,22 @@ impl CmsisDap {
         Ok(())
     }
 
-    /// Replay the measured activation structure exactly: escapes and command groups in the
-    /// counts and order a working two-pin read puts on the wire, and nothing else.
+    /// Replay the measured activation exactly: five repeats of a ten-edge escape followed by the
+    /// eight-scan command group, and nothing else at all.
     ///
-    /// The difference from every other activation here is what is *absent*. A capture of the
-    /// working path shows no chain scan, no instruction shift and no TAP reset before the
-    /// groups: the three one-clock scans that open each group are the whole window. Opening one
-    /// the way `cjtag_open_window` does adds a 256-clock chain scan and two instruction scans
-    /// that the working path never sends.
-    ///
-    /// The structure is escape 10, then escape 34, two groups, escape 34, two groups, escape 7,
-    /// one group. Five groups, three escapes between them.
+    /// Two things here are measured rather than reasoned. The escape is **ten edges**, paced a
+    /// uniform 1.10 us apart; earlier readings of 34 and 68 were an artifact of grouping bursts
+    /// with a millisecond threshold, which merges consecutive escapes into one. And the working
+    /// path sends **no chain scan, no instruction shift and no TAP reset** before the groups, so
+    /// the three one-clock scans that open each group are the entire window. Opening one the way
+    /// `cjtag_open_window` does adds a 256-clock chain scan and two instruction scans that the
+    /// working path never puts on the wire.
     pub fn cjtag_activate_replay(&mut self) -> Result<(), DebugProbeError> {
         tracing::debug!("cJTAG: replaying the measured activation");
 
-        for (edges, groups) in [(10usize, 0), (34, 2), (34, 2), (7, 1)] {
-            self.cjtag_escape_fast(edges)?;
-            for _ in 0..groups {
-                self.cjtag_dr_scans(&[1, 1, 1, STFMT, OSCAN1, 1, 2, 2])?;
-            }
+        for _ in 0..ACTIVATION_PASSES {
+            self.cjtag_escape_fast(ESCAPE_EDGES)?;
+            self.cjtag_dr_scans(&[1, 1, 1, STFMT, OSCAN1, 1, 2, 2])?;
         }
 
         Ok(())
