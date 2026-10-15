@@ -324,10 +324,24 @@ impl CmsisDap {
 
     /// The same replay with `delay_us` of `DAP_Delay` between escape edges.
     pub fn cjtag_activate_replay_paced(&mut self, delay_us: u16) -> Result<(), DebugProbeError> {
+        self.cjtag_activate_replay_with(ACTIVATION_PASSES, ESCAPE_EDGES, delay_us)
+    }
+
+    /// The replay with its pass and escape-edge counts chosen.
+    ///
+    /// Both are measured off the working path, so the defaults are the interesting values. These
+    /// exist because the earlier sweep of them was done with a command window in front, which
+    /// the working path does not send, so the combination was never tried.
+    pub fn cjtag_activate_replay_with(
+        &mut self,
+        passes: usize,
+        edges: usize,
+        delay_us: u16,
+    ) -> Result<(), DebugProbeError> {
         tracing::debug!("cJTAG: replaying the measured activation");
 
-        for _ in 0..ACTIVATION_PASSES {
-            self.cjtag_escape_paced(ESCAPE_EDGES, delay_us)?;
+        for _ in 0..passes {
+            self.cjtag_escape_paced(edges, delay_us)?;
             self.cjtag_dr_scans(&[1, 1, 1, STFMT, OSCAN1, 1, 2, 2])?;
         }
 
