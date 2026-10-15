@@ -324,6 +324,78 @@ impl CmsisDap {
         Ok(tdo)
     }
 
+    /// Send the four-pin switch as OScan1 frames, through a target already in OScan1.
+    ///
+    /// Every failure so far is the target not driving TMSC, and a probe cannot tell that apart
+    /// from a target that never understood the frames in the first place. This separates them,
+    /// because it needs no answer on TMSC at all: if the target receives these frames it leaves
+    /// OScan1 for four-pin, and the ordinary four-pin read afterwards says so.
+    ///
+    /// An answer means the receive path works and only the target's drive-back is missing. A
+    /// silent target means the frames never landed, and nothing about turnaround is implicated.
+    pub fn cjtag_four_pin_over_oscan1(&mut self) -> Result<(), DebugProbeError> {
+        tracing::debug!("cJTAG: four-pin command over OScan1 frames");
+
+        self.cjtag_shift(&command_window_frames(&[1, STC2, APFC_STANDARD_PINS]))?;
+
+        Ok(())
+    }
+
+    /// Drive the same generated frames over four pins, one TCK cycle per frame.
+    ///
+    /// This is the control for [`Self::cjtag_four_pin_over_oscan1`]. A negative there could just
+    /// as easily mean the frames are wrong as that the target is not listening, and the only way
+    /// to tell is to run them where the target is known to listen. Selecting OScan1 this way and
+    /// watching the target go quiet on four pins says the generator builds a real command window.
+    ///
+    /// `select_oscan` picks which command the window carries. Sending the four-pin one instead
+    /// is the positive half of the control: the target has to keep answering, which a generator
+    /// that merely wedged the TAP could not produce.
+    pub fn cjtag_window_frames_four_pin(
+        &mut self,
+        select_oscan: bool,
+    ) -> Result<(), DebugProbeError> {
+        tracing::debug!("cJTAG: command from generated frames, over four pins");
+
+        let frames = if select_oscan {
+            command_window_frames(&[1, 1, STFMT, OSCAN1, 1, 2, 2])
+        } else {
+            command_window_frames(&[1, STC2, APFC_STANDARD_PINS])
+        };
+
+        for chunk in frames.chunks(64) {
+            let mut sequences = Vec::with_capacity(chunk.len());
+            for &(tms, tdi) in chunk {
+                let data = if tdi { TDI_HIGH } else { [0u8; 8] };
+                sequences.push(JtagSequence::new(1, false, tms, data)?);
+            }
+            self.send_jtag_sequences(JtagSequenceRequest::new(sequences)?)?;
+        }
+
+        Ok(())
+    }
+
+    /// Clock `cycles` extra TCKC cycles before the first OScan1 frame, slipping the frame grid.
+    ///
+    /// An OScan1 frame is three cycles and the target counts them from the activation. If it
+    /// starts that count a cycle away from where the host does, every frame it receives is
+    /// misread, it never reaches a state where it answers, and TMSC keeps whatever level the
+    /// host last drove. On a capture that is indistinguishable from a target that is simply not
+    /// driving, so the only way to tell the two apart is to move the grid and look again.
+    ///
+    /// Three cycles return the grid to where it started, so offsets 0, 1 and 2 cover it.
+    ///
+    /// TMSC stays low throughout: five TMS-high clocks put a 1149.7 adapter back in its
+    /// power-up two-pin state, which would undo the activation being tested.
+    pub fn cjtag_pad_clocks(&mut self, cycles: usize) -> Result<(), DebugProbeError> {
+        if cycles == 0 {
+            return Ok(());
+        }
+
+        tracing::debug!("cJTAG: {cycles} padding clocks before the first frame");
+        self.cjtag_drive_swd_bits(&vec![0u8; cycles.div_ceil(8)], cycles)
+    }
+
     /// Bring the target up in OScan1 through the escape-sequence route.
     ///
     /// This is what the working two-pin path does, and it is not the documented command window.
@@ -560,6 +632,59 @@ impl CmsisDap {
             }
         }
     }
+}
+
+/// The whole cJTAG command window as `(tms, tdi)` frames: reset, the inert opcode, the two scans
+/// that raise the control level, then `scans` as data-register scans of those clock counts.
+fn command_window_frames(scans: &[u64]) -> Vec<(bool, bool)> {
+    let mut frames = vec![(true, true); OSCAN1_RESET_FRAMES];
+    frames.push((false, true));
+
+    shift_ir_frames(ICEPICK_BYPASS, &mut frames);
+    for _ in 0..2 {
+        zero_bit_scan_frames(&mut frames);
+    }
+    for clocks in scans.iter().copied() {
+        dr_scan_frames(clocks as usize, &mut frames);
+    }
+
+    frames
+}
+
+/// Frames for one data-register scan of `clocks` clocks in Shift-DR, from Run-Test/Idle and back.
+///
+/// The clock count is the command's value, so the count here is the payload (SWCU185G 6.2.1).
+fn dr_scan_frames(clocks: usize, frames: &mut Vec<(bool, bool)>) {
+    frames.push((true, true));
+    frames.push((false, true));
+    frames.push((false, true));
+    for clock in 0..clocks {
+        frames.push((clock == clocks - 1, true));
+    }
+    frames.push((true, true));
+    frames.push((false, true));
+}
+
+/// Frames for a scan that reaches Update-DR without ever entering Shift-DR, which is what raises
+/// the cJTAG control level. Pause-DR is one way there.
+fn zero_bit_scan_frames(frames: &mut Vec<(bool, bool)>) {
+    for tms in [true, false, true, false, true, true, false] {
+        frames.push((tms, true));
+    }
+}
+
+/// Frames that shift `instruction` into the instruction register, from Run-Test/Idle and back.
+fn shift_ir_frames(instruction: u32, frames: &mut Vec<(bool, bool)>) {
+    frames.push((true, true));
+    frames.push((true, true));
+    frames.push((false, true));
+    frames.push((false, true));
+    for bit in 0..ICEPICK_IR_LEN {
+        let value = instruction >> bit & 1 == 1;
+        frames.push((bit == ICEPICK_IR_LEN - 1, value));
+    }
+    frames.push((true, true));
+    frames.push((false, true));
 }
 
 /// Turn `(tms, tdi)` pairs into the sequences one OScan1 frame each takes.
