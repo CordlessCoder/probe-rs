@@ -39,6 +39,9 @@ const ESCAPE_EDGE_DWELL: std::time::Duration = std::time::Duration::from_millis(
 /// The measured working read uses nine; ten is the same thing with a frame to spare.
 const OSCAN1_RESET_FRAMES: usize = 10;
 
+/// Clocks of TMSC-high the working path puts between activation passes.
+const INTER_PASS_CLOCKS: usize = 354;
+
 /// Escape edges per activation pass, measured off a working two-pin read.
 const ESCAPE_EDGES: usize = 10;
 
@@ -315,10 +318,13 @@ impl CmsisDap {
 
     /// Activate and attempt the read once per pass, the way the working path does.
     ///
-    /// Between its command groups a working two-pin activation puts 472 clocks on the wire whose
-    /// TMSC carries long stretches of a repeating three-cycle pattern. That is OScan1 framing, so
-    /// the five passes are not a ritual repeat of the command: each one selects the format and
-    /// then tries to use it, and goes round again if it did not take.
+    /// Between its command groups a working two-pin activation puts 472 clocks on the wire that
+    /// never enter Shift-DR, so a scan decoder shows nothing there. Most of them hold TMSC high,
+    /// which is TAP-reset and idle clocking rather than data. `INTER_PASS_CLOCKS` reproduces the
+    /// dominant part of it.
+    ///
+    /// The passes are therefore not a ritual repeat of one command: each selects the format, and
+    /// the traffic between them resets the TAP before the next tries again.
     ///
     /// Returns what each pass read, so a caller can see whether any of them answered.
     pub fn cjtag_activate_and_read_retrying(&mut self) -> Result<Vec<BitVec>, DebugProbeError> {
@@ -332,9 +338,27 @@ impl CmsisDap {
             self.cjtag_reconnect_as_swd()?;
             reads.push(self.cjtag_read_idcode()?);
             self.cjtag_reconnect_as_jtag()?;
+
+            self.cjtag_emit_tms_run_long(INTER_PASS_CLOCKS)?;
         }
 
         Ok(reads)
+    }
+
+    /// Clock `count` cycles with TMS held high, across as many sequences as it takes.
+    ///
+    /// `cjtag_emit_tms_run` takes a `u8` and one sequence caps at 64 clocks, which is far short
+    /// of what the working path puts between its activation passes.
+    pub fn cjtag_emit_tms_run_long(&mut self, count: usize) -> Result<(), DebugProbeError> {
+        let mut left = count;
+        while left > 0 {
+            let now = left.min(64);
+            let sequences = vec![JtagSequence::new(now as u8, false, true, TDI_HIGH)?];
+            self.send_jtag_sequences(JtagSequenceRequest::new(sequences)?)?;
+            left -= now;
+        }
+
+        Ok(())
     }
 
     /// Reconnect the probe in SWD mode, keeping the target where it is.
