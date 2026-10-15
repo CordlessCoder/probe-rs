@@ -313,6 +313,30 @@ impl CmsisDap {
         Ok(())
     }
 
+    /// Activate and attempt the read once per pass, the way the working path does.
+    ///
+    /// Between its command groups a working two-pin activation puts 472 clocks on the wire whose
+    /// TMSC carries long stretches of a repeating three-cycle pattern. That is OScan1 framing, so
+    /// the five passes are not a ritual repeat of the command: each one selects the format and
+    /// then tries to use it, and goes round again if it did not take.
+    ///
+    /// Returns what each pass read, so a caller can see whether any of them answered.
+    pub fn cjtag_activate_and_read_retrying(&mut self) -> Result<Vec<BitVec>, DebugProbeError> {
+        let mut reads = Vec::with_capacity(ACTIVATION_PASSES);
+
+        for pass in 0..ACTIVATION_PASSES {
+            tracing::debug!("cJTAG: activation pass {pass}");
+            self.cjtag_escape_fast(ESCAPE_EDGES)?;
+            self.cjtag_dr_scans(&[1, 1, 1, STFMT, OSCAN1, 1, 2, 2])?;
+
+            self.cjtag_reconnect_as_swd()?;
+            reads.push(self.cjtag_read_idcode()?);
+            self.cjtag_reconnect_as_jtag()?;
+        }
+
+        Ok(reads)
+    }
+
     /// Reconnect the probe in SWD mode, keeping the target where it is.
     ///
     /// The command window rides on JTAG operations, and the OScan1 read needs the probe able to
@@ -674,10 +698,12 @@ pub fn oscan1_idcode_frames() -> Vec<(bool, bool)> {
     //
     // A frame is nTDI, TMS, then the released cycle. With TMS high for a TAP reset and TDI low,
     // nTDI is high and the released cycle floats high, so all three cycles are high and ten
-    // reset frames hold TMSC high for thirty-one clocks. That is the run a 1149.7 adapter
-    // watches for, and it returns the part to its power-up two-pin state, undoing the
-    // activation before the read has shifted anything. A working read never holds TMSC high
-    // for more than five clocks and drives TDI during the reset frames to achieve it.
+    // reset frames hold TMSC high for thirty-one clocks. A working read holds it high for at
+    // most five, and drives TDI through its reset frames to do so.
+    //
+    // Matching that is the whole justification. It is tempting to say the long run is what
+    // returns a 1149.7 adapter to its power-up state, but the same working capture has
+    // 354-clock high runs elsewhere, so that cannot be the rule as stated.
     let mut frames = vec![(true, true); OSCAN1_RESET_FRAMES];
 
     // Run-Test/Idle, then Select-DR, Capture-DR, Shift-DR.
