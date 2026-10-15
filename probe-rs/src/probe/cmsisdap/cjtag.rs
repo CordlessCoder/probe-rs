@@ -116,7 +116,20 @@ impl CmsisDap {
     /// which one. A format that is not OScan1 would look exactly like this: the part stops
     /// answering on four pins and ignores everything we then send as OScan1 frames.
     pub fn cjtag_activate_with_operand(&mut self, operand: u64) -> Result<(), DebugProbeError> {
-        self.cjtag_scans(&[1, 1, STFMT, operand, 1, 2, 2])
+        self.cjtag_activate_with_command(STFMT, operand)
+    }
+
+    /// Activate with a chosen opcode as well as operand.
+    ///
+    /// Both halves come from the same table reading. The pair is carried by the clock counts of
+    /// two consecutive scans, so an off-by-one in where the pairing starts would make our opcode
+    /// an operand and our operand the next opcode, and the sweep of one alone would never find it.
+    pub fn cjtag_activate_with_command(
+        &mut self,
+        opcode: u64,
+        operand: u64,
+    ) -> Result<(), DebugProbeError> {
+        self.cjtag_scans(&[1, 1, opcode, operand, 1, 2, 2])
     }
 
     /// Switch the target to four-pin JTAG, the same way `ctag_to_jtag` does.
