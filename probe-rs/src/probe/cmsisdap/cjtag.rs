@@ -336,7 +336,9 @@ impl CmsisDap {
     pub fn cjtag_four_pin_over_oscan1(&mut self) -> Result<(), DebugProbeError> {
         tracing::debug!("cJTAG: four-pin command over OScan1 frames");
 
-        self.cjtag_shift(&command_window_frames(&[1, STC2, APFC_STANDARD_PINS]))?;
+        for group in command_window_scans(&[STC2, APFC_STANDARD_PINS]) {
+            self.cjtag_shift(&group)?;
+        }
 
         Ok(())
     }
@@ -357,19 +359,21 @@ impl CmsisDap {
     ) -> Result<(), DebugProbeError> {
         tracing::debug!("cJTAG: command from generated frames, over four pins");
 
-        let frames = if select_oscan {
-            command_window_frames(&[1, 1, STFMT, OSCAN1, 1, 2, 2])
+        let groups = if select_oscan {
+            command_window_scans(&[1, 1, STFMT, OSCAN1, 1, 2, 2])
         } else {
-            command_window_frames(&[1, STC2, APFC_STANDARD_PINS])
+            command_window_scans(&[STC2, APFC_STANDARD_PINS])
         };
 
-        for chunk in frames.chunks(64) {
-            let mut sequences = Vec::with_capacity(chunk.len());
-            for &(tms, tdi) in chunk {
-                let data = if tdi { TDI_HIGH } else { [0u8; 8] };
-                sequences.push(JtagSequence::new(1, false, tms, data)?);
+        for group in groups {
+            for chunk in group.chunks(64) {
+                let mut sequences = Vec::with_capacity(chunk.len());
+                for &(tms, tdi) in chunk {
+                    let data = if tdi { TDI_HIGH } else { [0u8; 8] };
+                    sequences.push(JtagSequence::new(1, false, tms, data)?);
+                }
+                self.send_jtag_sequences(JtagSequenceRequest::new(sequences)?)?;
             }
-            self.send_jtag_sequences(JtagSequenceRequest::new(sequences)?)?;
         }
 
         Ok(())
@@ -634,21 +638,34 @@ impl CmsisDap {
     }
 }
 
-/// The whole cJTAG command window as `(tms, tdi)` frames: reset, the inert opcode, the two scans
-/// that raise the control level, then `scans` as data-register scans of those clock counts.
-fn command_window_frames(scans: &[u64]) -> Vec<(bool, bool)> {
-    let mut frames = vec![(true, true); OSCAN1_RESET_FRAMES];
-    frames.push((false, true));
+/// The cJTAG command window as one frame list per request: the reset and inert opcode, the two
+/// scans that raise the control level, then `scans` as data-register scans of those clock counts.
+///
+/// Split rather than concatenated because the working path sends each scan as its own request and
+/// lands them 100 us and more apart, where one batch puts them 10 us apart. A window driven from
+/// one batch does not take, which is the likeliest reading of an earlier bench result where a
+/// hand-rolled pattern was byte-identical on the wire and still did nothing.
+///
+/// The leading scan is prepended here for the same reason `cjtag_scans` prepends it: the command
+/// pairs start one scan after the level locks.
+fn command_window_scans(scans: &[u64]) -> Vec<Vec<(bool, bool)>> {
+    let mut opening = vec![(true, true); OSCAN1_RESET_FRAMES];
+    opening.push((false, true));
+    shift_ir_frames(ICEPICK_BYPASS, &mut opening);
 
-    shift_ir_frames(ICEPICK_BYPASS, &mut frames);
+    let mut groups = vec![opening];
     for _ in 0..2 {
-        zero_bit_scan_frames(&mut frames);
+        let mut group = Vec::new();
+        zero_bit_scan_frames(&mut group);
+        groups.push(group);
     }
-    for clocks in scans.iter().copied() {
-        dr_scan_frames(clocks as usize, &mut frames);
+    for clocks in std::iter::once(1).chain(scans.iter().copied()) {
+        let mut group = Vec::new();
+        dr_scan_frames(clocks as usize, &mut group);
+        groups.push(group);
     }
 
-    frames
+    groups
 }
 
 /// Frames for one data-register scan of `clocks` clocks in Shift-DR, from Run-Test/Idle and back.
