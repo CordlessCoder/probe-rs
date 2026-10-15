@@ -306,10 +306,15 @@ impl CmsisDap {
     /// `cjtag_open_window` does adds a 256-clock chain scan and two instruction scans that the
     /// working path never puts on the wire.
     pub fn cjtag_activate_replay(&mut self) -> Result<(), DebugProbeError> {
+        self.cjtag_activate_replay_paced(0)
+    }
+
+    /// The same replay with `delay_us` of `DAP_Delay` between escape edges.
+    pub fn cjtag_activate_replay_paced(&mut self, delay_us: u16) -> Result<(), DebugProbeError> {
         tracing::debug!("cJTAG: replaying the measured activation");
 
         for _ in 0..ACTIVATION_PASSES {
-            self.cjtag_escape_fast(ESCAPE_EDGES)?;
+            self.cjtag_escape_paced(ESCAPE_EDGES, delay_us)?;
             self.cjtag_dr_scans(&[1, 1, 1, STFMT, OSCAN1, 1, 2, 2])?;
         }
 
@@ -523,6 +528,19 @@ impl CmsisDap {
     /// The working two-pin path places them about 1.1 us apart, and that is only reachable by
     /// handing the probe several writes at once.
     pub fn cjtag_escape_fast(&mut self, edges: usize) -> Result<(), DebugProbeError> {
+        self.cjtag_escape_paced(edges, 0)
+    }
+
+    /// The same escape with `delay_us` of `DAP_Delay` between edges.
+    ///
+    /// Batched writes land 0.86 us apart; a working two-pin path paces its edges a uniform
+    /// 1.10 us. The gap is small and the delay only resolves to whole microseconds, so this
+    /// cannot reproduce 1.10 exactly — it exists to find out whether the target cares at all.
+    pub fn cjtag_escape_paced(
+        &mut self,
+        edges: usize,
+        delay_us: u16,
+    ) -> Result<(), DebugProbeError> {
         let mut writes = Vec::with_capacity(edges + 3);
 
         let mut clock = Pins(0);
@@ -540,7 +558,7 @@ impl CmsisDap {
             writes.push((level, data));
         }
 
-        self.send_pin_burst(PinBurstRequest::new(writes)?)?;
+        self.send_pin_burst(PinBurstRequest::paced(writes, delay_us)?)?;
 
         Ok(())
     }
@@ -718,30 +736,33 @@ impl CmsisDap {
 /// not an answer. That is the single most misread result on this path, and eyeballing it has gone
 /// wrong three times.
 pub fn oscan1_idcode_frames() -> Vec<(bool, bool)> {
-    // TDI high, which puts nTDI low and breaks the run of high cycles on TMSC.
+    // Transcribed frame for frame from a working two-pin read, TMS and TDI both.
     //
-    // A frame is nTDI, TMS, then the released cycle. With TMS high for a TAP reset and TDI low,
-    // nTDI is high and the released cycle floats high, so all three cycles are high and ten
-    // reset frames hold TMSC high for thirty-one clocks. A working read holds it high for at
-    // most five, and drives TDI through its reset frames to do so.
+    //   TMS  11111 0 110110 100 0x32
+    //   TDI  10011 1 000000 000 1x32
     //
-    // Matching that is the whole justification. It is tempting to say the long run is what
-    // returns a 1149.7 adapter to its power-up state, but the same working capture has
-    // 354-clock high runs elsewhere, so that cannot be the rule as stated.
-    let mut frames = vec![(true, true); OSCAN1_RESET_FRAMES];
+    // Five frames to Test-Logic-Reset, one to Run-Test/Idle, a zero-bit instruction scan, then
+    // Select-DR, Capture-DR, Shift-DR and the register. The instruction scan is not decoration:
+    // it passes through Capture-IR and Update-IR, which writes the captured pattern back, and a
+    // working read does it where ours went straight to the data register.
+    //
+    // TDI matters even though a data-register read ignores it. A frame is nTDI, TMS, then the
+    // released cycle, so TDI is what keeps TMSC from sitting high across all three. Ours drove
+    // it low through the shift; the working read drives it high.
+    const TMS: [bool; 47] = [
+        true, true, true, true, true, false, true, true, false, true, true, false, true, false,
+        false, false, false, false, false, false, false, false, false, false, false, false, false,
+        false, false, false, false, false, false, false, false, false, false, false, false, false,
+        false, false, false, false, false, false, false,
+    ];
+    const TDI: [bool; 47] = [
+        true, false, false, true, true, true, false, false, false, false, false, false, false,
+        false, false, true, true, true, true, true, true, true, true, true, true, true, true, true,
+        true, true, true, true, true, true, true, true, true, true, true, true, true, true, true,
+        true, true, true, true,
+    ];
 
-    // Run-Test/Idle, then Select-DR, Capture-DR, Shift-DR.
-    frames.extend([
-        (false, false),
-        (true, false),
-        (false, false),
-        (false, false),
-    ]);
-
-    // The register itself, with TMS low so the TAP stays in Shift-DR.
-    frames.extend(std::iter::repeat_n((false, false), 32));
-
-    frames
+    TMS.iter().copied().zip(TDI.iter().copied()).collect()
 }
 
 /// The cJTAG command window as one frame list per request: the reset and inert opcode, the two
