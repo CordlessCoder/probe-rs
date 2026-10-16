@@ -34,11 +34,11 @@ pub(crate) fn cmsis_handles_wait(wait_retry: u16) -> bool {
 /// fewer packets than `DAP_Transfer`.
 const MIN_BLOCK_TRANSFERS: usize = 2;
 
-/// How many `DAP_TransferBlock` requests may be outstanding at once.
+/// How many transfer requests may be outstanding at once.
 ///
 /// Overlapping a request with the previous reply hides one round trip each time. Past a handful
 /// the wait is already covered and a deeper queue only holds more requests in memory.
-const MAX_PIPELINED_BLOCKS: usize = 8;
+const MAX_IN_FLIGHT: usize = 8;
 
 /// Return how many words one `DAP_TransferBlock` packet holds.
 pub(crate) fn block_words_per_packet(packet_size: u16) -> usize {
@@ -208,6 +208,51 @@ impl PendingBatch {
     }
 }
 
+/// A transfer request the probe has been sent, and what its reply maps back to.
+enum Sent<'ops> {
+    /// A `DAP_Transfer` packet.
+    Transfers(PendingBatch),
+    /// One `DAP_TransferBlock` packet of a repeated access.
+    Block {
+        request: TransferBlockRequest,
+        chunk: &'ops [(HandleId, SwdOp)],
+        chunk_start: usize,
+        direction: Direction,
+    },
+}
+
+impl Sent<'_> {
+    /// The batch index of the first operation the request carries.
+    fn first_operation(&self) -> usize {
+        match self {
+            Sent::Transfers(packet) => packet.transfers[0].batch_index,
+            Sent::Block { chunk_start, .. } => *chunk_start,
+        }
+    }
+}
+
+/// Transfer requests sent ahead of their replies, which come back in the order they were sent.
+///
+/// Sending the next request before reading the previous reply hides one round trip per overlap,
+/// across the whole batch: the address write that opens an auto-increment window queues behind
+/// the blocks of the window before it. ADIv5 §B4.2.4 describes this as the intended use: "A
+/// debugger might stream a block of data and then check the CTRL/STAT register at the end of the
+/// block."
+///
+/// A request already on the wire when an earlier one faults cannot reach the target. Once a
+/// sticky flag is set the DP answers FAULT to every access except reads of DPIDR and CTRL/STAT and
+/// writes to ABORT, so the tail is refused rather than performed, and the first failure in batch
+/// order is the one reported.
+struct Pipeline<'ops> {
+    in_flight: VecDeque<Sent<'ops>>,
+    depth: usize,
+    results: Results,
+    failure: Option<(BatchError<DebugProbeError>, usize)>,
+    /// Cleared by a failed reply. Whatever ran after it is not the caller's to see; whatever ran
+    /// before it would have run without the pipeline too.
+    capture: bool,
+}
+
 impl CmsisDap {
     fn swd_register(port: Port, addr: u8) -> RegisterAddress {
         match port {
@@ -279,53 +324,146 @@ impl CmsisDap {
         Ok(())
     }
 
-    fn flush_pending_transfers(
-        &mut self,
-        pending: &PendingBatch,
-        mut results: Results,
-    ) -> Result<Results, BatchExecutionError<DebugProbeError>> {
-        if pending.is_empty() {
-            return Ok(results);
+    fn pipeline(&self) -> Pipeline<'static> {
+        // Leave one packet buffer free. A probe with all buffers full does not take
+        // `DAP_TransferAbort` before the current transfer ends.
+        let depth = (self.packet_count as usize)
+            .saturating_sub(1)
+            .clamp(1, MAX_IN_FLIGHT);
+        Pipeline {
+            in_flight: VecDeque::with_capacity(depth),
+            depth,
+            results: Results::new(),
+            failure: None,
+            capture: true,
+        }
+    }
+
+    /// Send `sent` once the pipeline has room for it. Nothing is sent after a failure.
+    fn pipeline_send<'ops>(&mut self, pipeline: &mut Pipeline<'ops>, sent: Sent<'ops>) {
+        while pipeline.failure.is_none() && pipeline.in_flight.len() >= pipeline.depth {
+            self.pipeline_receive(pipeline);
+        }
+        if pipeline.failure.is_some() {
+            return;
         }
 
-        let transfers = &pending.transfers;
-        let response = match commands::send_command(&mut self.device, &pending.request) {
-            Ok(response) => response,
+        let result = match &sent {
+            Sent::Transfers(packet) => commands::send_request(&mut self.device, &packet.request),
+            Sent::Block { request, .. } => commands::send_request(&mut self.device, request),
+        };
+        match result {
+            Ok(()) => pipeline.in_flight.push_back(sent),
             Err(error) => {
-                let fault_operation = transfers[0].batch_index;
-                return Err(BatchExecutionError::new_from_debug_probe_at(
-                    DebugProbeError::from(error),
-                    results,
-                    fault_operation,
+                pipeline.failure = Some((
+                    BatchError::Probe(DebugProbeError::from(error)),
+                    sent.first_operation(),
                 ));
             }
+        }
+    }
+
+    /// Take the oldest outstanding reply.
+    fn pipeline_receive(&mut self, pipeline: &mut Pipeline<'_>) {
+        let Some(sent) = pipeline.in_flight.pop_front() else {
+            return;
         };
 
-        if let Err((error, fault_operation)) =
-            Self::classify_transfer_response(&response, transfers)
-        {
-            self.recover_from_block_error(&error);
-            return Err(BatchExecutionError {
-                error,
-                results,
-                fault_operation,
-            });
-        }
+        let outcome = match &sent {
+            Sent::Transfers(packet) => {
+                commands::receive_response(&mut self.device, &packet.request).map(|response| {
+                    Self::classify_transfer_response(&response, &packet.transfers)?;
+                    if pipeline.capture {
+                        Self::capture_transfers(&mut pipeline.results, packet, &response)?;
+                    }
+                    Ok(())
+                })
+            }
+            Sent::Block {
+                request,
+                chunk,
+                chunk_start,
+                direction,
+            } => commands::receive_response(&mut self.device, request).map(|response| {
+                Self::classify_block_response(&response, chunk.len(), *chunk_start)?;
+                if pipeline.capture && *direction == Direction::Read {
+                    for ((id, _), value) in chunk.iter().zip(response.transfer_data.iter()) {
+                        if id.should_capture() {
+                            pipeline.results.push(id, CommandResult::U32(*value));
+                        }
+                    }
+                }
+                Ok(())
+            }),
+        };
 
-        for (transfer, response_transfer) in transfers.iter().zip(response.transfers.iter()) {
+        match outcome {
+            Err(error) => {
+                // A late reply arrives ahead of the replies still in flight, so reading on would
+                // give each request the reply of the one before it.
+                if commands::may_be_out_of_step(&error) || !pipeline.in_flight.is_empty() {
+                    self.device.resynchronise();
+                } else {
+                    self.device.drain();
+                }
+                pipeline.in_flight.clear();
+                pipeline.failure.get_or_insert((
+                    BatchError::Probe(DebugProbeError::from(error)),
+                    sent.first_operation(),
+                ));
+                pipeline.capture = false;
+            }
+            Ok(Err(problem)) => {
+                pipeline.failure.get_or_insert(problem);
+                pipeline.capture = false;
+            }
+            Ok(Ok(())) => {}
+        }
+    }
+
+    /// Record the words a `DAP_Transfer` read.
+    fn capture_transfers(
+        results: &mut Results,
+        packet: &PendingBatch,
+        response: &TransferResponse,
+    ) -> Result<(), (BatchError<DebugProbeError>, usize)> {
+        for (transfer, response_transfer) in packet.transfers.iter().zip(response.transfers.iter())
+        {
             if transfer.direction != Direction::Read || !transfer.id.should_capture() {
                 continue;
             }
             let Some(data) = response_transfer.data else {
-                return Err(BatchExecutionError::new_from_debug_probe_at(
-                    DebugProbeError::Other("CMSIS-DAP read did not return any data".to_string()),
-                    results,
+                return Err((
+                    BatchError::Probe(DebugProbeError::Other(
+                        "CMSIS-DAP read did not return any data".to_string(),
+                    )),
                     transfer.batch_index,
                 ));
             };
             results.push(&transfer.id, CommandResult::U32(data));
         }
-        Ok(results)
+        Ok(())
+    }
+
+    /// Take every outstanding reply, and put the port back in order if any of them failed.
+    fn pipeline_flush(
+        &mut self,
+        pipeline: &mut Pipeline<'_>,
+    ) -> Result<(), BatchExecutionError<DebugProbeError>> {
+        while !pipeline.in_flight.is_empty() {
+            self.pipeline_receive(pipeline);
+        }
+        match pipeline.failure.take() {
+            Some((error, fault_operation)) => {
+                self.recover_from_block_error(&error);
+                Err(BatchExecutionError {
+                    error,
+                    results: std::mem::replace(&mut pipeline.results, Results::new()),
+                    fault_operation,
+                })
+            }
+            None => Ok(()),
+        }
     }
 
     fn max_words_per_block_packet(&self) -> usize {
@@ -401,22 +539,13 @@ impl CmsisDap {
         }
     }
 
-    /// Send a repeated access as `DAP_TransferBlock` packets, several at a time.
-    ///
-    /// Sending the next request before reading the previous reply hides one round trip per
-    /// overlap. ADIv5 §B4.2.4 describes this as the intended use: "A debugger might stream a block
-    /// of data and then check the CTRL/STAT register at the end of the block."
-    ///
-    /// A request already on the wire when an earlier one faults cannot reach the target. Once a
-    /// sticky flag is set the DP answers FAULT to every access except reads of DPIDR and
-    /// CTRL/STAT and writes to ABORT, so the tail is refused rather than performed, and the first
-    /// failure in batch order is the one reported.
-    fn run_transfer_block(
+    /// Queue a repeated access as `DAP_TransferBlock` packets.
+    fn send_block_run<'ops>(
         &mut self,
-        run: &[(HandleId, SwdOp)],
+        pipeline: &mut Pipeline<'ops>,
+        run: &'ops [(HandleId, SwdOp)],
         run_start: usize,
-        mut results: Results,
-    ) -> Result<Results, BatchExecutionError<DebugProbeError>> {
+    ) {
         let SwdOp::Transfer {
             port,
             addr,
@@ -424,98 +553,31 @@ impl CmsisDap {
             ..
         } = run[0].1
         else {
-            return Ok(results);
+            return;
         };
         let address = Self::swd_register(port, addr);
         let words_per_packet = self.max_words_per_block_packet();
-        // Leave one packet buffer free. A probe with all buffers full does not take
-        // `DAP_TransferAbort` before the current transfer ends.
-        let depth = (self.packet_count as usize)
-            .saturating_sub(1)
-            .clamp(1, MAX_PIPELINED_BLOCKS);
 
-        let mut chunks = run.chunks(words_per_packet).enumerate();
-        let mut in_flight = VecDeque::with_capacity(depth);
-        let mut failure: Option<(BatchError<DebugProbeError>, usize)> = None;
-        // A chunk that failed ends the run, so nothing after it is the caller's to see. A chunk
-        // that was never sent does not: whatever is already in flight ran before the failure and
-        // would have run without the pipeline too.
-        let mut capture = true;
-
-        loop {
-            while failure.is_none() && in_flight.len() < depth {
-                let Some((chunk_index, chunk)) = chunks.next() else {
-                    break;
-                };
-                let chunk_start = run_start + chunk_index * words_per_packet;
-
-                let mut request = match direction {
-                    Direction::Read => {
-                        TransferBlockRequest::read_request(address, chunk.len() as u16)
-                    }
-                    Direction::Write => TransferBlockRequest::write_request(
-                        address,
-                        chunk.iter().map(|(_, op)| transfer_data(op)).collect(),
-                    ),
-                };
-                request.dap_index = self.jtag_state.chain_params.index as u8;
-
-                if let Err(error) = commands::send_request(&mut self.device, &request) {
-                    failure = Some((BatchError::Probe(DebugProbeError::from(error)), chunk_start));
-                    break;
-                }
-
-                in_flight.push_back((chunk_start, chunk, request));
+        for (chunk_index, chunk) in run.chunks(words_per_packet).enumerate() {
+            if pipeline.failure.is_some() {
+                return;
             }
-
-            let Some((chunk_start, chunk, request)) = in_flight.pop_front() else {
-                break;
+            let mut request = match direction {
+                Direction::Read => TransferBlockRequest::read_request(address, chunk.len() as u16),
+                Direction::Write => TransferBlockRequest::write_request(
+                    address,
+                    chunk.iter().map(|(_, op)| transfer_data(op)).collect(),
+                ),
             };
+            request.dap_index = self.jtag_state.chain_params.index as u8;
 
-            let response = match commands::receive_response(&mut self.device, &request) {
-                Ok(response) => response,
-                Err(error) => {
-                    // A late reply arrives ahead of the replies still in flight, so reading on
-                    // would give each request the reply of the one before it.
-                    if commands::may_be_out_of_step(&error) || !in_flight.is_empty() {
-                        self.device.resynchronise();
-                    }
-                    failure.get_or_insert((
-                        BatchError::Probe(DebugProbeError::from(error)),
-                        chunk_start,
-                    ));
-                    break;
-                }
+            let sent = Sent::Block {
+                request,
+                chunk,
+                chunk_start: run_start + chunk_index * words_per_packet,
+                direction,
             };
-
-            match Self::classify_block_response(&response, chunk.len(), chunk_start) {
-                Err(problem) => {
-                    failure.get_or_insert(problem);
-                    capture = false;
-                }
-                Ok(()) if !capture => {}
-                Ok(()) => {
-                    if direction == Direction::Read {
-                        for ((id, _), value) in chunk.iter().zip(response.transfer_data.iter()) {
-                            if id.should_capture() {
-                                results.push(id, CommandResult::U32(*value));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        match failure {
-            Some((error, fault_operation)) => {
-                self.recover_from_block_error(&error);
-                Err(BatchExecutionError {
-                    error,
-                    results,
-                    fault_operation,
-                })
-            }
-            None => Ok(results),
+            self.pipeline_send(pipeline, sent);
         }
     }
 
@@ -581,15 +643,15 @@ impl SwdProbe for CmsisDap {
         &mut self,
         batch: &SwdBatch,
     ) -> Result<Results, BatchExecutionError<DebugProbeError>> {
-        let mut results = Results::new();
         let ops: Vec<(HandleId, SwdOp)> = batch
             .iter()
             .map(|(id, op)| (id.clone(), op.clone()))
             .collect();
         let dap_index = self.jtag_state.chain_params.index as u8;
+        let mut pipeline = self.pipeline();
 
         let mut batch_index = 0;
-        while batch_index < ops.len() {
+        while batch_index < ops.len() && pipeline.failure.is_none() {
             let packets = split_into_packets(
                 &ops[batch_index..],
                 batch_index,
@@ -597,9 +659,8 @@ impl SwdProbe for CmsisDap {
                 self.packet_size,
             );
             for packet in packets {
-                let packed = packet.transfers.len();
-                results = self.flush_pending_transfers(&packet, results)?;
-                batch_index += packed;
+                batch_index += packet.transfers.len();
+                self.pipeline_send(&mut pipeline, Sent::Transfers(packet));
             }
 
             // Whatever ended the run is handled on its own, and cannot share a packet.
@@ -607,22 +668,28 @@ impl SwdProbe for CmsisDap {
                 break;
             };
 
+            if let SwdOp::Transfer { .. } = op {
+                let run = run_length(&ops, batch_index);
+                self.send_block_run(
+                    &mut pipeline,
+                    &ops[batch_index..batch_index + run],
+                    batch_index,
+                );
+                batch_index += run;
+                continue;
+            }
+
+            // Not a transfer request, so it does not queue behind them: it runs once everything
+            // before it has answered.
+            self.pipeline_flush(&mut pipeline)?;
+            let results = &mut pipeline.results;
             match op {
-                SwdOp::Transfer { .. } => {
-                    let run = run_length(&ops, batch_index);
-                    results = self.run_transfer_block(
-                        &ops[batch_index..batch_index + run],
-                        batch_index,
-                        results,
-                    )?;
-                    batch_index += run;
-                    continue;
-                }
+                SwdOp::Transfer { .. } => unreachable!("sent above"),
                 SwdOp::Sequence(bits) => {
                     if let Err(error) = self.run_swj_sequence_op(bits) {
                         return Err(BatchExecutionError::new_from_debug_probe_at(
                             error,
-                            results,
+                            std::mem::replace(results, Results::new()),
                             batch_index,
                         ));
                     }
@@ -631,7 +698,7 @@ impl SwdProbe for CmsisDap {
                     if let Err(error) = self.run_swj_idle(*cycles) {
                         return Err(BatchExecutionError::new_from_debug_probe_at(
                             error,
-                            results,
+                            std::mem::replace(results, Results::new()),
                             batch_index,
                         ));
                     }
@@ -646,7 +713,7 @@ impl SwdProbe for CmsisDap {
                         Err(error) => {
                             return Err(BatchExecutionError::new_from_debug_probe_at(
                                 error,
-                                results,
+                                std::mem::replace(results, Results::new()),
                                 batch_index,
                             ));
                         }
@@ -657,7 +724,8 @@ impl SwdProbe for CmsisDap {
             batch_index += 1;
         }
 
-        Ok(results)
+        self.pipeline_flush(&mut pipeline)?;
+        Ok(pipeline.results)
     }
 
     fn handles_wait(&self) -> bool {
@@ -719,12 +787,8 @@ mod tests {
 
         let mut batch = SwdBatch::new();
         let reads: Vec<_> = (0..30).map(|_| batch.read(Port::Ap, 0xC)).collect();
-        let ops: Vec<_> = batch
-            .iter()
-            .map(|(id, op)| (id.clone(), op.clone()))
-            .collect();
 
-        let error = dap.run_transfer_block(&ops, 0, Results::new()).unwrap_err();
+        let error = dap.run_batch(&batch).unwrap_err();
         let words_per_packet = dap.max_words_per_block_packet();
         assert_eq!(error.fault_operation, words_per_packet);
         let mut results = error.results;
@@ -738,6 +802,169 @@ mod tests {
 
         let packet_count = commands::send_command(&mut dap.device, &PacketCountCommand {});
         assert_eq!(packet_count.unwrap(), 4);
+    }
+
+    /// A probe whose memory reads count up from zero, one count per DRW read in batch order, and
+    /// which answers FAULT to the DRW read numbered `fault_at`.
+    fn counting_probe(
+        packet_count: u8,
+        fault_at: Option<u32>,
+    ) -> std::sync::Arc<std::sync::Mutex<crate::probe::cmsisdap::commands::fake::FakeProbe>> {
+        use crate::probe::cmsisdap::commands::{
+            CommandId,
+            fake::{FakeProbe, Reply, standard_reply},
+        };
+
+        const DRW_READ: u8 = 0x0F;
+        let mut next = 0u32;
+        let mut read = move |reply: &mut Vec<u8>| -> bool {
+            if fault_at == Some(next) {
+                return false;
+            }
+            reply.extend(next.to_le_bytes());
+            next += 1;
+            true
+        };
+        FakeProbe::shared(64, move |command| {
+            if command[0] == CommandId::Transfer as u8 {
+                let count = command[2];
+                let mut reply = vec![command[0], 0, Ack::Ok as u8];
+                let mut at = 3;
+                for _ in 0..count {
+                    let request = command[at];
+                    at += 1;
+                    if request & 0x02 == 0 {
+                        at += 4;
+                    } else if request == DRW_READ && !read(&mut reply) {
+                        reply[2] = Ack::Fault as u8;
+                        break;
+                    } else if request != DRW_READ {
+                        reply.extend(0u32.to_le_bytes());
+                    }
+                    reply[1] += 1;
+                }
+                return Reply::Now(reply);
+            }
+            if command[0] == CommandId::TransferBlock as u8 {
+                let count = u16::from_le_bytes([command[2], command[3]]);
+                let mut reply = vec![command[0], 0, 0, Ack::Ok as u8];
+                let mut done = 0u16;
+                for _ in 0..count {
+                    if command[4] == DRW_READ && !read(&mut reply) {
+                        reply[3] = Ack::Fault as u8;
+                        break;
+                    }
+                    done += 1;
+                }
+                reply[1..3].copy_from_slice(&done.to_le_bytes());
+                return Reply::Now(reply);
+            }
+            standard_reply(command, 64, packet_count)
+        })
+    }
+
+    /// Two auto-increment windows: an address write and `reads` DRW reads each.
+    fn two_windows(batch: &mut SwdBatch, reads: usize) -> Vec<crate::probe::Handle<u32>> {
+        let mut handles = Vec::new();
+        for window in 0..2u32 {
+            batch.write(Port::Ap, 0x4, 0x2000_0000 + window * 0x400);
+            handles.extend((0..reads).map(|_| batch.read(Port::Ap, 0xC)));
+        }
+        handles
+    }
+
+    #[test]
+    fn the_next_window_address_queues_behind_the_blocks_before_it() {
+        use crate::probe::cmsisdap::commands::{CmsisDapDevice, CommandId};
+
+        let probe = counting_probe(4, None);
+        let mut dap = CmsisDap::new_from_device(CmsisDapDevice::Fake(probe.clone())).unwrap();
+        let opened = probe.lock().unwrap().sent.len();
+
+        let mut batch = SwdBatch::new();
+        let reads = two_windows(&mut batch, 30);
+        let mut results = dap.run_batch(&batch).unwrap();
+        for (word, read) in reads.into_iter().enumerate() {
+            assert_eq!(results.take(read).ok(), Some(word as u32));
+        }
+
+        let probe = probe.lock().unwrap();
+        let sent = &probe.sent[opened..];
+        let owed = &probe.owed_at_send[opened..];
+        let addresses: Vec<_> = (0..sent.len())
+            .filter(|&i| sent[i][0] == CommandId::Transfer as u8)
+            .collect();
+        assert_eq!(addresses.len(), 2);
+        assert_eq!(owed[addresses[0]], 0);
+        assert!(
+            owed[addresses[1]] > 0,
+            "the second window waited for the first: {owed:?}"
+        );
+        // Four buffers, one left free for an abort.
+        assert!(owed.iter().all(|&owed| owed < 3), "{owed:?}");
+        assert!(probe.owes_nothing());
+    }
+
+    #[test]
+    fn a_probe_with_one_buffer_waits_for_every_reply() {
+        use crate::probe::cmsisdap::commands::CmsisDapDevice;
+
+        let probe = counting_probe(1, None);
+        let mut dap = CmsisDap::new_from_device(CmsisDapDevice::Fake(probe.clone())).unwrap();
+
+        let mut batch = SwdBatch::new();
+        let reads = two_windows(&mut batch, 30);
+        let mut results = dap.run_batch(&batch).unwrap();
+        for (word, read) in reads.into_iter().enumerate() {
+            assert_eq!(results.take(read).ok(), Some(word as u32));
+        }
+        assert!(
+            probe
+                .lock()
+                .unwrap()
+                .owed_at_send
+                .iter()
+                .all(|&owed| owed == 0)
+        );
+    }
+
+    #[test]
+    fn a_fault_in_one_window_is_reported_ahead_of_the_window_queued_behind_it() {
+        use crate::probe::cmsisdap::commands::CmsisDapDevice;
+
+        // The 20th read of the first window faults; the second window is already queued.
+        let probe = counting_probe(4, Some(20));
+        let mut dap = CmsisDap::new_from_device(CmsisDapDevice::Fake(probe.clone())).unwrap();
+
+        let mut batch = SwdBatch::new();
+        let reads = two_windows(&mut batch, 30);
+        let error = dap.run_batch(&batch).unwrap_err();
+
+        assert!(matches!(
+            error.error,
+            BatchError::Specific(DebugProbeError::SwdTransfer(
+                SwdTransferError::FaultResponse
+            ))
+        ));
+        // Read n is operation n + 1, and reads 14 to 27 went as one block, which is the one blamed.
+        assert!(
+            (15..=28).contains(&error.fault_operation),
+            "{}",
+            error.fault_operation
+        );
+        let mut results = error.results;
+        for (word, read) in reads.into_iter().enumerate() {
+            let value = results.take(read).ok();
+            if word < 14 {
+                assert_eq!(value, Some(word as u32), "read {word}");
+            } else {
+                assert_eq!(
+                    value, None,
+                    "read {word} was captured from the failed block or after it"
+                );
+            }
+        }
+        assert!(probe.lock().unwrap().owes_nothing());
     }
 
     #[test]
