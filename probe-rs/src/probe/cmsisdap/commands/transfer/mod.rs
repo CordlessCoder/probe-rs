@@ -495,6 +495,7 @@ impl Request for TransferAbortRequest {
     fn command(&self) -> CommandId {
         CommandId::TransferAbort
     }
+    const REPLIES: bool = false;
 
     type Response = ();
 

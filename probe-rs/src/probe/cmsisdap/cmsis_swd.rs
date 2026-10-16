@@ -829,7 +829,7 @@ mod tests {
             true
         };
         FakeProbe::shared(64, move |command| {
-            if command[0] == CommandId::Transfer as u8 {
+            if command[0] == CommandId::Transfer.id() {
                 let count = command[2];
                 let mut reply = vec![command[0], 0, Ack::Ok as u8];
                 let mut at = 3;
@@ -848,7 +848,7 @@ mod tests {
                 }
                 return Reply::Now(reply);
             }
-            if command[0] == CommandId::TransferBlock as u8 {
+            if command[0] == CommandId::TransferBlock.id() {
                 let count = u16::from_le_bytes([command[2], command[3]]);
                 let mut reply = vec![command[0], 0, 0, Ack::Ok as u8];
                 let mut done = 0u16;
@@ -895,7 +895,7 @@ mod tests {
         let sent = &probe.sent[opened..];
         let owed = &probe.owed_at_send[opened..];
         let addresses: Vec<_> = (0..sent.len())
-            .filter(|&i| sent[i][0] == CommandId::Transfer as u8)
+            .filter(|&i| sent[i][0] == CommandId::Transfer.id())
             .collect();
         assert_eq!(addresses.len(), 2);
         assert_eq!(owed[addresses[0]], 0);
