@@ -13,9 +13,9 @@ use crate::probe::usb_util::{BulkReadExt, BulkWriteExt};
 use crate::probe::{ProbeError, WireProtocol};
 use nusb::{
     Endpoint,
-    transfer::{Bulk, In, Out},
+    transfer::{Buffer, Bulk, In, Out},
 };
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::str::Utf8Error;
 use std::time::Duration;
 
@@ -228,6 +228,33 @@ pub enum CmsisDapDevice {
     Fake(std::sync::Arc<std::sync::Mutex<fake::FakeProbe>>),
 }
 
+/// Queue a read for one reply of up to `len` bytes.
+fn post_read(in_ep: &mut Endpoint<Bulk, In>, len: usize) {
+    let max_packet_size = in_ep.max_packet_size().max(1);
+    in_ep.submit(Buffer::new(len.div_ceil(max_packet_size) * max_packet_size));
+}
+
+/// Take the completions of writes that have finished, without waiting for the rest.
+fn reap_writes(out_ep: &mut Endpoint<Bulk, Out>) -> Result<(), SendError> {
+    while out_ep.pending() > 0 {
+        let Some(completion) = out_ep.wait_next_complete(Duration::ZERO) else {
+            break;
+        };
+        completion.status.map_err(io::Error::from)?;
+    }
+    Ok(())
+}
+
+/// Cancel every queued transfer on `ep` and take their completions.
+fn cancel_and_drain<D: nusb::transfer::EndpointDirection>(ep: &mut Endpoint<Bulk, D>) {
+    ep.cancel_all();
+    while ep.pending() > 0 {
+        if ep.wait_next_complete(Duration::from_millis(100)).is_none() {
+            break;
+        }
+    }
+}
+
 impl CmsisDapDevice {
     fn usb_timeout(&self) -> Duration {
         match self {
@@ -267,8 +294,35 @@ impl CmsisDapDevice {
                 }
             }
             CmsisDapDevice::V2 {
-                in_ep, usb_timeout, ..
-            } => Ok(in_ep.read_bulk(buf, *usb_timeout)?),
+                out_ep,
+                in_ep,
+                usb_timeout,
+                ..
+            } => {
+                if in_ep.pending() == 0 {
+                    post_read(in_ep, buf.len());
+                }
+                let Some(completion) = in_ep.wait_next_complete(*usb_timeout) else {
+                    cancel_and_drain(in_ep);
+                    cancel_and_drain(out_ep);
+                    return Err(SendError::Timeout);
+                };
+                reap_writes(out_ep)?;
+                completion.status.map_err(io::Error::from)?;
+
+                let len = completion.actual_len;
+                if len > buf.len() {
+                    return Err(SendError::UsbError(io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "device returned {len} bytes, buffer length is {}",
+                            buf.len()
+                        ),
+                    )));
+                }
+                buf[..len].copy_from_slice(&completion.buffer[..len]);
+                Ok(len)
+            }
             CmsisDapDevice::Tcp {
                 device, timeout, ..
             } => Ok(device.read(buf, *timeout)?),
@@ -282,22 +336,37 @@ impl CmsisDapDevice {
     }
 
     /// Write `buf` to the probe, returning the number of bytes written on success.
-    fn write(&mut self, buf: &[u8]) -> Result<usize, SendError> {
+    ///
+    /// On a v2 device the write is queued and this returns without waiting for the probe to take
+    /// it, and when `replies` the read for the reply is queued behind it. The host controller
+    /// hands each request over the moment the probe has room, so a probe that finishes a short
+    /// command does not wait for the host to notice before it gets the next one. A failed write
+    /// is reported by a later call.
+    fn write(&mut self, buf: &[u8], replies: bool) -> Result<usize, SendError> {
         match self {
             #[cfg(feature = "cmsisdap_v1")]
             CmsisDapDevice::V1 { handle, .. } => Ok(handle.write(buf)?),
             CmsisDapDevice::V2 {
                 out_ep,
-                usb_timeout,
+                in_ep,
+                max_packet_size,
                 ..
             } => {
+                reap_writes(out_ep)?;
                 // Skip first byte as it's set to 0 for HID transfers
-                Ok(out_ep.write_bulk(&buf[1..], *usb_timeout)?)
+                let mut transfer = Buffer::new(buf.len() - 1);
+                transfer.extend_from_slice(&buf[1..]);
+                out_ep.submit(transfer);
+                if replies {
+                    post_read(in_ep, *max_packet_size + 1);
+                }
+                Ok(buf.len() - 1)
             }
             // Skip the HID report byte, as for v2.
             CmsisDapDevice::Tcp { device, .. } => Ok(device.write(&buf[1..])?),
             #[cfg(test)]
             CmsisDapDevice::Fake(probe) => {
+                let _ = replies;
                 probe.lock().unwrap().write(&buf[1..]);
                 Ok(buf.len() - 1)
             }
@@ -341,16 +410,22 @@ impl CmsisDapDevice {
                 in_ep,
                 max_packet_size,
                 ..
-            } => {
-                let timeout = idle;
-                let mut discard = vec![0u8; *max_packet_size];
-                loop {
-                    match in_ep.read_bulk(&mut discard, timeout) {
-                        Ok(n) if n != 0 => drained = true,
-                        _ => break,
+            } => loop {
+                // Reads already queued for replies come back first, in order.
+                if in_ep.pending() == 0 {
+                    post_read(in_ep, *max_packet_size + 1);
+                }
+                match in_ep.wait_next_complete(idle) {
+                    Some(completion) if completion.status.is_ok() && completion.actual_len != 0 => {
+                        drained = true;
+                    }
+                    Some(_) => {}
+                    None => {
+                        cancel_and_drain(in_ep);
+                        break;
                     }
                 }
-            }
+            },
 
             CmsisDapDevice::Tcp {
                 device,
@@ -616,6 +691,9 @@ pub enum CommandId {
 pub(crate) trait Request {
     const COMMAND_ID: CommandId;
 
+    /// Whether the probe answers this command.
+    const REPLIES: bool = true;
+
     type Response;
 
     /// Convert the request to bytes, which can be sent to the probe.
@@ -766,7 +844,7 @@ fn send_request_inner<Req: Request>(
         size = *report_size + 1;
     }
 
-    let _ = device.write(&buffer[..size])?;
+    let _ = device.write(&buffer[..size], Req::REPLIES)?;
     trace_buffer("Transmit buffer", &buffer[..size]);
 
     Ok(())

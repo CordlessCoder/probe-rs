@@ -517,6 +517,7 @@ pub struct TransferAbortRequest;
 
 impl Request for TransferAbortRequest {
     const COMMAND_ID: CommandId = CommandId::TransferAbort;
+    const REPLIES: bool = false;
 
     type Response = ();
 
