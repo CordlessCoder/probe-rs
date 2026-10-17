@@ -1,6 +1,10 @@
 use std::time::Duration;
 
-use crate::probe::{BitSequence, WireProtocol, jtag::chain::JtagChain, swd::Port};
+use crate::probe::{
+    BitSequence, WireProtocol,
+    jtag::{chain::JtagChain, cjtag::CjtagProbe},
+    swd::Port,
+};
 
 use super::{
     ArmError,
@@ -407,4 +411,9 @@ pub trait DebugPortWire {
 
     /// Returns a [`JtagChain`] when the probe supports JTAG batching.
     fn try_jtag_chain(&mut self) -> Option<JtagChain<'_>>;
+
+    /// Returns the two-pin driver while [`WireProtocol::CJtag`] is selected.
+    fn cjtag(&mut self) -> Option<&mut dyn CjtagProbe> {
+        None
+    }
 }

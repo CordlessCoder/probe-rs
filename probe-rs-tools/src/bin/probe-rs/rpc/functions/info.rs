@@ -1138,6 +1138,7 @@ pub(crate) mod convert {
                 protocol: match request.protocol {
                     WireProtocol::Jtag => Some(ProbeRsWireProtocol::Jtag),
                     WireProtocol::Swd => Some(ProbeRsWireProtocol::Swd),
+                    WireProtocol::CJtag => Some(ProbeRsWireProtocol::CJtag),
                 },
                 non_interactive: true,
                 probe: Some(from_wire_debug_probe_selector(request.probe.selector())),

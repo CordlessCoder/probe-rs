@@ -6,6 +6,7 @@ pub mod swd;
 pub mod swj;
 pub mod swo;
 pub mod transfer;
+pub mod vendor;
 
 use crate::probe::cmsisdap::commands::general::info::{PacketCountCommand, PacketSizeCommand};
 use crate::probe::cmsisdap::tcp::TcpDevice;
@@ -154,6 +155,11 @@ pub enum RequestError {
     /// Failed to send the SWD sequence to the probe with the following request: {request:?}
     SwjSequence {
         request: swj::sequence::SequenceRequest,
+    },
+
+    /// The probe refused to switch two-pin framing: {request:?}
+    CjtagControl {
+        request: vendor::CjtagControlRequest,
     },
 
     /// Failed to send the JTAG sequence to the probe with the following request: {request:?}

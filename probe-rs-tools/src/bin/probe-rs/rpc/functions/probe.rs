@@ -581,6 +581,7 @@ pub(crate) mod convert {
         match protocol {
             WireProtocol::Jtag => probe_rs::probe::WireProtocol::Jtag,
             WireProtocol::Swd => probe_rs::probe::WireProtocol::Swd,
+            WireProtocol::CJtag => probe_rs::probe::WireProtocol::CJtag,
         }
     }
 
@@ -588,6 +589,7 @@ pub(crate) mod convert {
         match protocol {
             probe_rs::probe::WireProtocol::Jtag => WireProtocol::Jtag,
             probe_rs::probe::WireProtocol::Swd => WireProtocol::Swd,
+            probe_rs::probe::WireProtocol::CJtag => WireProtocol::CJtag,
         }
     }
 
