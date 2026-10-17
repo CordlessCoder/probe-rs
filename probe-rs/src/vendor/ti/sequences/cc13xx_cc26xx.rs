@@ -8,8 +8,9 @@ use crate::architecture::arm::memory::ArmMemoryInterface;
 use crate::architecture::arm::sequences::{ArmDebugSequence, ArmDebugSequenceError};
 use crate::architecture::arm::traits::DebugPortWire;
 use crate::architecture::arm::{ArmError, dp::DpAddress};
-use crate::probe::{BitSequence, WireProtocol};
+use crate::probe::{BitSequence, DebugProbeError, TapState, WireProtocol};
 
+use super::cjtag::{activate_oscan1, power_down};
 use super::icepick::{DefaultProtocol, Icepick};
 
 /// Marker struct indicating initialization sequencing for cc13xx_cc26xx family parts.
@@ -103,11 +104,24 @@ impl ArmDebugSequence for CC13xxCC26xx {
         interface: &mut dyn DebugPortWire,
         _dp: DpAddress,
     ) -> Result<(), ArmError> {
-        // Ensure current debug interface is in reset state.
-        interface.swj_sequence(&BitSequence::from_u64(51, 0x0007_FFFF_FFFF_FFFF))?;
-
         match interface.active_protocol() {
+            Some(WireProtocol::CJtag) => {
+                let probe = interface.cjtag().ok_or(ArmError::Probe(
+                    DebugProbeError::CommandNotSupportedByProbe {
+                        command_name: "two-pin JTAG",
+                    },
+                ))?;
+                activate_oscan1(probe).map_err(ArmError::Probe)?;
+                no_jtag_chain(interface.try_jtag_chain())?.assume_tap_state(TapState::RunTestIdle);
+
+                let mut icepick = Icepick::new(interface, DefaultProtocol::Oscan1)?;
+                icepick.select_tap(0, &self.name)?;
+                interface.configure_jtag(true)?;
+            }
             Some(WireProtocol::Jtag) => {
+                // Ensure current debug interface is in reset state.
+                interface.swj_sequence(&BitSequence::from_u64(51, 0x0007_FFFF_FFFF_FFFF))?;
+
                 let mut icepick = Icepick::new(interface, DefaultProtocol::CJtag)?;
                 icepick.select_tap(0, &self.name)?;
 
@@ -134,4 +148,30 @@ impl ArmDebugSequence for CC13xxCC26xx {
 
         Ok(())
     }
+
+    fn debug_port_stop(
+        &self,
+        interface: &mut dyn DebugPortWire,
+        dp: DpAddress,
+    ) -> Result<(), ArmError> {
+        self.debug_port_stop_default(interface, dp)?;
+
+        if interface.active_protocol() == Some(WireProtocol::CJtag) {
+            let mut chain = no_jtag_chain(interface.try_jtag_chain())?;
+            let from = chain.tap_state();
+            chain.assume_tap_state(TapState::TestLogicReset);
+            if let Some(probe) = interface.cjtag() {
+                power_down(probe, from).map_err(ArmError::Probe)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn no_jtag_chain<T>(chain: Option<T>) -> Result<T, ArmError> {
+    chain.ok_or(ArmError::Probe(
+        DebugProbeError::CommandNotSupportedByProbe {
+            command_name: "JTAG chain",
+        },
+    ))
 }

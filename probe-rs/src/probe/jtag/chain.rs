@@ -285,6 +285,16 @@ impl<'p> JtagChain<'p> {
         }
     }
 
+    /// The stable state the TAP rests in between batches.
+    pub fn tap_state(&mut self) -> TapState {
+        self.probe.chain_state_ref().tap_state
+    }
+
+    /// Record the state the TAP is in after something outside a batch moved it.
+    pub fn assume_tap_state(&mut self, state: TapState) {
+        self.probe.chain_state().tap_state = state;
+    }
+
     /// Schedule a TAP reset into Run-Test/Idle.
     pub fn tap_reset(&mut self, batch: &mut JtagBatch) {
         batch.enter(TapState::TestLogicReset);
