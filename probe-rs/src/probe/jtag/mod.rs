@@ -22,6 +22,7 @@
 //! batch.clock(8);
 //! ```
 pub mod chain;
+pub mod cjtag;
 pub mod dap;
 pub use chain::JtagChain;
 

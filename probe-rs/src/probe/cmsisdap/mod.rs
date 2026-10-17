@@ -22,7 +22,7 @@ use crate::{
         },
     },
     probe::{
-        DebugProbe, DebugProbeError, DebugProbeSelector, JtagChain, JtagChainAccess,
+        CjtagProbe, DebugProbe, DebugProbeError, DebugProbeSelector, JtagChain, JtagChainAccess,
         JtagChainState, ProbeFactory, WireProtocol,
         cmsisdap::commands::{
             CmsisDapError, RequestError,
@@ -31,6 +31,8 @@ use crate::{
         swd::SwdProbe,
     },
 };
+
+mod cjtag;
 
 use commands::{
     CmsisDapDevice, Status,
@@ -708,7 +710,7 @@ impl CmsisDap {
         let protocol: ConnectRequest = if let Some(protocol) = self.protocol {
             match protocol {
                 WireProtocol::Swd => ConnectRequest::Swd,
-                WireProtocol::Jtag => ConnectRequest::Jtag,
+                WireProtocol::Jtag | WireProtocol::CJtag => ConnectRequest::Jtag,
             }
         } else {
             ConnectRequest::DefaultPort
@@ -726,8 +728,19 @@ impl CmsisDap {
             })?;
 
         // Store the actually used protocol, to handle cases where the default protocol is used.
+        // Two-pin JTAG connects the JTAG port.
+        let used_protocol = match (self.protocol, used_protocol) {
+            (Some(WireProtocol::CJtag), WireProtocol::Jtag) => WireProtocol::CJtag,
+            _ => used_protocol,
+        };
         tracing::info!("Using protocol {}", used_protocol);
         self.protocol = Some(used_protocol);
+
+        // The firmware keeps framing across connections, so a session that ended without
+        // turning it off would frame the activation's raw clocks.
+        if used_protocol == WireProtocol::CJtag {
+            self.set_cjtag_framing(false)?;
+        }
 
         // If operating under JTAG, try to bring the JTAG machinery out of reset. Ignore errors
         // since not all probes support this.
@@ -841,7 +854,10 @@ impl DebugProbe for CmsisDap {
             match_retry: 0,
         })?;
 
-        if self.active_protocol() == Some(WireProtocol::Jtag) {
+        if matches!(
+            self.active_protocol(),
+            Some(WireProtocol::Jtag | WireProtocol::CJtag)
+        ) {
             // no-op: we configure JTAG in debug_port_setup,
             // because that is where we execute the SWJ-DP Switch Sequence
             // to ensure the debug port is ready for JTAG signals,
@@ -862,6 +878,14 @@ impl DebugProbe for CmsisDap {
     fn detach(&mut self) -> Result<(), crate::Error> {
         if self.swo_active {
             self.disable_swo()?;
+        }
+
+        // Back to four-wire clocks for whoever opens the probe next. The target stays as the
+        // debug sequence left it.
+        if self.protocol == Some(WireProtocol::CJtag)
+            && let Err(error) = self.set_cjtag_framing(false)
+        {
+            tracing::warn!("Could not turn two-pin framing off: {error}");
         }
 
         let response = commands::send_command(&mut self.device, &DisconnectRequest {})
@@ -889,6 +913,10 @@ impl DebugProbe for CmsisDap {
             }
             WireProtocol::Swd if self.capabilities.swd_implemented => {
                 self.protocol = Some(WireProtocol::Swd);
+                Ok(())
+            }
+            WireProtocol::CJtag if self.capabilities.jtag_implemented && self.frames_cjtag() => {
+                self.protocol = Some(WireProtocol::CJtag);
                 Ok(())
             }
             _ => Err(DebugProbeError::UnsupportedProtocol(protocol)),
@@ -938,7 +966,7 @@ impl DebugProbe for CmsisDap {
         sequence: Arc<dyn ArmDebugSequence>,
     ) -> Result<Box<dyn ArmDebugInterface + 'probe>, (Box<dyn DebugProbe>, ArmError)> {
         match self.protocol {
-            Some(WireProtocol::Jtag) => {
+            Some(WireProtocol::Jtag | WireProtocol::CJtag) => {
                 let settings = SwdProbe::swd_settings(self.as_ref());
                 Ok(ArmCommunicationInterface::create_jtag(
                     self, settings, sequence, false,
@@ -973,9 +1001,17 @@ impl DebugProbe for CmsisDap {
         Some(self)
     }
 
+    fn try_as_cjtag_probe_mut(&mut self) -> Option<&mut dyn CjtagProbe> {
+        if self.protocol == Some(WireProtocol::CJtag) {
+            Some(self)
+        } else {
+            None
+        }
+    }
+
     fn try_as_swd_probe(self: Box<Self>) -> Result<Box<dyn SwdProbe>, Box<dyn DebugProbe>> {
         match self.protocol {
-            Some(WireProtocol::Jtag) => Err(self.into_probe()),
+            Some(WireProtocol::Jtag | WireProtocol::CJtag) => Err(self.into_probe()),
             _ => Ok(self),
         }
     }

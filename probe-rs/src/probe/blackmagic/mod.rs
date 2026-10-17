@@ -1275,11 +1275,14 @@ impl DebugProbe for BlackMagicProbe {
     }
 
     fn select_protocol(&mut self, protocol: WireProtocol) -> Result<(), DebugProbeError> {
+        if protocol == WireProtocol::CJtag {
+            return Err(DebugProbeError::UnsupportedProtocol(protocol));
+        }
         self.protocol = Some(protocol);
 
         tracing::debug!("Switching to protocol {}", protocol);
         match protocol {
-            WireProtocol::Jtag => {
+            WireProtocol::Jtag | WireProtocol::CJtag => {
                 self.command(RemoteCommand::JtagInit)?;
                 self.command(RemoteCommand::JtagReset)?;
             }
