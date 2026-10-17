@@ -50,9 +50,10 @@ const SYSCTRL_DEFAULT: u32 = 0x80;
 /// the target out of OScan1 whatever this bit says.
 const SYSCTRL_OSCAN1: u32 = 0;
 
-/// Run-Test/Idle clocks before a TAP the ICEPick has just selected answers. Over two pins three
-/// leave the first scans reading all ones and four are enough; more cost nothing.
-const SD_TAP_JOIN_CLOCKS: u32 = 10;
+/// Run-Test/Idle clocks before a TAP the ICEPick has just selected answers. It joins only on
+/// clocks that come a few microseconds after the routing write, so the count has to cover that
+/// time at the fastest clock: 256 is over five microseconds up to 50 MHz.
+const SD_TAP_JOIN_CLOCKS: u32 = 256;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug)]
