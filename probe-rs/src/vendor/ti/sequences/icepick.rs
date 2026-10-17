@@ -109,10 +109,16 @@ impl<'a> Icepick<'a> {
             this.probe.select(0).map_err(ArmError::Probe)?;
             this.shift_ir_value(IR_IDCODE)?;
         } else {
-            // Reset the JTAG bus, which removes all TAPs except the main ICEPICK.
+            // Reset the JTAG bus, which removes all TAPs except the main ICEPICK. A chain left
+            // from before, with a secondary TAP selected, would misplace every IR scan below.
             let mut batch = JtagBatch::new();
             this.probe.tap_reset(&mut batch);
             this.probe.run(batch).map_err(ArmError::Probe)?;
+            this.probe.set_chain(&[ScanChainElement {
+                name: Some("ICEPICK".to_owned()),
+                ir_len: Some(IR_LEN_IN_BITS),
+            }]);
+            this.probe.select(0).map_err(ArmError::Probe)?;
         }
 
         if protocol == DefaultProtocol::CJtag {
