@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
+use crate::probe::WireProtocol;
 use crate::{
     architecture::arm::{
         RegisterAddress,
@@ -16,10 +17,11 @@ use crate::{
                 swj::sequence::SequenceRequest,
                 transfer::{
                     Ack, RW, TransferBlockRequest, TransferBlockResponse, TransferRequest,
-                    TransferResponse,
+                    TransferResponse, WriteAbortRequest,
                 },
             },
         },
+        jtag::{JtagBatch, TapState},
         swd::{Direction, Pins as SwdPins, Port, SwdBatch, SwdOp, SwdProbe, SwdTransferError},
     },
 };
@@ -52,6 +54,19 @@ fn transfer_data(op: &SwdOp) -> u32 {
         SwdOp::Transfer { data, .. } => *data,
         _ => 0,
     }
+}
+
+/// Whether `op` writes the DP's ABORT register.
+fn is_abort_write(op: &SwdOp) -> bool {
+    matches!(
+        op,
+        SwdOp::Transfer {
+            port: Port::Dp,
+            addr: 0,
+            direction: Direction::Write,
+            ..
+        }
+    )
 }
 
 /// Return how many operations from `start` repeat the same access.
@@ -91,6 +106,7 @@ fn split_into_packets(
     run_start: usize,
     dap_index: u8,
     packet_size: u16,
+    abort_alone: bool,
 ) -> impl Iterator<Item = PendingBatch> {
     let mut offset = 0;
 
@@ -101,6 +117,9 @@ fn split_into_packets(
             let SwdOp::Transfer { direction, .. } = op else {
                 break;
             };
+            if abort_alone && is_abort_write(op) {
+                break;
+            }
 
             // A repeat of one access can go as a block transfer, which is pipelined and, for a
             // write, denser -- but only if it gets a packet to itself. Ask for the whole run: if
@@ -607,6 +626,16 @@ impl CmsisDap {
         Ok(())
     }
 
+    fn run_jtag_abort(&mut self, dap_index: u8, abort: u32) -> Result<(), DebugProbeError> {
+        let request = WriteAbortRequest { dap_index, abort };
+        match commands::send_command(&mut self.device, &request)? {
+            commands::Status::DapOk => Ok(()),
+            commands::Status::DapError => Err(DebugProbeError::Other(
+                "DAP_WriteABORT was refused".to_string(),
+            )),
+        }
+    }
+
     fn run_swj_idle(&mut self, cycles: u32) -> Result<(), DebugProbeError> {
         let mut remaining = cycles as usize;
         while remaining > 0 {
@@ -648,6 +677,17 @@ impl SwdProbe for CmsisDap {
             .map(|(id, op)| (id.clone(), op.clone()))
             .collect();
         let dap_index = self.jtag_state.chain_params.index as u8;
+        // Over JTAG the probe runs the DP itself on the selected TAP. ABORT has an instruction of
+        // its own there, and every transfer starts and ends in Run-Test/Idle.
+        let jtag = matches!(
+            self.protocol,
+            Some(WireProtocol::Jtag | WireProtocol::CJtag)
+        );
+        if jtag && self.jtag_state.tap_state != TapState::RunTestIdle {
+            let mut enter = JtagBatch::new();
+            enter.enter(TapState::RunTestIdle);
+            crate::probe::jtag::JtagProbe::run_batch(self, &enter)?;
+        }
         let mut pipeline = self.pipeline();
 
         let mut batch_index = 0;
@@ -657,6 +697,7 @@ impl SwdProbe for CmsisDap {
                 batch_index,
                 dap_index,
                 self.packet_size,
+                jtag,
             );
             for packet in packets {
                 batch_index += packet.transfers.len();
@@ -667,6 +708,19 @@ impl SwdProbe for CmsisDap {
             let Some((id, op)) = ops.get(batch_index) else {
                 break;
             };
+
+            if jtag && is_abort_write(op) {
+                self.pipeline_flush(&mut pipeline)?;
+                if let Err(error) = self.run_jtag_abort(dap_index, transfer_data(op)) {
+                    return Err(BatchExecutionError::new_from_debug_probe_at(
+                        error,
+                        std::mem::replace(&mut pipeline.results, Results::new()),
+                        batch_index,
+                    ));
+                }
+                batch_index += 1;
+                continue;
+            }
 
             if let SwdOp::Transfer { .. } = op {
                 let run = run_length(&ops, batch_index);
@@ -725,6 +779,9 @@ impl SwdProbe for CmsisDap {
         }
 
         self.pipeline_flush(&mut pipeline)?;
+        if jtag {
+            self.jtag_state.tap_state = TapState::RunTestIdle;
+        }
         Ok(pipeline.results)
     }
 
@@ -1056,7 +1113,7 @@ mod tests {
             ops.push(transfer(Port::Ap, 0b1100, Direction::Read, 0));
         }
 
-        let packets: Vec<_> = split_into_packets(&ops, 0, 0, 1024).collect();
+        let packets: Vec<_> = split_into_packets(&ops, 0, 0, 1024, false).collect();
         assert_eq!(packets[0].transfers.len(), 255);
     }
 
@@ -1072,7 +1129,7 @@ mod tests {
             ops.push(transfer(Port::Dp, addr, Direction::Read, 0));
         }
 
-        let packets: Vec<_> = split_into_packets(&ops, 0, 0, packet_size).collect();
+        let packets: Vec<_> = split_into_packets(&ops, 0, 0, packet_size, false).collect();
         assert_eq!(packets.len(), 2);
         assert_eq!(packets[0].transfers.len(), max_per_packet);
         assert_eq!(packets[1].transfers.len(), 2);
@@ -1083,6 +1140,22 @@ mod tests {
         assert!(!cmsis_handles_wait(0));
         assert!(cmsis_handles_wait(1));
         assert!(cmsis_handles_wait(0xffff));
+    }
+
+    #[test]
+    fn over_jtag_an_abort_write_leaves_the_packet() {
+        let ops = vec![
+            transfer(Port::Dp, 0x8, Direction::Write, 0),
+            transfer(Port::Dp, 0x0, Direction::Write, 0x1e),
+            transfer(Port::Dp, 0x4, Direction::Read, 0),
+        ];
+        let sizes = |abort_alone| {
+            split_into_packets(&ops, 0, 0, 1024, abort_alone)
+                .map(|packet| packet.transfers.len())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sizes(true), [1]);
+        assert_eq!(sizes(false), [3]);
     }
 
     fn transfer(port: Port, addr: u8, direction: Direction, data: u32) -> (HandleId, SwdOp) {
@@ -1134,7 +1207,7 @@ mod tests {
 
     #[test]
     fn a_repeat_that_fits_travels_with_the_address_that_set_it_up() {
-        let packets: Vec<_> = split_into_packets(&address_then_reads(2), 0, 0, 64).collect();
+        let packets: Vec<_> = split_into_packets(&address_then_reads(2), 0, 0, 64, false).collect();
 
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].transfers.len(), 3);
@@ -1144,18 +1217,20 @@ mod tests {
     fn a_repeat_rides_along_until_the_reply_is_full() {
         // Three header bytes and four per read leave room for fifteen in a 64-byte reply, and the
         // address write costs the reply nothing.
-        let fits: Vec<_> = split_into_packets(&address_then_reads(15), 0, 0, 64).collect();
+        let fits: Vec<_> = split_into_packets(&address_then_reads(15), 0, 0, 64, false).collect();
         assert_eq!(fits.len(), 1);
         assert_eq!(fits[0].transfers.len(), 16);
 
-        let one_more: Vec<_> = split_into_packets(&address_then_reads(16), 0, 0, 64).collect();
+        let one_more: Vec<_> =
+            split_into_packets(&address_then_reads(16), 0, 0, 64, false).collect();
         assert_eq!(one_more.len(), 1);
         assert_eq!(one_more[0].transfers.len(), 1);
     }
 
     #[test]
     fn a_repeat_too_long_for_the_packet_is_left_to_the_block_command() {
-        let packets: Vec<_> = split_into_packets(&address_then_reads(40), 0, 0, 64).collect();
+        let packets: Vec<_> =
+            split_into_packets(&address_then_reads(40), 0, 0, 64, false).collect();
 
         // Only the address write is packed. `run_batch` sends the reads as `DAP_TransferBlock`,
         // which is pipelined.

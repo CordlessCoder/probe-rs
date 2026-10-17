@@ -510,10 +510,6 @@ impl Drop for ArmCommunicationInterface {
 }
 
 impl ArmCommunicationInterface {
-    fn is_swd(&self) -> bool {
-        matches!(self.probe.as_ref(), Some(ArmProbe::Swd(_, _)))
-    }
-
     fn close(mut self) -> Probe {
         self.disconnect();
 
@@ -661,7 +657,24 @@ impl ArmCommunicationInterface {
                 let mut port = SwdPort::new(probe.as_mut(), settings);
                 f(&mut port).map_err(Self::swd_port_error)
             }
-            _ => panic!("ArmCommunicationInterface does not hold an SwdProbe"),
+            ArmProbe::Jtag(probe, settings) => {
+                let settings = settings.clone();
+                let probe = probe
+                    .jtag_dp_transfers()
+                    .expect("only used when the probe runs its own JTAG-DP");
+                let mut port = SwdPort::new(probe, settings);
+                f(&mut port).map_err(Self::swd_port_error)
+            }
+        }
+    }
+
+    /// Whether DP and AP transfers go to the probe as transfers, which the SWD port drives, rather
+    /// than as JTAG scans.
+    fn probe_transfers(&mut self) -> bool {
+        match self.probe.as_mut() {
+            Some(ArmProbe::Swd(_, _)) => true,
+            Some(ArmProbe::Jtag(probe, _)) => probe.jtag_dp_transfers().is_some(),
+            None => false,
         }
     }
 
@@ -1184,7 +1197,7 @@ impl DapAccess for ArmCommunicationInterface {
     ) -> Result<u32, ArmError> {
         self.select_dp_and_dp_bank(dp, &address)?;
         let register = RegisterAddress::DpRegister(address);
-        if self.is_swd() {
+        if self.probe_transfers() {
             let addr = Self::swd_addr(register);
             self.with_swd_port(|port| {
                 let mut batch = SwdBatch::new();
@@ -1205,7 +1218,7 @@ impl DapAccess for ArmCommunicationInterface {
     ) -> Result<(), ArmError> {
         self.select_dp_and_dp_bank(dp, &address)?;
         let register = RegisterAddress::DpRegister(address);
-        let result = if self.is_swd() {
+        let result = if self.probe_transfers() {
             let addr = Self::swd_addr(register);
             self.with_swd_port(|port| {
                 let mut batch = SwdBatch::new();
@@ -1233,7 +1246,7 @@ impl DapAccess for ArmCommunicationInterface {
             this.select_ap_and_ap_bank(ap, address)?;
             let register = RegisterAddress::ApRegister((address & 0xFF) as u8);
 
-            if this.is_swd() {
+            if this.probe_transfers() {
                 let addr = Self::ap_swd_addr(address);
                 this.with_swd_port(|port| {
                     let mut batch = SwdBatch::new();
@@ -1258,7 +1271,7 @@ impl DapAccess for ArmCommunicationInterface {
         self.select_ap_and_ap_bank(ap, address)?;
         let register = RegisterAddress::ApRegister((address & 0xFF) as u8);
 
-        if self.is_swd() {
+        if self.probe_transfers() {
             let addr = Self::ap_swd_addr(address);
             let count = values.len();
             self.with_swd_port(|port| {
@@ -1299,7 +1312,7 @@ impl DapAccess for ArmCommunicationInterface {
             "every read needs a word to land in"
         );
 
-        if !self.is_swd() {
+        if !self.probe_transfers() {
             // JTAG has no batch to pack, so the list is replayed. A repeat of one register is
             // still a block transfer here, and one access at a time would undo it.
             let mut read = 0;
@@ -1362,7 +1375,7 @@ impl DapAccess for ArmCommunicationInterface {
             this.select_ap_and_ap_bank(ap, address)?;
             let register = RegisterAddress::ApRegister((address & 0xFF) as u8);
 
-            if this.is_swd() {
+            if this.probe_transfers() {
                 let addr = Self::ap_swd_addr(address);
                 this.with_swd_port(|port| {
                     let mut batch = SwdBatch::new();
@@ -1387,7 +1400,7 @@ impl DapAccess for ArmCommunicationInterface {
         self.select_ap_and_ap_bank(ap, address)?;
         let register = RegisterAddress::ApRegister((address & 0xFF) as u8);
 
-        if self.is_swd() {
+        if self.probe_transfers() {
             let addr = Self::ap_swd_addr(address);
             self.with_swd_port(|port| {
                 let mut batch = SwdBatch::new();

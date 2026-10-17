@@ -57,7 +57,7 @@ use commands::{
         sequence::{SequenceRequest, SequenceResponse},
     },
     swo,
-    transfer::{Ack, TransferRequest, configure::ConfigureRequest},
+    transfer::{Ack, TransferRequest, WriteAbortRequest, configure::ConfigureRequest},
 };
 use probe_rs_target::ScanChainElement;
 
@@ -544,6 +544,22 @@ impl CmsisDap {
     }
 
     fn write_abort(&mut self, abort: Abort) -> Result<(), ArmError> {
+        if matches!(
+            self.protocol,
+            Some(WireProtocol::Jtag | WireProtocol::CJtag)
+        ) {
+            let request = WriteAbortRequest {
+                dap_index: self.jtag_state.chain_params.index as u8,
+                abort: abort.into(),
+            };
+            return match commands::send_command(&mut self.device, &request)
+                .map_err(DebugProbeError::from)?
+            {
+                Status::DapOk => Ok(()),
+                Status::DapError => Err(DapError::Protocol(WireProtocol::Jtag).into()),
+            };
+        }
+
         let mut request = TransferRequest::write(Abort::ADDRESS, abort.into());
         request.dap_index = self.jtag_state.chain_params.index as u8;
         let response =

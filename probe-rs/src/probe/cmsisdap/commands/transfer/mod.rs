@@ -2,7 +2,7 @@ pub mod configure;
 
 use std::iter;
 
-use super::{CommandId, Request, SendError};
+use super::{CommandId, Request, SendError, Status};
 use crate::architecture::arm::RegisterAddress;
 use scroll::{LE, Pread, Pwrite};
 
@@ -348,6 +348,31 @@ pub struct TransferResponse {
     pub transfers: Vec<InnerTransferResponse>,
 }
 
+/// `DAP_WriteABORT`: writes the DP's ABORT register on either wire. Over JTAG, ABORT has an
+/// instruction of its own, so a `DAP_Transfer` to its address would reach another register.
+#[derive(Debug)]
+pub struct WriteAbortRequest {
+    /// Zero based device index of the selected JTAG device. For SWD mode the value is ignored.
+    pub dap_index: u8,
+    pub abort: u32,
+}
+
+impl Request for WriteAbortRequest {
+    const COMMAND_ID: CommandId = CommandId::WriteAbort;
+
+    type Response = Status;
+
+    fn to_bytes(&self, buffer: &mut [u8]) -> Result<usize, SendError> {
+        buffer[0] = self.dap_index;
+        buffer[1..5].copy_from_slice(&self.abort.to_le_bytes());
+        Ok(5)
+    }
+
+    fn parse_response(&self, buffer: &[u8]) -> Result<Self::Response, SendError> {
+        Status::from_byte(*buffer.first().ok_or(SendError::NotEnoughData)?)
+    }
+}
+
 /// Repeats one access, so that one packet carries more words than
 /// [`TransferRequest`] can.
 #[derive(Debug)]
@@ -538,6 +563,18 @@ mod packet_length_tests {
         request.add_read(RegisterAddress::ApRegister(0x0C));
         request.add_write(RegisterAddress::ApRegister(0x04), 0x1234_5678);
         request
+    }
+
+    #[test]
+    fn write_abort_carries_the_index_and_the_value() {
+        let request = WriteAbortRequest {
+            dap_index: 1,
+            abort: 0x1E,
+        };
+        let mut buffer = [0u8; 8];
+        assert_eq!(request.to_bytes(&mut buffer).unwrap(), 5);
+        assert_eq!(buffer[..5], [1, 0x1E, 0, 0, 0]);
+        assert_eq!(request.parse_response(&[0x00]).unwrap(), Status::DapOk);
     }
 
     #[test]

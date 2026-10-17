@@ -2,7 +2,7 @@ use bitvec::{bitvec, slice::BitSlice, vec::BitVec};
 
 use crate::probe::{
     Batch, BatchExecutionError, DebugProbeError, JtagChainAccess, JtagChainState, JtagOp,
-    JtagProbe, Results,
+    JtagProbe, Results, SwdProbe,
     cmsisdap::{
         CmsisDap,
         commands::jtag::sequence::{Sequence, SequenceRequest},
@@ -25,6 +25,10 @@ impl JtagChainAccess for CmsisDap {
 
     fn chain_state_ref(&self) -> &JtagChainState {
         &self.jtag_state
+    }
+
+    fn jtag_dp_transfers(&mut self) -> Option<&mut dyn SwdProbe> {
+        Some(self)
     }
 }
 

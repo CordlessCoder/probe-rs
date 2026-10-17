@@ -354,6 +354,13 @@ pub trait JtagChainAccess: JtagProbe {
 
     /// Returns the driver state.
     fn chain_state_ref(&self) -> &JtagChainState;
+
+    /// The probe's own JTAG-DP, for a probe that runs debug and access port transfers on the
+    /// selected TAP from the same batches an SWD probe takes, as CMSIS-DAP's `DAP_Transfer` does.
+    /// `None` leaves them to probe-rs's scans.
+    fn jtag_dp_transfers(&mut self) -> Option<&mut dyn super::swd::SwdProbe> {
+        None
+    }
 }
 
 /// Bit-banging JTAG interface for probe drivers.
