@@ -985,6 +985,19 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
         interface: &mut dyn DebugPortWire,
         dp: DpAddress,
     ) -> Result<(), ArmError> {
+        self.debug_port_stop_default(interface, dp)
+    }
+
+    /// The stock `DebugPortStop` implementation, split out from
+    /// [`debug_port_stop`](ArmDebugSequence::debug_port_stop) so that vendor sequences which
+    /// only need to *append* device-specific steps can run it without copying the body.
+    ///
+    /// There is no reason to override this; override `debug_port_stop` and call this from it.
+    fn debug_port_stop_default(
+        &self,
+        interface: &mut dyn DebugPortWire,
+        dp: DpAddress,
+    ) -> Result<(), ArmError> {
         tracing::info!("Powering down debug port {dp:x?}");
         // Select Bank 0
         interface.raw_write_register(

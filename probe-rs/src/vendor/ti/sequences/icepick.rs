@@ -9,10 +9,12 @@ use probe_rs_target::ScanChainElement;
 /// Which connection type is used by the Icepick
 #[derive(Debug, PartialEq)]
 pub enum DefaultProtocol {
-    /// cJTAG two-wire variant
+    /// cJTAG two-wire variant, switched to four-pin JTAG here
     CJtag,
     /// Standard JTAG implementation
     Jtag,
+    /// Two-pin OScan1, already activated. A TAP reset would end it, so none is sent.
+    Oscan1,
 }
 
 /// A TI ICEPick device. An ICEPick manages a JTAG device and can be used to add or
@@ -45,6 +47,12 @@ const SYSCTRL_DEFAULT: u32 = 0x80;
 /// Run-Test/Idle clocks after selecting a secondary TAP. The TAP joins the scan chain on these
 /// clocks, and a run of only a few leaves it unable to answer.
 const JOIN_IDLE_CLOCKS: u32 = 64;
+
+/// SYSCTRL over two pins. KeepPoweredinTLR stays clear, so the Test-Logic-Reset that ends a
+/// session powers the JTAG domain down, as a pin reset would, and clears halt-in-boot
+/// (SWCU185G 6.4, 6.6). During a session nothing may reach Test-Logic-Reset anyway: it drops
+/// the target out of OScan1 whatever this bit says.
+const SYSCTRL_OSCAN1: u32 = 0;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug)]
@@ -91,8 +99,16 @@ impl<'a> Icepick<'a> {
 
         let mut this = Icepick { probe: chain };
 
-        // Reset the JTAG bus, which removes all TAPs except the main ICEPICK.
-        {
+        if protocol == DefaultProtocol::Oscan1 {
+            // Only the ICEPick is on the chain, with BYPASS in IR from the activation.
+            this.probe.set_chain(&[ScanChainElement {
+                name: Some("ICEPICK".to_owned()),
+                ir_len: Some(IR_LEN_IN_BITS),
+            }]);
+            this.probe.select(0).map_err(ArmError::Probe)?;
+            this.shift_ir_value(IR_IDCODE)?;
+        } else {
+            // Reset the JTAG bus, which removes all TAPs except the main ICEPICK.
             let mut batch = JtagBatch::new();
             this.probe.tap_reset(&mut batch);
             this.probe.run(batch).map_err(ArmError::Probe)?;
@@ -135,7 +151,12 @@ impl<'a> Icepick<'a> {
                 .inspect_err(|e| tracing::error!("Couldn't write IR_CONNECT: {e}"))?;
         }
 
-        this.icepick_router(IcepickRoutingRegister::Sysctrl, SYSCTRL_DEFAULT)?;
+        let sysctrl = if protocol == DefaultProtocol::Oscan1 {
+            SYSCTRL_OSCAN1
+        } else {
+            SYSCTRL_DEFAULT
+        };
+        this.icepick_router(IcepickRoutingRegister::Sysctrl, sysctrl)?;
 
         Ok(this)
     }
