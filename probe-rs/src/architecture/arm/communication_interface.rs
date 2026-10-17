@@ -24,7 +24,7 @@ use crate::{
 };
 use jep106::JEP106Code;
 
-use crate::probe::jtag::{FullTapState, chain::JtagChain};
+use crate::probe::jtag::{FullTapState, chain::JtagChain, cjtag::CjtagProbe};
 use crate::probe::swd::Pins;
 
 use std::{
@@ -568,7 +568,7 @@ impl JtagDebugPortWire<'_> {
 
 impl DebugPortWire for JtagDebugPortWire<'_> {
     fn active_protocol(&self) -> Option<WireProtocol> {
-        Some(WireProtocol::Jtag)
+        self.probe.active_protocol()
     }
 
     fn swj_sequence(&mut self, bits: &BitSequence) -> Result<(), ArmError> {
@@ -644,6 +644,10 @@ impl DebugPortWire for JtagDebugPortWire<'_> {
     fn try_jtag_chain(&mut self) -> Option<JtagChain<'_>> {
         Some(JtagChain::new(self.probe))
     }
+
+    fn cjtag(&mut self) -> Option<&mut dyn CjtagProbe> {
+        self.probe.try_as_cjtag_probe_mut()
+    }
 }
 
 fn dp_wire_register(port: Port, addr: u8) -> RegisterAddress {
@@ -665,8 +669,10 @@ pub(crate) fn probe_debug_port_wire<R>(
         .map(|swd| swd.swd_settings())
         .unwrap_or_default();
 
-    if probe.active_protocol() == Some(WireProtocol::Jtag)
-        && let Some(jtag) = probe.try_as_jtag_chain_access_mut()
+    if matches!(
+        probe.active_protocol(),
+        Some(WireProtocol::Jtag | WireProtocol::CJtag)
+    ) && let Some(jtag) = probe.try_as_jtag_chain_access_mut()
     {
         let mut wire = JtagDebugPortWire {
             probe: jtag,

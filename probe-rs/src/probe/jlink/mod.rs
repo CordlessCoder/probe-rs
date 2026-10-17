@@ -987,6 +987,7 @@ impl DebugProbe for JLink {
             let jlink_interface = match protocol {
                 WireProtocol::Swd => Interface::Swd,
                 WireProtocol::Jtag => Interface::Jtag,
+                WireProtocol::CJtag => return Err(DebugProbeError::UnsupportedProtocol(protocol)),
             };
 
             if !self.interfaces.contains(jlink_interface) {
@@ -1049,7 +1050,7 @@ impl DebugProbe for JLink {
         if self.caps.contains(Capability::SelectIf) {
             let jlink_interface = match self.protocol {
                 WireProtocol::Swd => Interface::Swd,
-                WireProtocol::Jtag => Interface::Jtag,
+                WireProtocol::Jtag | WireProtocol::CJtag => Interface::Jtag,
             };
 
             self.select_interface(jlink_interface)?;
@@ -1076,7 +1077,7 @@ impl DebugProbe for JLink {
         }
 
         match self.protocol {
-            WireProtocol::Jtag => {
+            WireProtocol::Jtag | WireProtocol::CJtag => {
                 // try some JTAG stuff
 
                 tracing::debug!("Resetting JTAG chain using trst");
@@ -1179,7 +1180,7 @@ impl DebugProbe for JLink {
     ) -> Result<Box<dyn ArmDebugInterface + 'probe>, (Box<dyn DebugProbe>, ArmError)> {
         let settings = SwdProbe::swd_settings(self.as_ref());
         let iface = match self.protocol {
-            WireProtocol::Jtag => {
+            WireProtocol::Jtag | WireProtocol::CJtag => {
                 ArmCommunicationInterface::create_jtag(self, settings, sequence, true)
             }
             WireProtocol::Swd => {

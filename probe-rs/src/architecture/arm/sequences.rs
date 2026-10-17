@@ -540,6 +540,13 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
         interface: &mut dyn DebugPortWire,
         dp: DpAddress,
     ) -> Result<(), ArmError> {
+        if interface.active_protocol() == Some(WireProtocol::CJtag) {
+            return Err(ArmDebugSequenceError::SequenceSpecific(
+                "Two-pin JTAG needs the target's own sequence to activate it".into(),
+            )
+            .into());
+        }
+
         // TODO: Handle this differently for ST-Link?
         tracing::debug!("Setting up debug port {dp:x?}");
 
@@ -1028,7 +1035,7 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
         dp: DpAddress,
     ) -> Result<(), ArmError> {
         match interface.active_protocol() {
-            Some(WireProtocol::Jtag) => {
+            Some(WireProtocol::Jtag | WireProtocol::CJtag) => {
                 tracing::debug!("JTAG: No special sequence needed to connect to debug port");
                 return Ok(());
             }

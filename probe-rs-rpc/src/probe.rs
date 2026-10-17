@@ -96,6 +96,8 @@ pub enum WireProtocol {
     Jtag,
     /// SWD
     Swd,
+    /// cJTAG
+    CJtag,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Schema)]

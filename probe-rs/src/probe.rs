@@ -47,6 +47,7 @@ use target_serial::TargetSerial;
 
 pub use bits::BitSequence;
 pub use jtag::chain::ChainParams;
+pub use jtag::cjtag::{CjtagProbe, PinStep};
 pub use jtag::{
     BitbangJtag, JtagBatch, JtagChain, JtagChainAccess, JtagChainState, JtagOp, JtagProbe, TapState,
 };
@@ -89,7 +90,7 @@ pub(crate) fn register_probe_factory(factory: &'static dyn ProbeFactory) {
 
 /// The protocol that is to be used by the probe when communicating with the target.
 ///
-/// For ARM select `Swd` or `Jtag`, for RISC-V select `Jtag`.
+/// For ARM select `Swd` or `Jtag`, for RISC-V select `Jtag`. `CJtag` is JTAG over two pins.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum WireProtocol {
     /// Serial Wire Debug is ARMs proprietary standard for communicating with ARM cores.
@@ -98,6 +99,11 @@ pub enum WireProtocol {
     /// JTAG is a standard which is supported by many chips independent of architecture.
     /// See [`Wikipedia`](https://en.wikipedia.org/wiki/JTAG) for more info.
     Jtag,
+    /// Compact JTAG (IEEE 1149.7): JTAG over two pins, TCKC and TMSC, in the OScan1 format.
+    ///
+    /// The target's debug sequence activates the format, so only targets with such a
+    /// sequence support it.
+    CJtag,
 }
 
 impl fmt::Display for WireProtocol {
@@ -105,6 +111,7 @@ impl fmt::Display for WireProtocol {
         match self {
             WireProtocol::Swd => f.write_str("SWD"),
             WireProtocol::Jtag => f.write_str("JTAG"),
+            WireProtocol::CJtag => f.write_str("cJTAG"),
         }
     }
 }
@@ -116,8 +123,9 @@ impl std::str::FromStr for WireProtocol {
         match &s.to_ascii_lowercase()[..] {
             "swd" => Ok(WireProtocol::Swd),
             "jtag" => Ok(WireProtocol::Jtag),
+            "cjtag" => Ok(WireProtocol::CJtag),
             _ => Err(format!(
-                "'{s}' is not a valid protocol. Choose either 'swd' or 'jtag'."
+                "'{s}' is not a valid protocol. Choose 'swd', 'jtag' or 'cjtag'."
             )),
         }
     }
@@ -941,6 +949,11 @@ pub trait DebugProbe: Any + Send + fmt::Debug {
 
     /// Borrow this probe as a layer-0 JTAG chain driver, if it implements [`JtagChainAccess`].
     fn try_as_jtag_chain_access_mut(&mut self) -> Option<&mut dyn JtagChainAccess> {
+        None
+    }
+
+    /// Borrow this probe as a two-pin JTAG driver, while [`WireProtocol::CJtag`] is selected.
+    fn try_as_cjtag_probe_mut(&mut self) -> Option<&mut dyn CjtagProbe> {
         None
     }
 
