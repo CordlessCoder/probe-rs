@@ -461,18 +461,23 @@ impl CmsisDapDevice {
                     return Ok(size as usize);
                 }
 
-                // Ignore timeouts and retry.
+                // The answer to an abort from a probe that runs it in order, such as debugprobe.
+                // Another abort would answer the next attempt the same way.
                 Err(CmsisDapError::Send {
-                    source: SendError::Timeout,
+                    source: SendError::CommandIdMismatch(0xFF, _),
                     ..
                 }) => (),
 
-                // A reply to a command from before this device was opened. It has now been read
-                // and the rest of the queue discarded with it, so the next attempt gets its own.
+                // No reply, or one to a command sent before this device was opened: the probe can
+                // still be running that session's transfers, for minutes against a target that
+                // keeps answering WAIT. The abort ends the one running. It follows every failed
+                // attempt, because a probe whose buffers the attempts have filled takes no abort.
                 Err(CmsisDapError::Send {
-                    source: SendError::CommandIdMismatch(..),
+                    source: SendError::Timeout | SendError::CommandIdMismatch(..),
                     ..
-                }) => (),
+                }) => {
+                    let _ = send_request(self, &TransferAbortRequest);
+                }
 
                 // Raise other errors.
                 Err(e) => return Err(e),
