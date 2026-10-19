@@ -1407,4 +1407,34 @@ mod tests {
         let usb_timeout = probe.lock().unwrap().usb_timeout;
         assert_eq!(usb_timeout, DEFAULT_USB_TIMEOUT);
     }
+
+    #[test]
+    fn opening_ends_a_transfer_an_earlier_session_left_running() {
+        let probe = FakeProbe::shared(64, |command| match command {
+            [0x05, ..] => Reply::Held(vec![0x05, 0x01, 0x02]),
+            _ => standard_reply(command, 64, 4),
+        });
+        {
+            let mut fake = probe.lock().unwrap();
+            fake.held_until_abort = true;
+            // The last command of a host that exited, still retrying against its target.
+            fake.write(&[0x05, 0x00, 0x01, 0x06]);
+        }
+        let dap = CmsisDap::new_from_device(CmsisDapDevice::Fake(probe.clone())).unwrap();
+        assert_eq!((dap.packet_size, dap.packet_count), (64, 4));
+        assert!(probe.lock().unwrap().aborts() >= 1);
+    }
+
+    #[test]
+    fn opening_a_probe_that_answers_the_abort_in_order() {
+        let mut answered = false;
+        let probe = FakeProbe::shared(64, move |command| match command {
+            [0x00, 0xFF, ..] if !std::mem::replace(&mut answered, true) => Reply::None,
+            [0x07, ..] => Reply::Now(vec![0xFF]),
+            _ => standard_reply(command, 64, 4),
+        });
+        probe.lock().unwrap().abort_interrupts = false;
+        let dap = CmsisDap::new_from_device(CmsisDapDevice::Fake(probe.clone())).unwrap();
+        assert_eq!(dap.packet_size, 64);
+    }
 }
