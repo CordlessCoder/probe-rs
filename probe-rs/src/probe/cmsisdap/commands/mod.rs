@@ -214,6 +214,9 @@ pub enum CmsisDapDevice {
 }
 
 /// Queue a read for one reply of up to `len` bytes.
+///
+/// `len` is the DAP packet size and no more: a reply that fills it ends on a full USB packet with
+/// no short one after it, so a longer read would wait for data that never comes.
 fn post_read(in_ep: &mut Endpoint<Bulk, In>, len: usize) {
     let max_packet_size = in_ep.max_packet_size().max(1);
     in_ep.submit(Buffer::new(len.div_ceil(max_packet_size) * max_packet_size));
@@ -280,10 +283,11 @@ impl CmsisDapDevice {
                 out_ep,
                 in_ep,
                 usb_timeout,
+                max_packet_size,
                 ..
             } => {
                 if in_ep.pending() == 0 {
-                    post_read(in_ep, buf.len());
+                    post_read(in_ep, *max_packet_size);
                 }
                 let Some(completion) = in_ep.wait_next_complete(*usb_timeout) else {
                     // The probe did not answer, or never took the request: neither endpoint may
@@ -340,7 +344,7 @@ impl CmsisDapDevice {
                 transfer.extend_from_slice(&buf[1..]);
                 out_ep.submit(transfer);
                 if replies {
-                    post_read(in_ep, *max_packet_size + 1);
+                    post_read(in_ep, *max_packet_size);
                 }
                 Ok(buf.len() - 1)
             }
@@ -393,7 +397,7 @@ impl CmsisDapDevice {
             } => loop {
                 // Reads already queued for replies come back first, in order.
                 if in_ep.pending() == 0 {
-                    post_read(in_ep, *max_packet_size + 1);
+                    post_read(in_ep, *max_packet_size);
                 }
                 match in_ep.wait_next_complete(idle) {
                     Some(completion) if completion.status.is_ok() && completion.actual_len != 0 => {
