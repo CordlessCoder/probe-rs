@@ -7,10 +7,10 @@ pub mod swj;
 pub mod swo;
 pub mod transfer;
 
+use crate::probe::ProbeError;
 use crate::probe::cmsisdap::commands::general::info::{PacketCountCommand, PacketSizeCommand};
 use crate::probe::cmsisdap::tcp::TcpDevice;
 use crate::probe::usb_util::{BulkReadExt, BulkWriteExt};
-use crate::probe::{ProbeError, WireProtocol};
 use nusb::{
     Endpoint,
     transfer::{Buffer, Bulk, In, Out},
@@ -19,6 +19,7 @@ use std::io::{self, ErrorKind};
 use std::str::Utf8Error;
 use std::time::Duration;
 
+use self::general::connect::ConnectRequest;
 use self::general::host_status::HostStatusRequest;
 use self::swj::clock::SWJClockRequest;
 use self::transfer::TransferAbortRequest;
@@ -179,8 +180,8 @@ pub enum RequestError {
     /// Could not execute SWO control command {command:?}
     SwoControl { command: swo::ControlRequest },
 
-    /// {protocol:?} initialization failed
-    InitFailed { protocol: Option<WireProtocol> },
+    /// The probe could not initialize {request}
+    InitFailed { request: ConnectRequest },
 
     /// Setting the host status on the debug probe failed with request {request:?}
     HostStatus { request: HostStatusRequest },

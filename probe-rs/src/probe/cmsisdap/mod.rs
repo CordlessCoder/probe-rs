@@ -861,7 +861,7 @@ impl CmsisDap {
                 ConnectResponse::SuccessfulInitForJTAG => Ok(WireProtocol::Jtag),
                 ConnectResponse::InitFailed => {
                     Err(CmsisDapError::ErrorResponse(RequestError::InitFailed {
-                        protocol: self.protocol,
+                        request: protocol,
                     }))
                 }
             })?;
