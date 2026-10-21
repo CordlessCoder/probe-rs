@@ -68,27 +68,30 @@ pub fn list_cmsisdap_devices(selector: Option<&DebugProbeSelector>) -> Vec<Probe
     tracing::debug!("Searching for CMSIS-DAP probes using nusb");
 
     let nusb_span = tracing::debug_span!("list_usb_devices").entered();
-    #[cfg_attr(not(feature = "cmsisdap_v1"), expect(unused_mut))]
-    let mut probes: Vec<ProbeListItem> = match nusb::list_devices().wait() {
-        Ok(devices) => devices
-            .flat_map(|device| {
-                // A single USB device can yield multiple entries (v1/v2 interfaces); give each
-                // entry the same accessibility for that device.
-                let accessibility = usb_probe_accessibility(&device);
-                get_cmsisdap_info(&device, false)
-                    .into_iter()
-                    .map(move |info| ProbeListItem {
-                        info,
-                        accessibility,
-                    })
-            })
-            .filter(|probe| selector.is_none_or(|s| s.matches_probe(&probe.info)))
-            .collect(),
+    let usb_devices: Vec<DeviceInfo> = match nusb::list_devices().wait() {
+        Ok(devices) => devices.collect(),
         Err(e) => {
             tracing::warn!("error listing devices with nusb: {e}");
             vec![]
         }
     };
+
+    #[cfg_attr(not(feature = "cmsisdap_v1"), expect(unused_mut))]
+    let mut probes: Vec<ProbeListItem> = usb_devices
+        .iter()
+        .flat_map(|device| {
+            // A single USB device can yield multiple entries (v1/v2 interfaces); give each
+            // entry the same accessibility for that device.
+            let accessibility = usb_probe_accessibility(device);
+            get_cmsisdap_info(device, false)
+                .into_iter()
+                .map(move |info| ProbeListItem {
+                    info,
+                    accessibility,
+                })
+        })
+        .filter(|probe| selector.is_none_or(|s| s.matches_probe(&probe.info)))
+        .collect();
 
     drop(nusb_span);
 
@@ -114,6 +117,7 @@ pub fn list_cmsisdap_devices(selector: Option<&DebugProbeSelector>) -> Vec<Probe
         for device in api.device_list() {
             if let Some(info) = get_cmsisdap_hid_info(device)
                 && selector.is_none_or(|s| s.matches_probe(&info))
+                && hid_interface_qualifies(device, &usb_devices)
             {
                 if !probes.iter().any(|p| {
                     p.info.vendor_id == info.vendor_id
@@ -286,6 +290,54 @@ fn get_cmsisdap_hid_info(device: &hidapi::DeviceInfo) -> Option<DebugProbeInfo> 
         ))
     } else {
         None
+    }
+}
+
+/// Whether nusb's view of the device behind `hid` leaves `hid` a candidate CMSIS-DAP interface.
+///
+/// hidapi cannot read interface strings, so without that view the product string decides alone.
+#[cfg(feature = "cmsisdap_v1")]
+fn hid_interface_qualifies(hid: &hidapi::DeviceInfo, usb_devices: &[DeviceInfo]) -> bool {
+    let Ok(number) = u8::try_from(hid.interface_number()) else {
+        return true;
+    };
+    let Some(device) = usb_devices.iter().find(|device| {
+        device.vendor_id() == hid.vendor_id()
+            && device.product_id() == hid.product_id()
+            && device.serial_number().unwrap_or("") == hid.serial_number().unwrap_or("")
+    }) else {
+        return true;
+    };
+    let interfaces: Vec<_> = device
+        .interfaces()
+        .map(|i| (i.interface_number(), i.class(), i.interface_string()))
+        .collect();
+    let qualifies = hid_may_be_cmsis_dap(&interfaces, number);
+    if !qualifies {
+        tracing::trace!(
+            "HID interface {number} is not named CMSIS-DAP and is not the only candidate"
+        );
+    }
+    qualifies
+}
+
+/// Whether HID interface `hid` may be the CMSIS-DAP interface of a device whose interfaces are
+/// `interfaces`, each given as its number, class and string.
+///
+/// The spec has a composite device name its CMSIS-DAP interface. A HID named anything else is
+/// taken on the product string alone only while nothing else on the device could be the probe:
+/// no second HID, and no interface named CMSIS-DAP. NXP's MCU-Link firmware, for one, has trace,
+/// power and serial-bridge HIDs and a product string that says CMSIS-DAP.
+#[cfg(feature = "cmsisdap_v1")]
+fn hid_may_be_cmsis_dap(interfaces: &[(u8, u8, Option<&str>)], hid: u8) -> bool {
+    let Some(&(_, _, name)) = interfaces.iter().find(|(number, ..)| *number == hid) else {
+        return true;
+    };
+    match name {
+        Some(name) if !is_cmsis_dap(name) => !interfaces.iter().any(|&(number, class, name)| {
+            number != hid && (class == USB_CLASS_HID || name.is_some_and(is_cmsis_dap))
+        }),
+        _ => true,
     }
 }
 
@@ -506,39 +558,39 @@ pub fn open_device_from_selector(
     // Try using nusb to open a v2 device. This might fail if
     // the device does not support v2 operation or due to driver
     // or permission issues with opening bulk devices.
-    match nusb::list_devices().wait() {
-        Ok(devices) => {
-            for device in devices {
-                tracing::trace!("Trying device {:?}", device);
-
-                if selector.matches(&device)
-                    && let Some(device_info) =
-                        get_cmsisdap_info(&device, true).into_iter().find(|dpi| {
-                            tracing::trace!("DebugProbeInfo: {:?}", dpi);
-                            // Only compare if the selector has an interface to compare to
-                            selector.interface.is_none_or(|i| Some(i) == dpi.interface)
-                        })
-                {
-                    // If the VID, PID, and potentially SN all match,
-                    // and the device is a valid CMSIS-DAP probe,
-                    // attempt to open the device in v2 mode.
-                    if let Some(device) = open_v2_device(&device, device_info.interface)? {
-                        return Ok(device);
-                    } else {
-                        #[cfg(feature = "cmsisdap_v1")]
-                        {
-                            // Otherwise, save as a potential CMSIS-DAP v1 HID device and continue.
-                            hid_device_info = Some(device_info);
-                        }
-                    }
-                }
-
-                tracing::trace!("Device did not match");
-            }
-        }
+    let usb_devices: Vec<DeviceInfo> = match nusb::list_devices().wait() {
+        Ok(devices) => devices.collect(),
         Err(e) => {
             tracing::debug!("No devices matched using nusb: {e}");
+            vec![]
         }
+    };
+
+    for device in &usb_devices {
+        tracing::trace!("Trying device {:?}", device);
+
+        if selector.matches(device)
+            && let Some(device_info) = get_cmsisdap_info(device, true).into_iter().find(|dpi| {
+                tracing::trace!("DebugProbeInfo: {:?}", dpi);
+                // Only compare if the selector has an interface to compare to
+                selector.interface.is_none_or(|i| Some(i) == dpi.interface)
+            })
+        {
+            // If the VID, PID, and potentially SN all match,
+            // and the device is a valid CMSIS-DAP probe,
+            // attempt to open the device in v2 mode.
+            if let Some(device) = open_v2_device(device, device_info.interface)? {
+                return Ok(device);
+            } else {
+                #[cfg(feature = "cmsisdap_v1")]
+                {
+                    // Otherwise, save as a potential CMSIS-DAP v1 HID device and continue.
+                    hid_device_info = Some(device_info);
+                }
+            }
+        }
+
+        tracing::trace!("Device did not match");
     }
 
     #[cfg(not(feature = "cmsisdap_v1"))]
@@ -581,7 +633,7 @@ pub fn open_device_from_selector(
                         device_match &= info.interface_number() == hid_interface as i32;
                     }
 
-                    device_match
+                    device_match && hid_interface_qualifies(info, &usb_devices)
                 })
                 .ok_or(ProbeCreationError::NotFound)?;
 
@@ -665,4 +717,74 @@ fn hid_report_size(device: &hidapi::DeviceInfo) -> usize {
     // Devices are queried at startup for their packet size so it can usually be increased quickly
     // if needed; only some devices are annoying to query the packet size so are worth an override.
     64
+}
+
+#[cfg(all(test, feature = "cmsisdap_v1"))]
+mod tests {
+    use super::*;
+
+    const CDC: u8 = 0x02;
+    const CDC_DATA: u8 = 0x0A;
+
+    #[test]
+    fn a_hid_beside_another_hid_needs_its_own_name() {
+        // NXP's MCU-Link Pro firmware with its SWD jumper fitted.
+        let interfaces = [
+            (0, USB_CLASS_HID, Some("MCU-LINK NXP POWER")),
+            (1, CDC, Some("VCOM")),
+            (2, CDC_DATA, Some("VCOM")),
+            (3, CDC, Some("VCOM2")),
+            (4, CDC_DATA, Some("VCOM2")),
+            (5, USB_CLASS_HID, Some("LPCSIO")),
+        ];
+        assert!(!hid_may_be_cmsis_dap(&interfaces, 0));
+        assert!(!hid_may_be_cmsis_dap(&interfaces, 5));
+    }
+
+    #[test]
+    fn a_hid_beside_a_named_interface_needs_its_own_name() {
+        // NXP's MCU-Link firmware: a v2 interface and a trace HID.
+        let interfaces = [
+            (
+                0,
+                USB_CMSIS_DAP_CLASS,
+                Some("MCU-LINK (r0FB) CMSIS-DAP V3.172"),
+            ),
+            (1, USB_CLASS_HID, Some("MCU-LINK NXP TRACE")),
+            (2, CDC, Some("VCOM")),
+            (3, CDC_DATA, Some("VCOM")),
+        ];
+        assert!(!hid_may_be_cmsis_dap(&interfaces, 1));
+    }
+
+    #[test]
+    fn the_named_hid_is_taken_among_several() {
+        // The LPC-Link2's HIDs, as OpenOCD's interface-zero quirk for it lists them.
+        let interfaces = [
+            (0, USB_CLASS_HID, Some("LPC-LINK2 CMSIS-DAP V5.224")),
+            (1, CDC, None),
+            (2, CDC_DATA, None),
+            (3, USB_CLASS_HID, Some("LPCSIO")),
+            (4, USB_CLASS_HID, Some("LPC-LINK2 DATA PORT")),
+        ];
+        assert!(hid_may_be_cmsis_dap(&interfaces, 0));
+        assert!(!hid_may_be_cmsis_dap(&interfaces, 3));
+        assert!(!hid_may_be_cmsis_dap(&interfaces, 4));
+    }
+
+    #[test]
+    fn a_lone_hid_is_taken_whatever_its_name() {
+        let interfaces = [
+            (0, USB_CLASS_HID, Some("HID Interface")),
+            (1, CDC, Some("VCOM")),
+            (2, CDC_DATA, None),
+        ];
+        assert!(hid_may_be_cmsis_dap(&interfaces, 0));
+    }
+
+    #[test]
+    fn a_hid_without_a_name_is_taken() {
+        let interfaces = [(0, USB_CLASS_HID, None), (1, USB_CLASS_HID, Some("LPCSIO"))];
+        assert!(hid_may_be_cmsis_dap(&interfaces, 0));
+    }
 }
