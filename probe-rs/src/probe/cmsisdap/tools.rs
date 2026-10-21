@@ -28,27 +28,30 @@ pub fn list_cmsisdap_devices(selector: Option<&DebugProbeSelector>) -> Vec<Probe
     tracing::debug!("Searching for CMSIS-DAP probes using nusb");
 
     let nusb_span = tracing::debug_span!("list_usb_devices").entered();
-    #[cfg_attr(not(feature = "cmsisdap_v1"), expect(unused_mut))]
-    let mut probes: Vec<ProbeListItem> = match nusb::list_devices().wait() {
-        Ok(devices) => devices
-            .flat_map(|device| {
-                // A single USB device can yield multiple entries (v1/v2 interfaces); give each
-                // entry the same accessibility for that device.
-                let accessibility = usb_probe_accessibility(&device);
-                get_cmsisdap_info(&device, false)
-                    .into_iter()
-                    .map(move |info| ProbeListItem {
-                        info,
-                        accessibility,
-                    })
-            })
-            .filter(|probe| selector.is_none_or(|s| s.matches_probe(&probe.info)))
-            .collect(),
+    let usb_devices: Vec<DeviceInfo> = match nusb::list_devices().wait() {
+        Ok(devices) => devices.collect(),
         Err(e) => {
             tracing::warn!("error listing devices with nusb: {e}");
             vec![]
         }
     };
+
+    #[cfg_attr(not(feature = "cmsisdap_v1"), expect(unused_mut))]
+    let mut probes: Vec<ProbeListItem> = usb_devices
+        .iter()
+        .flat_map(|device| {
+            // A single USB device can yield multiple entries (v1/v2 interfaces); give each
+            // entry the same accessibility for that device.
+            let accessibility = usb_probe_accessibility(device);
+            get_cmsisdap_info(device, false)
+                .into_iter()
+                .map(move |info| ProbeListItem {
+                    info,
+                    accessibility,
+                })
+        })
+        .filter(|probe| selector.is_none_or(|s| s.matches_probe(&probe.info)))
+        .collect();
 
     drop(nusb_span);
 
@@ -62,7 +65,7 @@ pub fn list_cmsisdap_devices(selector: Option<&DebugProbeSelector>) -> Vec<Probe
     }
 
     #[cfg(feature = "cmsisdap_v1")]
-    v1::list_hid_only_devices(&mut probes, selector);
+    v1::list_hid_only_devices(&mut probes, selector, &usb_devices);
 
     tracing::debug!("Found {} CMSIS-DAP probes total", probes.len());
     probes
@@ -414,46 +417,46 @@ pub fn open_device_from_selector(
     // Try using nusb to open a v2 device. This might fail if
     // the device does not support v2 operation or due to driver
     // or permission issues with opening bulk devices.
-    match nusb::list_devices().wait() {
-        Ok(devices) => {
-            for device in devices {
-                tracing::trace!("Trying device {:?}", device);
-
-                if selector.matches(&device)
-                    && let Some(device_info) =
-                        get_cmsisdap_info(&device, true).into_iter().find(|dpi| {
-                            tracing::trace!("DebugProbeInfo: {:?}", dpi);
-                            // Only compare if the selector has an interface to compare to
-                            selector.interface.is_none_or(|i| Some(i) == dpi.interface)
-                        })
-                {
-                    // If the VID, PID, and potentially SN all match,
-                    // and the device is a valid CMSIS-DAP probe,
-                    // attempt to open the device in v2 mode.
-                    if let Some(opened) = open_v2_device(&device, device_info.interface)? {
-                        return Ok((opened, device.product_string().map(str::to_owned)));
-                    } else {
-                        #[cfg(feature = "cmsisdap_v1")]
-                        {
-                            // Otherwise, save as a potential CMSIS-DAP v1 HID device and continue.
-                            hid_device_info = Some(device_info);
-                        }
-                    }
-                }
-
-                tracing::trace!("Device did not match");
-            }
-        }
+    let usb_devices: Vec<DeviceInfo> = match nusb::list_devices().wait() {
+        Ok(devices) => devices.collect(),
         Err(e) => {
             tracing::debug!("No devices matched using nusb: {e}");
+            vec![]
         }
+    };
+
+    for device in &usb_devices {
+        tracing::trace!("Trying device {:?}", device);
+
+        if selector.matches(device)
+            && let Some(device_info) = get_cmsisdap_info(device, true).into_iter().find(|dpi| {
+                tracing::trace!("DebugProbeInfo: {:?}", dpi);
+                // Only compare if the selector has an interface to compare to
+                selector.interface.is_none_or(|i| Some(i) == dpi.interface)
+            })
+        {
+            // If the VID, PID, and potentially SN all match,
+            // and the device is a valid CMSIS-DAP probe,
+            // attempt to open the device in v2 mode.
+            if let Some(opened) = open_v2_device(device, device_info.interface)? {
+                return Ok((opened, device.product_string().map(str::to_owned)));
+            } else {
+                #[cfg(feature = "cmsisdap_v1")]
+                {
+                    // Otherwise, save as a potential CMSIS-DAP v1 HID device and continue.
+                    hid_device_info = Some(device_info);
+                }
+            }
+        }
+
+        tracing::trace!("Device did not match");
     }
 
     #[cfg(not(feature = "cmsisdap_v1"))]
     return Err(ProbeCreationError::NotFound);
 
     #[cfg(feature = "cmsisdap_v1")]
-    v1::open_device(selector, hid_device_info)
+    v1::open_device(selector, hid_device_info, &usb_devices)
 }
 
 /// We recognise cmsis dap interfaces if they have string like "CMSIS-DAP"

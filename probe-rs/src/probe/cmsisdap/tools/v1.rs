@@ -1,12 +1,13 @@
 //! CMSIS-DAP v1 probes, which use HID.
 
-use super::{is_cmsis_dap, reject_probe_by_version};
+use super::{USB_CLASS_HID, is_cmsis_dap, reject_probe_by_version};
 use crate::probe::{
     DebugProbeInfo, DebugProbeSelector, ProbeCreationError,
     cmsisdap::{CmsisDapDevice, CmsisDapFactory, commands::DEFAULT_USB_TIMEOUT},
     list::ProbeListItem,
 };
 use hidapi::HidApi;
+use nusb::DeviceInfo;
 
 /// The process-wide hidapi context.
 ///
@@ -51,6 +52,7 @@ fn with_hid_api<T>(refresh: bool, f: impl FnOnce(&HidApi) -> T) -> Option<T> {
 pub(super) fn list_hid_only_devices(
     probes: &mut Vec<ProbeListItem>,
     selector: Option<&DebugProbeSelector>,
+    usb_devices: &[DeviceInfo],
 ) {
     tracing::debug!(
         "Found {} CMSIS-DAP probes using nusb, searching HID",
@@ -59,11 +61,14 @@ pub(super) fn list_hid_only_devices(
 
     let _hid_span = tracing::debug_span!("list_hid_devices").entered();
     with_hid_api(true, |api| {
-        for info in api
+        for (device, info) in api
             .device_list()
-            .filter_map(get_cmsisdap_hid_info)
-            .filter(|info| selector.is_none_or(|s| s.matches_probe(info)))
+            .filter_map(|device| Some((device, get_cmsisdap_hid_info(device)?)))
+            .filter(|(_, info)| selector.is_none_or(|s| s.matches_probe(info)))
         {
+            if !hid_interface_qualifies(device, usb_devices) {
+                continue;
+            }
             let duplicate = probes.iter().any(|p| {
                 p.info.vendor_id == info.vendor_id
                     && p.info.product_id == info.product_id
@@ -114,6 +119,7 @@ fn get_cmsisdap_hid_info(device: &hidapi::DeviceInfo) -> Option<DebugProbeInfo> 
 pub(super) fn open_device(
     selector: &DebugProbeSelector,
     hid_device_info: Option<DebugProbeInfo>,
+    usb_devices: &[DeviceInfo],
 ) -> Result<(CmsisDapDevice, Option<String>), ProbeCreationError> {
     // If nusb failed or the device didn't support v2, try using hidapi to open in v1 mode.
     let vid = selector.vendor_id;
@@ -151,7 +157,7 @@ pub(super) fn open_device(
                     device_match &= info.interface_number() == hid_interface as i32;
                 }
 
-                device_match
+                device_match && hid_interface_qualifies(info, usb_devices)
             })
             .ok_or(ProbeCreationError::NotFound)?;
 
@@ -187,6 +193,52 @@ pub(super) fn open_device(
         }
     })
     .unwrap_or(Err(ProbeCreationError::NotFound))
+}
+
+/// Whether nusb's view of the device behind `hid` leaves `hid` a candidate CMSIS-DAP interface.
+///
+/// hidapi cannot read interface strings, so without that view the product string decides alone.
+fn hid_interface_qualifies(hid: &hidapi::DeviceInfo, usb_devices: &[DeviceInfo]) -> bool {
+    let Ok(number) = u8::try_from(hid.interface_number()) else {
+        return true;
+    };
+    let Some(device) = usb_devices.iter().find(|device| {
+        device.vendor_id() == hid.vendor_id()
+            && device.product_id() == hid.product_id()
+            && device.serial_number().unwrap_or("") == hid.serial_number().unwrap_or("")
+    }) else {
+        return true;
+    };
+    let interfaces: Vec<_> = device
+        .interfaces()
+        .map(|i| (i.interface_number(), i.class(), i.interface_string()))
+        .collect();
+    let qualifies = hid_may_be_cmsis_dap(&interfaces, number);
+    if !qualifies {
+        tracing::trace!(
+            "HID interface {number} is not named CMSIS-DAP and is not the only candidate"
+        );
+    }
+    qualifies
+}
+
+/// Whether HID interface `hid` may be the CMSIS-DAP interface of a device whose interfaces are
+/// `interfaces`, each given as its number, class and string.
+///
+/// The spec has a composite device name its CMSIS-DAP interface. A HID named anything else is
+/// taken on the product string alone only while nothing else on the device could be the probe:
+/// no second HID, and no interface named CMSIS-DAP. NXP's MCU-Link firmware, for one, has trace,
+/// power and serial-bridge HIDs and a product string that says CMSIS-DAP.
+fn hid_may_be_cmsis_dap(interfaces: &[(u8, u8, Option<&str>)], hid: u8) -> bool {
+    let Some(&(_, _, name)) = interfaces.iter().find(|(number, ..)| *number == hid) else {
+        return true;
+    };
+    match name {
+        Some(name) if !is_cmsis_dap(name) => !interfaces.iter().any(|&(number, class, name)| {
+            number != hid && (class == USB_CLASS_HID || name.is_some_and(is_cmsis_dap))
+        }),
+        _ => true,
+    }
 }
 
 /// The size of the output report in the HID interface's report descriptor.
@@ -279,7 +331,7 @@ fn hid_report_size(device: &hidapi::DeviceInfo) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::output_report_size;
+    use super::{USB_CLASS_HID, hid_may_be_cmsis_dap, output_report_size};
 
     /// A vendor-defined descriptor in the shape of TinyUSB's `TUD_HID_REPORT_DESC_GENERIC_INOUT`,
     /// with `items` inside its application collection.
@@ -336,5 +388,70 @@ mod tests {
         for (name, descriptor, expected) in cases {
             assert_eq!(output_report_size(descriptor), *expected, "{name}");
         }
+    }
+
+    const CDC: u8 = 0x02;
+    const CDC_DATA: u8 = 0x0A;
+
+    #[test]
+    fn a_hid_beside_another_hid_needs_its_own_name() {
+        // NXP's MCU-Link Pro firmware with its SWD jumper fitted.
+        let interfaces = [
+            (0, USB_CLASS_HID, Some("MCU-LINK NXP POWER")),
+            (1, CDC, Some("VCOM")),
+            (2, CDC_DATA, Some("VCOM")),
+            (3, CDC, Some("VCOM2")),
+            (4, CDC_DATA, Some("VCOM2")),
+            (5, USB_CLASS_HID, Some("LPCSIO")),
+        ];
+        assert!(!hid_may_be_cmsis_dap(&interfaces, 0));
+        assert!(!hid_may_be_cmsis_dap(&interfaces, 5));
+    }
+
+    #[test]
+    fn a_hid_beside_a_named_interface_needs_its_own_name() {
+        // NXP's MCU-Link firmware: a v2 interface and a trace HID.
+        let interfaces = [
+            (
+                0,
+                super::super::USB_CMSIS_DAP_CLASS,
+                Some("MCU-LINK (r0FB) CMSIS-DAP V3.172"),
+            ),
+            (1, USB_CLASS_HID, Some("MCU-LINK NXP TRACE")),
+            (2, CDC, Some("VCOM")),
+            (3, CDC_DATA, Some("VCOM")),
+        ];
+        assert!(!hid_may_be_cmsis_dap(&interfaces, 1));
+    }
+
+    #[test]
+    fn the_named_hid_is_taken_among_several() {
+        // The LPC-Link2's HIDs, as OpenOCD's interface-zero quirk for it lists them.
+        let interfaces = [
+            (0, USB_CLASS_HID, Some("LPC-LINK2 CMSIS-DAP V5.224")),
+            (1, CDC, None),
+            (2, CDC_DATA, None),
+            (3, USB_CLASS_HID, Some("LPCSIO")),
+            (4, USB_CLASS_HID, Some("LPC-LINK2 DATA PORT")),
+        ];
+        assert!(hid_may_be_cmsis_dap(&interfaces, 0));
+        assert!(!hid_may_be_cmsis_dap(&interfaces, 3));
+        assert!(!hid_may_be_cmsis_dap(&interfaces, 4));
+    }
+
+    #[test]
+    fn a_lone_hid_is_taken_whatever_its_name() {
+        let interfaces = [
+            (0, USB_CLASS_HID, Some("HID Interface")),
+            (1, CDC, Some("VCOM")),
+            (2, CDC_DATA, None),
+        ];
+        assert!(hid_may_be_cmsis_dap(&interfaces, 0));
+    }
+
+    #[test]
+    fn a_hid_without_a_name_is_taken() {
+        let interfaces = [(0, USB_CLASS_HID, None), (1, USB_CLASS_HID, Some("LPCSIO"))];
+        assert!(hid_may_be_cmsis_dap(&interfaces, 0));
     }
 }
