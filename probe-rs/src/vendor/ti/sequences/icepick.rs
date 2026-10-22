@@ -13,8 +13,8 @@ pub enum DefaultProtocol {
     CJtag,
     /// Standard JTAG implementation
     Jtag,
-    /// Two-pin OScan1, already activated. A TAP reset would end it, so none is sent.
-    Oscan1,
+    /// Two-pin, already activated. A TAP reset would end it, so none is sent.
+    TwoPin,
 }
 
 /// A TI ICEPick device. An ICEPick manages a JTAG device and can be used to add or
@@ -47,8 +47,8 @@ const SYSCTRL_DEFAULT: u32 = 0x80;
 /// SYSCTRL over two pins. KeepPoweredinTLR stays clear, so the Test-Logic-Reset that ends a
 /// session powers the JTAG domain down, as a pin reset would, and clears halt-in-boot
 /// (SWCU185G 6.4, 6.6). During a session nothing may reach Test-Logic-Reset anyway: it drops
-/// the target out of OScan1 whatever this bit says.
-const SYSCTRL_OSCAN1: u32 = 0;
+/// the target out of its two-pin format whatever this bit says.
+const SYSCTRL_TWO_PIN: u32 = 0;
 
 /// Run-Test/Idle clocks before a TAP the ICEPick has just selected answers. It joins only on
 /// clocks that come a few microseconds after the routing write, so the count has to cover that
@@ -100,7 +100,7 @@ impl<'a> Icepick<'a> {
 
         let mut this = Icepick { probe: chain };
 
-        if protocol == DefaultProtocol::Oscan1 {
+        if protocol == DefaultProtocol::TwoPin {
             // Only the ICEPick is on the chain, with BYPASS in IR from the activation.
             this.probe.set_chain(&[ScanChainElement {
                 name: Some("ICEPICK".to_owned()),
@@ -156,8 +156,8 @@ impl<'a> Icepick<'a> {
                 .inspect_err(|e| tracing::error!("Couldn't write IR_CONNECT: {e}"))?;
         }
 
-        let sysctrl = if protocol == DefaultProtocol::Oscan1 {
-            SYSCTRL_OSCAN1
+        let sysctrl = if protocol == DefaultProtocol::TwoPin {
+            SYSCTRL_TWO_PIN
         } else {
             SYSCTRL_DEFAULT
         };

@@ -1,8 +1,9 @@
-//! Two-pin JTAG (IEEE 1149.7 OScan1) through the mculink-cjtag firmware.
+//! Two-pin JTAG (IEEE 1149.7) through the Verge firmware.
 //!
 //! With framing on, the firmware sends every JTAG clock of `DAP_JTAG_Sequence` and
-//! `DAP_Transfer` as one OScan1 frame. Activating the format is the target's business: its debug
-//! sequence drives the pins through [`CjtagProbe::cjtag_pins`], then turns framing on.
+//! `DAP_Transfer` as one frame of the format it was turned on in. Activating the format is the
+//! target's business: its debug sequence drives the pins through [`CjtagProbe::cjtag_pins`], then
+//! turns framing on.
 //!
 //! The pins are written one `DAP_SWJ_Pins` at a time, batched in `DAP_ExecuteCommands`, rather
 //! than with `DAP_SWJ_Sequence`: that moves TMS while TCK is high, which a two-pin target reads as
@@ -16,10 +17,10 @@ use super::{
         self, RequestError, Status,
         general::execute::{PinCommand, PinProgramRequest},
         jtag::sequence::{Sequence as JtagSequence, SequenceRequest as JtagSequenceRequest},
-        vendor::{CjtagControlRequest, CjtagInfoRequest},
+        vendor::{CjtagControlRequest, CjtagInfo, CjtagInfoRequest},
     },
 };
-use crate::probe::{CjtagProbe, DebugProbeError, PinStep, Pins};
+use crate::probe::{CjtagProbe, DebugProbeError, PinStep, Pins, ScanFormat};
 
 /// TCKC is SWCLK/TCK, bit 0 of `DAP_SWJ_Pins`.
 const TCKC: u8 = 1 << 0;
@@ -30,26 +31,35 @@ const TMSC: u8 = 1 << 1;
 const MAX_SEQUENCE_CLOCKS: usize = 64;
 
 impl CmsisDap {
-    /// Whether the probe runs firmware that frames OScan1 after an activation the host drives.
-    pub(crate) fn frames_cjtag(&mut self) -> bool {
+    /// What the probe says about its cJTAG firmware, if it runs it.
+    fn cjtag_info(&mut self) -> Option<CjtagInfo> {
         match commands::send_command(&mut self.device, &CjtagInfoRequest) {
             Ok(Some(info)) => {
                 tracing::debug!("cJTAG firmware {info:?}");
-                info.frames_after_host_activation()
+                Some(info)
             }
-            Ok(None) => false,
+            Ok(None) => None,
             Err(error) => {
                 tracing::debug!("The probe does not answer the cJTAG info command: {error}");
-                false
+                None
             }
         }
     }
 
-    pub(crate) fn set_cjtag_framing(&mut self, on: bool) -> Result<(), CmsisDapError> {
-        let request = if on {
-            CjtagControlRequest::Frame
-        } else {
-            CjtagControlRequest::Off
+    /// Whether the probe runs firmware that frames OScan1 after an activation the host drives.
+    pub(crate) fn frames_cjtag(&mut self) -> bool {
+        self.cjtag_info()
+            .is_some_and(|info| info.frames_after_host_activation())
+    }
+
+    pub(crate) fn set_cjtag_framing(
+        &mut self,
+        format: Option<ScanFormat>,
+    ) -> Result<(), CmsisDapError> {
+        let request = match format {
+            None => CjtagControlRequest::Off,
+            Some(ScanFormat::OScan1) => CjtagControlRequest::Frame,
+            Some(format) => CjtagControlRequest::FrameFormat(format),
         };
         match commands::send_command(&mut self.device, &request)? {
             Status::DapOk => Ok(()),
@@ -113,11 +123,13 @@ fn pin_programs(commands: Vec<PinCommand>, budget: usize) -> Vec<Vec<PinCommand>
     programs
 }
 
-/// `DAP_JTAG_Sequence` requests that clock `tms` with TDI high, each fitting `budget` bytes.
+/// `DAP_JTAG_Sequence` requests that clock `tms` with TDI high and capture TDO, each fitting
+/// `budget` bytes.
 fn tms_requests(tms: &[bool], budget: usize) -> Result<Vec<JtagSequenceRequest>, CmsisDapError> {
     let mut requests = Vec::new();
     let mut sequences = Vec::new();
-    // The sequence count, then each sequence's info byte and TDI bytes.
+    // The sequence count, then each sequence's info byte and TDI bytes. The reply, a status and
+    // the TDO bytes, is shorter, so it fits too.
     let mut len = 1;
     for run in tms.chunk_by(|a, b| a == b) {
         for chunk in run.chunks(MAX_SEQUENCE_CLOCKS) {
@@ -128,7 +140,7 @@ fn tms_requests(tms: &[bool], budget: usize) -> Result<Vec<JtagSequenceRequest>,
                 len = 1;
             }
             let tdi = BitVec::<usize, Lsb0>::repeat(true, chunk.len());
-            sequences.push(JtagSequence::no_capture(chunk[0], &tdi)?);
+            sequences.push(JtagSequence::capture(chunk[0], &tdi)?);
             len += size;
         }
     }
@@ -147,15 +159,24 @@ impl CjtagProbe for CmsisDap {
         Ok(())
     }
 
-    fn set_oscan1_framing(&mut self, on: bool) -> Result<(), DebugProbeError> {
-        Ok(self.set_cjtag_framing(on)?)
+    fn scan_formats(&mut self) -> Result<Vec<ScanFormat>, DebugProbeError> {
+        let info = self.cjtag_info();
+        Ok([ScanFormat::OScan1, ScanFormat::OScan2]
+            .into_iter()
+            .filter(|&format| info.as_ref().is_some_and(|info| info.frames(format)))
+            .collect())
     }
 
-    fn cjtag_tms(&mut self, tms: &[bool]) -> Result<(), DebugProbeError> {
+    fn set_framing(&mut self, format: Option<ScanFormat>) -> Result<(), DebugProbeError> {
+        Ok(self.set_cjtag_framing(format)?)
+    }
+
+    fn cjtag_tms(&mut self, tms: &[bool]) -> Result<Vec<bool>, DebugProbeError> {
+        let mut tdo = Vec::with_capacity(tms.len());
         for request in tms_requests(tms, self.request_budget())? {
-            self.send_jtag_sequences(request)?;
+            tdo.extend(self.send_jtag_sequences(request)?);
         }
-        Ok(())
+        Ok(tdo)
     }
 }
 

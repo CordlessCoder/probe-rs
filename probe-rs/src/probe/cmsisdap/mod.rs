@@ -838,7 +838,7 @@ impl CmsisDap {
         // The firmware keeps framing across connections, so a session that ended without
         // turning it off would frame the activation's raw clocks.
         if used_protocol == WireProtocol::CJtag {
-            self.set_cjtag_framing(false)?;
+            self.set_cjtag_framing(None)?;
         }
 
         // If operating under JTAG, try to bring the JTAG machinery out of reset. Ignore errors
@@ -991,7 +991,7 @@ impl DebugProbe for CmsisDap {
         // Back to four-wire clocks for whoever opens the probe next. The target stays as the
         // debug sequence left it.
         if self.protocol == Some(WireProtocol::CJtag)
-            && let Err(error) = self.set_cjtag_framing(false)
+            && let Err(error) = self.set_cjtag_framing(None)
         {
             tracing::warn!("Could not turn two-pin framing off: {error}");
         }

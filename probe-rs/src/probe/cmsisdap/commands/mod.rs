@@ -696,9 +696,9 @@ pub enum CommandId {
     UartControl = 0x22,
     UartStatus = 0x23,
     UartTransfer = 0x21,
-    /// The mculink-cjtag firmware's info command.
+    /// The Verge firmware's info command.
     CjtagInfo = 0x82,
-    /// The mculink-cjtag firmware's framing control.
+    /// The Verge firmware's framing control.
     CjtagControl = 0x83,
 }
 

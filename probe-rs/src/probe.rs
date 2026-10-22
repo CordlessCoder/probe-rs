@@ -47,7 +47,7 @@ use target_serial::TargetSerial;
 
 pub use bits::BitSequence;
 pub use jtag::chain::ChainParams;
-pub use jtag::cjtag::{CjtagProbe, PinStep};
+pub use jtag::cjtag::{CjtagProbe, PinStep, ScanFormat};
 pub use jtag::{
     BitbangJtag, JtagBatch, JtagChain, JtagChainAccess, JtagChainState, JtagOp, JtagProbe, TapState,
 };
@@ -99,7 +99,7 @@ pub enum WireProtocol {
     /// JTAG is a standard which is supported by many chips independent of architecture.
     /// See [`Wikipedia`](https://en.wikipedia.org/wiki/JTAG) for more info.
     Jtag,
-    /// Compact JTAG (IEEE 1149.7): JTAG over two pins, TCKC and TMSC, in the OScan1 format.
+    /// Compact JTAG (IEEE 1149.7): JTAG over two pins, TCKC and TMSC, in an OScan format.
     ///
     /// The target's debug sequence activates the format, so only targets with such a
     /// sequence support it.

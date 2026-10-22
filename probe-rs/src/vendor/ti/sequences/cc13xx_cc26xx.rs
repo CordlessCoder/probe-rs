@@ -10,7 +10,7 @@ use crate::architecture::arm::traits::DebugPortWire;
 use crate::architecture::arm::{ArmError, dp::DpAddress};
 use crate::probe::{BitSequence, DebugProbeError, TapState, WireProtocol};
 
-use super::cjtag::{activate_oscan1, power_down};
+use super::cjtag::{activate_two_pin, power_down};
 use super::icepick::{DefaultProtocol, Icepick};
 
 /// Marker struct indicating initialization sequencing for cc13xx_cc26xx family parts.
@@ -111,10 +111,11 @@ impl ArmDebugSequence for CC13xxCC26xx {
                         command_name: "two-pin JTAG",
                     },
                 ))?;
-                activate_oscan1(probe).map_err(ArmError::Probe)?;
+                let format = activate_two_pin(probe).map_err(ArmError::Probe)?;
+                tracing::debug!("Two-pin JTAG in {format:?}");
                 no_jtag_chain(interface.try_jtag_chain())?.assume_tap_state(TapState::RunTestIdle);
 
-                let mut icepick = Icepick::new(interface, DefaultProtocol::Oscan1)?;
+                let mut icepick = Icepick::new(interface, DefaultProtocol::TwoPin)?;
                 icepick.select_tap(0, &self.name)?;
                 interface.configure_jtag(true)?;
             }
