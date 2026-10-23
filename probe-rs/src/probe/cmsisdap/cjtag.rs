@@ -1,4 +1,4 @@
-//! Two-pin JTAG (IEEE 1149.7) through the Verge firmware.
+//! Two-pin JTAG (IEEE 1149.7) through a CMSIS-DAP probe with cJTAG framing support.
 //!
 //! With framing on, the firmware sends every JTAG clock of `DAP_JTAG_Sequence` and
 //! `DAP_Transfer` as one frame of the format it was turned on in. Activating the format is the
@@ -14,10 +14,9 @@ use bitvec::prelude::*;
 use super::{
     CmsisDap, CmsisDapError,
     commands::{
-        self, RequestError, Status,
+        self,
         general::execute::{PinCommand, PinProgramRequest},
         jtag::sequence::{Sequence as JtagSequence, SequenceRequest as JtagSequenceRequest},
-        vendor::{CjtagControlRequest, CjtagInfo, CjtagInfoRequest},
     },
 };
 use crate::probe::{CjtagProbe, DebugProbeError, PinStep, Pins, ScanFormat};
@@ -31,42 +30,46 @@ const TMSC: u8 = 1 << 1;
 const MAX_SEQUENCE_CLOCKS: usize = 64;
 
 impl CmsisDap {
-    /// What the probe says about its cJTAG firmware, if it runs it.
-    fn cjtag_info(&mut self) -> Option<CjtagInfo> {
-        match commands::send_command(&mut self.device, &CjtagInfoRequest) {
-            Ok(Some(info)) => {
-                tracing::debug!("cJTAG firmware {info:?}");
-                Some(info)
-            }
-            Ok(None) => None,
-            Err(error) => {
-                tracing::debug!("The probe does not answer the cJTAG info command: {error}");
-                None
-            }
-        }
-    }
-
-    /// Whether the probe runs firmware that frames OScan1 after an activation the host drives.
     pub(crate) fn frames_cjtag(&mut self) -> bool {
-        self.cjtag_info()
-            .is_some_and(|info| info.frames_after_host_activation())
+        self.cjtag_scan_formats()
+            .is_ok_and(|formats| formats.contains(&ScanFormat::OScan1))
     }
 
     pub(crate) fn set_cjtag_framing(
         &mut self,
         format: Option<ScanFormat>,
-    ) -> Result<(), CmsisDapError> {
-        let request = match format {
-            None => CjtagControlRequest::Off,
-            Some(ScanFormat::OScan1) => CjtagControlRequest::Frame,
-            Some(format) => CjtagControlRequest::FrameFormat(format),
+    ) -> Result<(), DebugProbeError> {
+        self.cjtag_set_framing(format)
+    }
+
+    fn cjtag_scan_formats(&mut self) -> Result<Vec<ScanFormat>, DebugProbeError> {
+        let Some(extension) = self.cjtag_extension.as_mut() else {
+            return Err(DebugProbeError::NotImplemented {
+                function_name: "CMSIS-DAP cJTAG vendor extension",
+            });
         };
-        match commands::send_command(&mut self.device, &request)? {
-            Status::DapOk => Ok(()),
-            Status::DapError => Err(CmsisDapError::ErrorResponse(RequestError::CjtagControl {
-                request,
-            })),
-        }
+        let device = &mut self.device;
+        let mut send_vendor_command = |command_id: u8, payload: &[u8]| {
+            super::send_vendor_command(device, command_id, payload)
+        };
+        extension.scan_formats(&mut send_vendor_command)
+    }
+
+    fn cjtag_set_framing(&mut self, format: Option<ScanFormat>) -> Result<(), DebugProbeError> {
+        let Some(extension) = self.cjtag_extension.as_mut() else {
+            return if format.is_none() {
+                Ok(())
+            } else {
+                Err(DebugProbeError::NotImplemented {
+                    function_name: "CMSIS-DAP cJTAG vendor extension",
+                })
+            };
+        };
+        let device = &mut self.device;
+        let mut send_vendor_command = |command_id: u8, payload: &[u8]| {
+            super::send_vendor_command(device, command_id, payload)
+        };
+        extension.set_framing(format, &mut send_vendor_command)
     }
 
     /// The bytes one request's payload may take.
@@ -160,15 +163,11 @@ impl CjtagProbe for CmsisDap {
     }
 
     fn scan_formats(&mut self) -> Result<Vec<ScanFormat>, DebugProbeError> {
-        let info = self.cjtag_info();
-        Ok([ScanFormat::OScan1, ScanFormat::OScan2]
-            .into_iter()
-            .filter(|&format| info.as_ref().is_some_and(|info| info.frames(format)))
-            .collect())
+        self.cjtag_scan_formats()
     }
 
     fn set_framing(&mut self, format: Option<ScanFormat>) -> Result<(), DebugProbeError> {
-        Ok(self.set_cjtag_framing(format)?)
+        self.cjtag_set_framing(format)
     }
 
     fn cjtag_tms(&mut self, tms: &[bool]) -> Result<Vec<bool>, DebugProbeError> {

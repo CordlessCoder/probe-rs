@@ -25,7 +25,7 @@ use crate::{
     },
     probe::{
         CjtagProbe, DebugProbe, DebugProbeError, DebugProbeSelector, JtagChain, JtagChainAccess,
-        JtagChainState, ProbeFactory, ResetLine, WireProtocol,
+        JtagChainState, ProbeFactory, ResetLine, ScanFormat, WireProtocol,
         cmsisdap::{
             arm::CmsisDapTransport,
             commands::{
@@ -40,6 +40,37 @@ use crate::{
 };
 
 mod cjtag;
+
+/// Sends CMSIS-DAP vendor commands for cJTAG discovery and framing.
+pub trait CmsisDapCjtagExtension: Send {
+    /// Reports the cJTAG scan formats this probe can frame.
+    fn scan_formats(
+        &mut self,
+        send_vendor_command: &mut dyn FnMut(u8, &[u8]) -> Result<Vec<u8>, DebugProbeError>,
+    ) -> Result<Vec<ScanFormat>, DebugProbeError>;
+
+    /// Enables framing in `format`, or disables framing when `format` is `None`.
+    fn set_framing(
+        &mut self,
+        format: Option<ScanFormat>,
+        send_vendor_command: &mut dyn FnMut(u8, &[u8]) -> Result<Vec<u8>, DebugProbeError>,
+    ) -> Result<(), DebugProbeError>;
+}
+
+pub(super) fn send_vendor_command(
+    device: &mut CmsisDapDevice,
+    command_id: u8,
+    payload: &[u8],
+) -> Result<Vec<u8>, DebugProbeError> {
+    commands::send_command(
+        device,
+        &commands::VendorCommandRequest {
+            command_id,
+            payload,
+        },
+    )
+    .map_err(Into::into)
+}
 
 use commands::{
     CmsisDapDevice, Status,
@@ -168,6 +199,7 @@ pub struct CmsisDap {
     swo_active: bool,
     swo_streaming: bool,
     connected: bool,
+    cjtag_extension: Option<Box<dyn CmsisDapCjtagExtension>>,
 
     /// Speed in kHz
     speed_khz: u32,
@@ -216,6 +248,13 @@ struct ProbeInfo {
 }
 
 impl CmsisDap {
+    /// Installs the vendor-command adapter used to discover and control cJTAG framing.
+    ///
+    /// Call this before selecting [`WireProtocol::CJtag`].
+    pub fn set_cjtag_extension(&mut self, extension: Box<dyn CmsisDapCjtagExtension>) {
+        self.cjtag_extension = Some(extension);
+    }
+
     fn new_from_device(mut device: CmsisDapDevice) -> Result<Self, DebugProbeError> {
         // Discard anything left in buffer, as otherwise
         // we'll get out of sync between requests and responses.
@@ -259,6 +298,7 @@ impl CmsisDap {
             swo_active: false,
             swo_streaming: false,
             connected: false,
+            cjtag_extension: None,
             speed_khz: 1_000,
             transfer_wait_retry: 0,
             jtag_state: JtagChainState::default(),
@@ -1092,6 +1132,14 @@ impl DebugProbe for CmsisDap {
         true
     }
 
+    fn send_vendor_command(
+        &mut self,
+        command_id: u8,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, DebugProbeError> {
+        send_vendor_command(&mut self.device, command_id, payload)
+    }
+
     fn into_probe(self: Box<Self>) -> Box<dyn DebugProbe> {
         self
     }
@@ -1109,11 +1157,8 @@ impl DebugProbe for CmsisDap {
     }
 
     fn try_as_cjtag_probe_mut(&mut self) -> Option<&mut dyn CjtagProbe> {
-        if self.protocol == Some(WireProtocol::CJtag) {
-            Some(self)
-        } else {
-            None
-        }
+        (self.protocol == Some(WireProtocol::CJtag) && self.cjtag_extension.is_some())
+            .then_some(self as &mut dyn CjtagProbe)
     }
 
     fn try_as_swd_probe(self: Box<Self>) -> Result<Box<dyn SwdProbe>, Box<dyn DebugProbe>> {
@@ -1302,18 +1347,21 @@ mod tests {
         assert!(
             ignore_unknown_command(failed(SendError::CommandIdMismatch(
                 0xFF,
-                CommandId::HostStatus
+                CommandId::HostStatus as u8
             )))
             .is_ok()
         );
         assert!(
-            ignore_unknown_command(failed(SendError::CommandIdMismatch(0xFF, CommandId::Info)))
-                .is_ok()
+            ignore_unknown_command(failed(SendError::CommandIdMismatch(
+                0xFF,
+                CommandId::Info as u8
+            )))
+            .is_ok()
         );
         assert!(
             ignore_unknown_command(failed(SendError::CommandIdMismatch(
                 0x00,
-                CommandId::HostStatus
+                CommandId::HostStatus as u8
             )))
             .is_err()
         );

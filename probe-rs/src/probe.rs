@@ -735,6 +735,19 @@ impl Probe {
         self.inner.get_target_voltage()
     }
 
+    /// Send a vendor command and return its response payload.
+    ///
+    /// The command ID and payload are defined by the probe firmware. CMSIS-DAP probes accept
+    /// vendor command IDs from `0x80` through `0x9F`. The response excludes the command ID and
+    /// may include packet padding.
+    pub fn send_vendor_command(
+        &mut self,
+        command_id: u8,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, DebugProbeError> {
+        self.inner.send_vendor_command(command_id, payload)
+    }
+
     /// Try to convert the probe into a concrete probe type.
     pub fn try_into<P: DebugProbe>(&mut self) -> Option<&mut P> {
         (self.inner.as_mut() as &mut dyn Any).downcast_mut::<P>()
@@ -961,6 +974,21 @@ pub trait DebugProbe: Any + Send + fmt::Debug {
     /// if the probe doesn’t support reading the target voltage.
     fn get_target_voltage(&mut self) -> Result<Option<f32>, DebugProbeError> {
         Ok(None)
+    }
+
+    /// Send a vendor command and return its response payload.
+    ///
+    /// Probe drivers can implement the vendor command transport they support. CMSIS-DAP uses
+    /// command IDs `0x80` through `0x9F`; its response excludes the command ID and may include
+    /// packet padding.
+    fn send_vendor_command(
+        &mut self,
+        _command_id: u8,
+        _payload: &[u8],
+    ) -> Result<Vec<u8>, DebugProbeError> {
+        Err(DebugProbeError::NotImplemented {
+            function_name: "vendor commands",
+        })
     }
 }
 

@@ -6,7 +6,6 @@ pub mod swd;
 pub mod swj;
 pub mod swo;
 pub mod transfer;
-pub mod vendor;
 
 use crate::probe::cmsisdap::commands::general::info::{PacketCountCommand, PacketSizeCommand};
 use crate::probe::cmsisdap::tcp::TcpDevice;
@@ -98,8 +97,11 @@ pub enum SendError {
     /// Connecting to target failed, received: {0:x}
     ConnectResponseError(u8),
 
-    /// Command ID in response ({0:#02x}) does not match sent command ID ({1:?} - {*_1 as u8:#02x}).
-    CommandIdMismatch(u8, CommandId),
+    /// Command ID in response ({0:#02x}) does not match sent command ID ({1:#02x}).
+    CommandIdMismatch(u8, u8),
+
+    /// CMSIS-DAP vendor command IDs must be in the range 0x80 through 0x9F.
+    InvalidVendorCommandId(u8),
 
     /// String in response is not valid UTF-8.
     ///
@@ -152,11 +154,6 @@ pub enum RequestError {
     /// Failed to send the SWD sequence to the probe with the following request: {request:?}
     SwjSequence {
         request: swj::sequence::SequenceRequest,
-    },
-
-    /// The probe refused to switch two-pin framing: {request:?}
-    CjtagControl {
-        request: vendor::CjtagControlRequest,
     },
 
     /// Failed to send the JTAG sequence to the probe with the following request: {request:?}
@@ -640,7 +637,7 @@ impl CmsisDapDevice {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Status {
     DapOk = 0x00,
     DapError = 0xFF,
@@ -696,14 +693,16 @@ pub enum CommandId {
     UartControl = 0x22,
     UartStatus = 0x23,
     UartTransfer = 0x21,
-    /// The Verge firmware's info command.
-    CjtagInfo = 0x82,
-    /// The Verge firmware's framing control.
-    CjtagControl = 0x83,
+    /// Vendor-specific command base.
+    Vendor = 0x80,
 }
 
 pub(crate) trait Request {
     const COMMAND_ID: CommandId;
+
+    fn command_id(&self) -> u8 {
+        Self::COMMAND_ID as u8
+    }
 
     /// Whether the probe answers this command.
     const REPLIES: bool = true;
@@ -716,6 +715,37 @@ pub(crate) trait Request {
 
     /// Parse the response to this request from received bytes.
     fn parse_response(&self, buffer: &[u8]) -> Result<Self::Response, SendError>;
+}
+
+/// Sends an opaque CMSIS-DAP vendor command.
+pub(super) struct VendorCommandRequest<'a> {
+    pub(super) command_id: u8,
+    pub(super) payload: &'a [u8],
+}
+
+impl Request for VendorCommandRequest<'_> {
+    const COMMAND_ID: CommandId = CommandId::Vendor;
+
+    fn command_id(&self) -> u8 {
+        self.command_id
+    }
+
+    type Response = Vec<u8>;
+
+    fn to_bytes(&self, buffer: &mut [u8]) -> Result<usize, SendError> {
+        if !(0x80..=0x9F).contains(&self.command_id) {
+            return Err(SendError::InvalidVendorCommandId(self.command_id));
+        }
+        let request = buffer
+            .get_mut(..self.payload.len())
+            .ok_or(SendError::NotEnoughData)?;
+        request.copy_from_slice(self.payload);
+        Ok(self.payload.len())
+    }
+
+    fn parse_response(&self, buffer: &[u8]) -> Result<Self::Response, SendError> {
+        Ok(buffer.to_vec())
+    }
 }
 
 /// Send a request and take its reply. After a failure that can leave a reply behind, bring the
@@ -845,7 +875,7 @@ fn send_request_inner<Req: Request>(
     buffer: &mut [u8],
 ) -> Result<(), SendError> {
     // Leave byte 0 as the HID report, and write the command and request to the buffer.
-    buffer[1] = Req::COMMAND_ID as u8;
+    buffer[1] = request.command_id();
     #[cfg_attr(not(feature = "cmsisdap_v1"), allow(unused_mut))]
     let mut size = request.to_bytes(&mut buffer[2..])? + 2;
 
@@ -877,12 +907,12 @@ fn receive_response_inner<Req: Request>(
         return Err(SendError::NotEnoughData);
     }
 
-    if response_data[0] == Req::COMMAND_ID as u8 {
+    if response_data[0] == request.command_id() {
         request.parse_response(&response_data[1..])
     } else {
         Err(SendError::CommandIdMismatch(
             response_data[0],
-            Req::COMMAND_ID,
+            request.command_id(),
         ))
     }
 }
