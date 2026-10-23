@@ -5,7 +5,8 @@
 //! additions. TI's routine starts from a powered-down JTAG domain and leaves out the power-up
 //! wait the TRM requires. Here a reset escape and more wake clocks come first, so it also
 //! attaches to a target a previous session left framing, or half woken. And where the probe
-//! frames OScan2, the target's TAP.7 controller is asked whether it has it too, and switched to it.
+//! frames formats beyond OScan1, the target's TAP.7 controller is asked which it has, and switched
+//! to one they share.
 //!
 //! The adapter powers up in two-pin JScan, where TMSC is TMS on every clock. Command scans then
 //! select OScan1, and from there every JTAG clock is a frame. Between some steps the adapter's
@@ -135,20 +136,30 @@ fn cr_scan() -> Vec<bool> {
     .concat()
 }
 
-/// Whether CNFG0 (IEEE 1149.7-2022 Table 9-15) says the controller has OScan2: class T4 or T5,
-/// this revision of the standard, and the OScan3:2 pair. A read nothing drove, all ones or all
-/// zeros, says no.
-fn offers_oscan2(cnfg0: u32) -> bool {
+/// The formats beyond OScan1 the activation switches to, fewest bits for a DAP scan first, which
+/// is also the order they read fastest in on the probe firmware that frames them.
+const SWITCH_TO: [ScanFormat; 3] = [ScanFormat::OScan6, ScanFormat::OScan5, ScanFormat::OScan2];
+
+/// Whether CNFG0 (IEEE 1149.7-2022 Table 9-15) says the controller has `format`: class T4 or T5,
+/// this revision of the standard, and the OSCANS bit of the format's pair. A read nothing drove,
+/// all ones or all zeros, says no.
+fn has_format(cnfg0: u32, format: ScanFormat) -> bool {
+    let oscans = match format {
+        ScanFormat::OScan1 => return true,
+        ScanFormat::OScan2 => 22,
+        ScanFormat::OScan5 => 23,
+        ScanFormat::OScan6 => 24,
+    };
     let class = cnfg0 & 0xF;
     let revision = cnfg0 >> 4 & 0xF;
-    matches!(class, 4 | 5) && revision == 1 && cnfg0 & 1 << 22 != 0
+    matches!(class, 4 | 5) && revision == 1 && cnfg0 & 1 << oscans != 0
 }
 
 /// The clocks of a scan packet outside Shift-xR (IEEE 1149.7-2022 Table 25-1).
 fn scan_packet_clocks(format: ScanFormat) -> usize {
     match format {
-        ScanFormat::OScan1 => 3,
-        ScanFormat::OScan2 => 1,
+        ScanFormat::OScan1 | ScanFormat::OScan5 => 3,
+        ScanFormat::OScan2 | ScanFormat::OScan6 => 1,
     }
 }
 
@@ -292,15 +303,19 @@ impl<'a> Wire<'a> {
     }
 }
 
-/// Activates two-pin JTAG from any state, in OScan2 where both the probe and the target have it
-/// and in OScan1 otherwise, and returns the format. Framing is left on and the TAP in
-/// Run-Test/Idle with BYPASS in IR.
+/// Activates two-pin JTAG from any state, in the first of [`SWITCH_TO`] that both the probe and
+/// the target have and in OScan1 otherwise, and returns the format. Framing is left on and the
+/// TAP in Run-Test/Idle with BYPASS in IR.
 ///
 /// After this, the target must not reach Test-Logic-Reset until the session ends: that drops it
 /// back to JScan.
 pub(crate) fn activate_two_pin(probe: &mut dyn CjtagProbe) -> Result<ScanFormat, DebugProbeError> {
     probe.set_framing(None)?;
-    let probe_frames_oscan2 = probe.scan_formats()?.contains(&ScanFormat::OScan2);
+    let offered = probe.scan_formats()?;
+    let candidates: Vec<_> = SWITCH_TO
+        .into_iter()
+        .filter(|format| offered.contains(format))
+        .collect();
 
     let mut wire = Wire::new(probe);
     wire.escape(RESET_ESCAPE_EDGES);
@@ -316,16 +331,15 @@ pub(crate) fn activate_two_pin(probe: &mut dyn CjtagProbe) -> Result<ScanFormat,
     }
 
     // A probe that frames OScan1 alone gets TI's activation unchanged.
-    let format = if probe_frames_oscan2 {
+    let format = if candidates.is_empty() {
+        ScanFormat::OScan1
+    } else {
         let cnfg0 = wire.read_cnfg0()?;
         tracing::debug!("TAP.7 CNFG0: {cnfg0:#010x}");
-        if offers_oscan2(cnfg0) {
-            ScanFormat::OScan2
-        } else {
-            ScanFormat::OScan1
-        }
-    } else {
-        ScanFormat::OScan1
+        candidates
+            .into_iter()
+            .find(|&format| has_format(cnfg0, format))
+            .unwrap_or(ScanFormat::OScan1)
     };
     if format != ScanFormat::OScan1 {
         wire.set_format(format)?;
@@ -547,6 +561,8 @@ mod tests {
                 Adapter::OScan(match operand {
                     9 => ScanFormat::OScan1,
                     10 => ScanFormat::OScan2,
+                    13 => ScanFormat::OScan5,
+                    14 => ScanFormat::OScan6,
                     other => panic!("STFMT {other}"),
                 })
             } else {
@@ -556,10 +572,20 @@ mod tests {
             let clocks = match self.adapter {
                 Adapter::JScan if opcode == STFMT => CHECK_PACKET_CLOCKS,
                 Adapter::JScan => return,
-                Adapter::OScan(format) => scan_packet_clocks(format) + CHECK_PACKET_CLOCKS,
+                Adapter::OScan(format) => non_shift_payload_bits(format) + CHECK_PACKET_CLOCKS,
                 Adapter::Unknown => unreachable!(),
             };
             self.check_packet = Some((clocks, next, closes));
+        }
+    }
+
+    /// The bits of a scan packet outside Shift-xR, counted from IEEE 1149.7-2022 Table 25-1.
+    fn non_shift_payload_bits(format: ScanFormat) -> usize {
+        match format {
+            // nTDI, TMS and TDO.
+            ScanFormat::OScan1 | ScanFormat::OScan5 => 3,
+            // TMS.
+            ScanFormat::OScan2 | ScanFormat::OScan6 => 1,
         }
     }
 
@@ -670,6 +696,54 @@ mod tests {
     }
 
     #[test]
+    fn a_probe_without_oscan2_switches_to_oscan5() {
+        let mut target = Target::new(&[ScanFormat::OScan1, ScanFormat::OScan5], CC1312_CNFG0);
+        assert_eq!(activate(&mut target), ScanFormat::OScan5);
+        assert_eq!(
+            target.commands,
+            [
+                &TI_COMMANDS[..],
+                &[(MCM, 0), (SCNS, CNFG0), (STFMT, 13), (STMC, ECL)][..]
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn a_probe_with_only_oscan6_switches_to_it() {
+        let mut target = Target::new(&[ScanFormat::OScan1, ScanFormat::OScan6], CC1312_CNFG0);
+        assert_eq!(activate(&mut target), ScanFormat::OScan6);
+        assert_eq!(
+            target.commands,
+            [
+                &TI_COMMANDS[..],
+                &[(MCM, 0), (SCNS, CNFG0), (STFMT, 14), (STMC, ECL)][..]
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn the_formats_are_tried_in_order() {
+        let all = [
+            ScanFormat::OScan1,
+            ScanFormat::OScan2,
+            ScanFormat::OScan5,
+            ScanFormat::OScan6,
+        ];
+        let mut target = Target::new(&all, CC1312_CNFG0);
+        assert_eq!(activate(&mut target), ScanFormat::OScan6);
+
+        // A target without the OScan7:6 pair.
+        let mut target = Target::new(&all, CC1312_CNFG0 & !(1 << 24));
+        assert_eq!(activate(&mut target), ScanFormat::OScan5);
+
+        // A target with the OScan3:2 pair alone.
+        let mut target = Target::new(&all, CC1312_CNFG0 & !(1 << 24) & !(1 << 23));
+        assert_eq!(activate(&mut target), ScanFormat::OScan2);
+    }
+
+    #[test]
     fn a_read_nothing_drove_stays_in_oscan1() {
         let mut target = Target::new(&[ScanFormat::OScan1, ScanFormat::OScan2], u32::MAX);
         assert_eq!(activate(&mut target), ScanFormat::OScan1);
@@ -685,12 +759,19 @@ mod tests {
 
     #[test]
     fn cnfg0_says_which_formats_the_target_has() {
-        assert!(offers_oscan2(CC1312_CNFG0));
+        for format in SWITCH_TO {
+            assert!(has_format(CC1312_CNFG0, format));
+            // Class T3, which has no OScan formats.
+            assert!(!has_format(CC1312_CNFG0 & !0xF | 3, format));
+            assert!(!has_format(0, format));
+        }
         // OScan5:4 and OScan7:6 without OScan3:2.
-        assert!(!offers_oscan2(CC1312_CNFG0 & !(1 << 22)));
-        // Class T3, which has no OScan formats.
-        assert!(!offers_oscan2(CC1312_CNFG0 & !0xF | 3));
-        assert!(!offers_oscan2(0));
+        assert!(!has_format(CC1312_CNFG0 & !(1 << 22), ScanFormat::OScan2));
+        assert!(has_format(CC1312_CNFG0 & !(1 << 22), ScanFormat::OScan5));
+        // OScan3:2 and OScan7:6 without OScan5:4.
+        assert!(!has_format(CC1312_CNFG0 & !(1 << 23), ScanFormat::OScan5));
+        // OScan3:2 and OScan5:4 without OScan7:6.
+        assert!(!has_format(CC1312_CNFG0 & !(1 << 24), ScanFormat::OScan6));
     }
 
     #[test]

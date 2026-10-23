@@ -1,1 +1,1 @@
-`--protocol cjtag` drives a TI CC13xx or CC26xx over two pins (IEEE 1149.7), through a CMSIS-DAP probe whose firmware frames the two-pin formats. It uses OScan2 where both the probe and the target have it, and OScan1 otherwise.
+`--protocol cjtag` drives a TI CC13xx or CC26xx over two pins (IEEE 1149.7), through a CMSIS-DAP probe whose firmware frames the two-pin formats. It uses the first of OScan6, OScan5 and OScan2 that both the probe and the target have, and OScan1 otherwise.

@@ -28,6 +28,12 @@ pub enum ScanFormat {
     OScan1,
     /// TMS alone outside Shift-xR; nTDI, TMS and TDO in it.
     OScan2,
+    /// nTDI, TMS and TDO outside Shift-xR; nTDI and TDO in it, where an escape on the nTDI bit
+    /// is TMS high.
+    OScan5,
+    /// TMS alone outside Shift-xR; in it, nTDI and TDO as in OScan5, after a pad bit on entering
+    /// it.
+    OScan6,
 }
 
 impl ScanFormat {
@@ -36,6 +42,8 @@ impl ScanFormat {
         match self {
             ScanFormat::OScan1 => 9,
             ScanFormat::OScan2 => 10,
+            ScanFormat::OScan5 => 13,
+            ScanFormat::OScan6 => 14,
         }
     }
 }
