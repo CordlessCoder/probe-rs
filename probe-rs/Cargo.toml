@@ -21,12 +21,26 @@ rust-version.workspace = true
 exclude = ["tests/"]
 
 [features]
-default = ["builtin-targets", "cmsisdap_v1", "builtin-formats", "coredump"]
+default = [
+    "builtin-targets",
+    "cmsisdap_v1",
+    "hidapi-basic-udev",
+    "builtin-formats",
+    "coredump",
+]
 flate2 = ["dep:flate2"]
 
 # Enable all built in targets.
 builtin-targets = ["dep:bincode", "dep:probe-rs-target"]
 cmsisdap_v1 = ["dep:hidapi"]
+
+# CMSIS-DAP v1 probes speak HID, and on Linux hidapi needs exactly one backend chosen at
+# build time. `hidapi-basic-udev` is the default and links nothing; `hidapi-libudev` reads
+# the same devices through libudev, which enumerates several times faster but adds a shared
+# library dependency. Selecting the latter means `--no-default-features` plus the features
+# you want, since Cargo features only add.
+hidapi-basic-udev = ["hidapi?/linux-native-basic-udev"]
+hidapi-libudev = ["hidapi?/linux-native"]
 
 # Enables the bin, hex, elf image formats
 builtin-formats = ["dep:uf2-decode", "object", "flate2", "dep:ihex"]
@@ -48,7 +62,6 @@ bincode = { version = "2", features = ["serde"], optional = true }
 bitfield = "0.20.0"
 bitvec = "1"
 hidapi = { version = "2.6.4", default-features = false, features = [
-    "linux-native-basic-udev",
     "windows-native",
 ], optional = true }
 itertools = "0.15"
