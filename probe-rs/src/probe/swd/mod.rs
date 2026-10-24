@@ -166,6 +166,21 @@ pub enum SwdOp {
 pub type SwdBatch = Batch<SwdOp, DebugProbeError>;
 
 impl SwdBatch {
+    pub(crate) fn captured_result_count(&self) -> usize {
+        self.iter()
+            .filter(|(id, op)| {
+                id.should_capture()
+                    && matches!(
+                        op,
+                        SwdOp::Transfer {
+                            direction: Direction::Read,
+                            ..
+                        } | SwdOp::Pins { .. }
+                    )
+            })
+            .count()
+    }
+
     /// Schedule a read and return a handle for the captured value.
     pub fn read(&mut self, port: Port, addr: u8) -> Handle<u32> {
         self.schedule(SwdOp::Transfer {
@@ -478,7 +493,7 @@ fn run_bitbang_batch<P: BitbangSwd>(
     probe: &mut P,
     batch: &SwdBatch,
 ) -> Result<Results, BatchExecutionError<DebugProbeError>> {
-    let mut results = Results::new();
+    let mut results = Results::with_capacity(batch.captured_result_count());
     let mut run = BitbangRun::default();
 
     for (operation, (id, op)) in batch.iter().enumerate() {
@@ -565,6 +580,18 @@ mod tests {
         let _ = batch.read(Port::Dp, 0b1100);
         batch.write(Port::Dp, 0b0000, 0xDEAD_BEEF);
         assert_eq!(batch.len(), 6);
+    }
+
+    #[test]
+    fn captured_result_count_skips_writes_and_dropped_handles() {
+        let mut batch = SwdBatch::new();
+        drop(batch.read(Port::Dp, 0b0100));
+        let _read = batch.read(Port::Dp, 0b1100);
+        batch.write(Port::Ap, 0b1000, 0x1234_5678);
+        let _pins = batch.pins(Pins(0), Pins(0), Duration::ZERO);
+        batch.sequence(BitSequence::from_u64(16, 0xE24E));
+
+        assert_eq!(batch.captured_result_count(), 2);
     }
 
     #[derive(Debug)]

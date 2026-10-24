@@ -330,7 +330,7 @@ impl SwdProbe for Glasgow {
         &mut self,
         batch: &SwdBatch,
     ) -> Result<Results, BatchExecutionError<DebugProbeError>> {
-        let mut results = Results::new();
+        let mut results = Results::with_capacity(batch.captured_result_count());
 
         for (fault_operation, (id, op)) in batch.iter().enumerate() {
             let op_result: Result<(), DebugProbeError> = match op {

@@ -1,7 +1,5 @@
 //! ADIv5 transaction rules for SWD probes.
 
-use rustc_hash::FxHashSet;
-
 use super::{Direction, Port, SwdBatch, SwdOp, SwdProbe, SwdTransferError};
 use crate::probe::{
     BatchError, CommandResult, DebugProbeError, Handle, HandleId, Results, SwdSettings,
@@ -23,8 +21,12 @@ const ABORT_DAP_ABORT: u32 = 1;
 pub struct SwdPort<'p> {
     probe: &'p mut dyn SwdProbe,
     settings: SwdSettings,
-    block_read_counts: Vec<usize>,
-    block_read_handles: Vec<Vec<Handle<u32>>>,
+    block_reads: Vec<BlockRead>,
+}
+
+struct BlockRead {
+    first_result_op: usize,
+    held: Vec<Handle<u32>>,
 }
 
 /// An error from [`SwdPort`].
@@ -51,8 +53,7 @@ impl<'p> SwdPort<'p> {
         Self {
             probe,
             settings,
-            block_read_counts: Vec::new(),
-            block_read_handles: Vec::new(),
+            block_reads: Vec::new(),
         }
     }
 
@@ -65,6 +66,7 @@ impl<'p> SwdPort<'p> {
         addr: u8,
         count: usize,
     ) -> Handle<Vec<u32>> {
+        let first_op = batch.len();
         if self.probe.handles_ap_pipeline() {
             let mut held = Vec::new();
             for _ in 1..count {
@@ -72,8 +74,10 @@ impl<'p> SwdPort<'p> {
             }
             let last = batch.read(Port::Ap, addr);
 
-            self.block_read_counts.push(count);
-            self.block_read_handles.push(held);
+            self.block_reads.push(BlockRead {
+                first_result_op: first_op,
+                held,
+            });
 
             return Handle::from_parts(last.id().clone(), Box::new(decode_block_read));
         }
@@ -92,8 +96,10 @@ impl<'p> SwdPort<'p> {
         }
         let trailing = batch.read(Port::Dp, DP_RDBUFF_ADDR);
 
-        self.block_read_counts.push(count);
-        self.block_read_handles.push(held);
+        self.block_reads.push(BlockRead {
+            first_result_op: first_op + 1,
+            held,
+        });
 
         Handle::from_parts(trailing.id().clone(), Box::new(decode_block_read))
     }
@@ -121,10 +127,17 @@ impl<'p> SwdPort<'p> {
             logical,
             pipeline_handles,
             pins_handles,
-        } = expand_batch(&batch, &self.settings, self.probe.handles_ap_pipeline());
+            block_read_ranges,
+        } = expand_batch(
+            &batch,
+            &self.settings,
+            self.probe.handles_ap_pipeline(),
+            &self.block_reads,
+        );
         drop(batch);
         let mut expanded = expanded;
-        let mut collected = Results::new();
+        let expected_result_count = read_handles.iter().flatten().count() + pins_handles.len();
+        let mut collected = Results::with_capacity(expected_result_count);
         let mut idle_cycles = self.settings.num_idle_cycles_between_writes.max(1);
         let max_retries = self.settings.num_retries_after_wait;
 
@@ -137,10 +150,9 @@ impl<'p> SwdPort<'p> {
                         logical,
                         &pins_handles,
                         collected,
-                        &self.block_read_counts,
+                        &block_read_ranges,
                     );
-                    self.block_read_counts.clear();
-                    self.block_read_handles.clear();
+                    self.block_reads.clear();
                     drop(pipeline_handles);
                     return Ok(remapped);
                 }
@@ -235,6 +247,7 @@ struct ExpansionPlan {
     logical: Vec<LogicalMapping>,
     pipeline_handles: Vec<Handle<()>>,
     pins_handles: Vec<HandleId>,
+    block_read_ranges: Vec<std::ops::Range<usize>>,
 }
 
 enum LogicalMapping {
@@ -252,6 +265,7 @@ fn expand_batch(
     batch: &SwdBatch,
     settings: &SwdSettings,
     probe_handles_pipeline: bool,
+    block_reads: &[BlockRead],
 ) -> ExpansionPlan {
     let transfers: Vec<SwdOp> = batch
         .iter()
@@ -266,9 +280,20 @@ fn expand_batch(
     let mut logical_mappings = Vec::new();
     let mut pipeline_handles = Vec::new();
     let mut pins_handles = Vec::new();
+    let mut block_read_ranges = Vec::with_capacity(block_reads.len());
+    let mut block_reads = block_reads.iter().peekable();
+    let mut active_block: Option<(usize, usize)> = None;
     let mut transfer_index = 0usize;
 
-    for (handle_id, op) in batch.iter() {
+    for (op_index, (handle_id, op)) in batch.iter().enumerate() {
+        if active_block.is_none()
+            && block_reads
+                .peek()
+                .is_some_and(|block| block.first_result_op == op_index)
+        {
+            let block = block_reads.peek().expect("block read was just matched");
+            active_block = Some((read_handles.len(), block.held.len() + 1));
+        }
         let op = op.clone();
         match op {
             SwdOp::Transfer {
@@ -356,7 +381,20 @@ fn expand_batch(
                 }
             }
         }
+
+        if let Some((start, count)) = active_block
+            && read_handles.len() - start >= count
+        {
+            let range = start..read_handles.len();
+            debug_assert_eq!(range.len(), count);
+            block_read_ranges.push(range);
+            block_reads.next();
+            active_block = None;
+        }
     }
+
+    debug_assert!(active_block.is_none());
+    debug_assert!(block_reads.peek().is_none());
 
     if !expanded.is_empty() && !probe_handles_pipeline {
         expanded.idle(settings.idle_cycles_after_transfer as u32);
@@ -368,6 +406,7 @@ fn expand_batch(
         logical: logical_mappings,
         pipeline_handles,
         pins_handles,
+        block_read_ranges,
     }
 }
 
@@ -521,35 +560,24 @@ fn must_not_stall(op: &SwdOp) -> bool {
     }
 }
 
-fn block_value_indices(read_handles: &[Option<HandleId>], count: usize) -> Vec<usize> {
-    if read_handles.len() < count {
-        return Vec::new();
-    }
-    let start = read_handles.len() - count;
-    (start..read_handles.len()).collect()
-}
-
 fn remap_results(
     read_handles: Vec<Option<HandleId>>,
     logical: Vec<LogicalMapping>,
     pins_handles: &[HandleId],
     mut expanded_results: Results,
-    block_read_counts: &[usize],
+    block_read_ranges: &[std::ops::Range<usize>],
 ) -> Results {
-    let mut logical_results = Results::new();
+    let mut logical_results =
+        Results::with_capacity(pins_handles.len() + logical.len() + block_read_ranges.len());
     for handle_id in pins_handles {
         if let Some(result) = expanded_results.take_id(handle_id) {
             logical_results.push(handle_id, result);
         }
     }
     let mut expanded_read_values: Vec<Option<u32>> = vec![None; read_handles.len()];
-    let block_aggregate_ids: FxHashSet<HandleId> = block_read_counts
+    let block_aggregate_indices: Vec<usize> = block_read_ranges
         .iter()
-        .filter_map(|&count| {
-            block_value_indices(&read_handles, count)
-                .last()
-                .and_then(|&index| read_handles[index].clone())
-        })
+        .filter_map(|range| range.end.checked_sub(1))
         .collect();
 
     for (index, handle_id) in read_handles.iter().enumerate() {
@@ -568,7 +596,10 @@ fn remap_results(
                 handle_id,
                 expanded_read,
             } => {
-                if block_aggregate_ids.contains(&handle_id) {
+                if block_aggregate_indices
+                    .binary_search(&expanded_read)
+                    .is_ok()
+                {
                     continue;
                 }
                 if let Some(value) = expanded_read_values[expanded_read] {
@@ -589,9 +620,8 @@ fn remap_results(
         }
     }
 
-    for &count in block_read_counts {
-        let indices = block_value_indices(&read_handles, count);
-        let Some(&aggregate_index) = indices.last() else {
+    for range in block_read_ranges {
+        let Some(aggregate_index) = range.end.checked_sub(1) else {
             continue;
         };
         let Some(aggregate_id) = &read_handles[aggregate_index] else {
@@ -600,9 +630,9 @@ fn remap_results(
         if !aggregate_id.should_capture() {
             continue;
         }
-        let values: Vec<u32> = indices
-            .iter()
-            .filter_map(|index| expanded_read_values[*index])
+        let values: Vec<u32> = range
+            .clone()
+            .filter_map(|index| expanded_read_values[index])
             .collect();
         if !values.is_empty() {
             logical_results.push(aggregate_id, encode_block_read(&values));
@@ -960,6 +990,43 @@ mod tests {
         assert_eq!(results.take(handle).unwrap(), vec![11, 22, 33]);
 
         assert_eq!(read_ops(&probe.transfer_ops()).len(), 3);
+    }
+
+    #[test]
+    fn posting_probe_keeps_multiple_block_reads_separate() {
+        let mut probe = MockSwdProbe::new().handles_ap_pipeline();
+        probe.set_read_sequence(Port::Ap, 0b1000, vec![11, 12]);
+        probe.set_read_value(Port::Dp, DP_CTRL_ADDR, 31);
+        probe.set_read_sequence(Port::Ap, 0b1100, vec![21, 22, 23]);
+
+        let mut batch = SwdBatch::new();
+        let mut port = SwdPort::new(&mut probe, SwdSettings::default());
+        let first = port.read_ap_block(&mut batch, 0b1000, 2);
+        let between = batch.read(Port::Dp, DP_CTRL_ADDR);
+        let second = port.read_ap_block(&mut batch, 0b1100, 3);
+
+        let mut results = port.run(batch).expect("run should succeed");
+        assert_eq!(results.take(first).unwrap(), vec![11, 12]);
+        assert_eq!(results.take(between).unwrap(), 31);
+        assert_eq!(results.take(second).unwrap(), vec![21, 22, 23]);
+    }
+
+    #[test]
+    fn non_posting_probe_keeps_multiple_block_reads_separate() {
+        let mut probe = MockSwdProbe::new();
+        for value in [0, 11, 12, 0, 21, 22, 23] {
+            probe.push_response(ScriptedResponse::Ok(value));
+        }
+        push_ok(&mut probe, 1);
+
+        let mut batch = SwdBatch::new();
+        let mut port = SwdPort::new(&mut probe, SwdSettings::default());
+        let first = port.read_ap_block(&mut batch, 0b1000, 2);
+        let second = port.read_ap_block(&mut batch, 0b1000, 3);
+
+        let mut results = port.run(batch).expect("run should succeed");
+        assert_eq!(results.take(first).unwrap(), vec![11, 12]);
+        assert_eq!(results.take(second).unwrap(), vec![21, 22, 23]);
     }
 
     #[test]

@@ -412,7 +412,20 @@ impl SwdProbe for LinuxSpidevSwdProbe {
         &mut self,
         batch: &SwdBatch,
     ) -> Result<Results, BatchExecutionError<DebugProbeError>> {
-        let mut results = Results::new();
+        let result_capacity = batch
+            .iter()
+            .filter(|(id, op)| {
+                id.should_capture()
+                    && matches!(
+                        op,
+                        SwdOp::Transfer {
+                            direction: Direction::Read,
+                            ..
+                        } | SwdOp::Pins { .. }
+                    )
+            })
+            .count();
+        let mut results = Results::with_capacity(result_capacity);
 
         for (index, (id, op)) in batch.iter().enumerate() {
             let at_index = |error| (index, error);

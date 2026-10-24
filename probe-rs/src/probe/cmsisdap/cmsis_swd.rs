@@ -324,7 +324,7 @@ impl CmsisDap {
         Ok(())
     }
 
-    fn pipeline(&self) -> Pipeline<'static> {
+    fn pipeline(&self, result_capacity: usize) -> Pipeline<'static> {
         // Leave one packet buffer free. A probe with all buffers full does not take
         // `DAP_TransferAbort` before the current transfer ends.
         let depth = (self.packet_count as usize)
@@ -333,7 +333,7 @@ impl CmsisDap {
         Pipeline {
             in_flight: VecDeque::with_capacity(depth),
             depth,
-            results: Results::new(),
+            results: Results::with_capacity(result_capacity),
             failure: None,
             capture: true,
         }
@@ -649,7 +649,7 @@ impl SwdProbe for CmsisDap {
             .map(|(id, op)| (id.clone(), op.clone()))
             .collect();
         let dap_index = self.jtag_state.chain_params.index as u8;
-        let mut pipeline = self.pipeline();
+        let mut pipeline = self.pipeline(batch.captured_result_count());
 
         let mut batch_index = 0;
         while batch_index < ops.len() && pipeline.failure.is_none() {

@@ -255,7 +255,7 @@ impl Results {
     }
 
     pub(crate) fn merge_from(&mut self, other: Results) {
-        if self.0.is_empty() {
+        if self.0.is_empty() && self.0.capacity() < other.0.len() {
             self.0 = other.0;
         } else {
             self.0.extend(other.0);
@@ -582,6 +582,45 @@ mod tests {
         assert!(matches!(results.take(h0).unwrap(), CommandResult::U32(1)));
         assert!(matches!(results.take(h1).unwrap(), CommandResult::U32(2)));
         assert!(matches!(results.take(h2).unwrap(), CommandResult::U32(3)));
+    }
+
+    #[test]
+    fn results_can_be_taken_out_of_order() {
+        let mut batch = Batch::<TestOp, TestError>::new();
+        let first = batch.schedule(TestOp::A);
+        let middle = batch.schedule(TestOp::B);
+        let last = batch.schedule(TestOp::C);
+
+        let mut results = run_batch(&batch, execute_success).unwrap();
+
+        assert!(matches!(results.take(last).unwrap(), CommandResult::U32(3)));
+        assert!(matches!(
+            results.take(first).unwrap(),
+            CommandResult::U32(1)
+        ));
+        assert!(matches!(
+            results.take(middle).unwrap(),
+            CommandResult::U32(2)
+        ));
+    }
+
+    #[test]
+    fn merging_into_reserved_results_keeps_the_reservation() {
+        let mut batch = Batch::<TestOp, TestError>::new();
+        let handle = batch.schedule(TestOp::A);
+        let id = handle.id().clone();
+        let mut reserved = Results::with_capacity(8);
+        let capacity = reserved.0.capacity();
+        let mut part = Results::new();
+        part.push(&id, CommandResult::U32(1));
+
+        reserved.merge_from(part);
+
+        assert_eq!(reserved.0.capacity(), capacity);
+        assert!(matches!(
+            reserved.take(handle).unwrap(),
+            CommandResult::U32(1)
+        ));
     }
 
     #[test]

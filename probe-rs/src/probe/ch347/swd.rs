@@ -628,7 +628,7 @@ impl Ch347Device {
         &mut self,
         batch: &SwdBatch,
     ) -> Result<Results, BatchExecutionError<DebugProbeError>> {
-        let mut results = Results::new();
+        let mut results = Results::with_capacity(batch.captured_result_count());
         let mut transfers = Vec::new();
         for (index, (id, op)) in batch.iter().enumerate() {
             if let SwdOp::Transfer {
