@@ -119,6 +119,35 @@ variants:
       ir_len: 4
     - name: ICEPICK
       ir_len: 6
+- name: CC1311R3
+  cores:
+  - name: main
+    type: armv7em
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    range:
+      start: 0x0
+      end: 0x58000
+    cores:
+    - main
+    access:
+      boot: true
+  - !Ram
+    range:
+      start: 0x20000000
+      end: 0x20008000
+    cores:
+    - main
+  flash_algorithms:
+  - cc13x2-cc26x2-flash
+  jtag:
+    scan_chain:
+    - name: core0
+      ir_len: 4
+    - name: ICEPICK
+      ir_len: 6
 - name: CC1312R
   cores:
   - name: main
