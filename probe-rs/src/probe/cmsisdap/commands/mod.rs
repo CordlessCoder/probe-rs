@@ -10,7 +10,7 @@ pub mod transfer;
 use crate::probe::ProbeError;
 use crate::probe::cmsisdap::commands::general::info::{PacketCountCommand, PacketSizeCommand};
 use crate::probe::cmsisdap::tcp::TcpDevice;
-use crate::probe::usb_util::{BulkReadExt, BulkWriteExt};
+use crate::probe::usb_util::BulkReadExt;
 use nusb::{
     Endpoint,
     transfer::{Buffer, Bulk, In, Out},

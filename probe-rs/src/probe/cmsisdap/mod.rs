@@ -141,15 +141,6 @@ impl ProbeFactory for CmsisDapFactory {
         &self,
         selector: Option<&DebugProbeSelector>,
     ) -> Vec<crate::probe::list::ProbeListItem> {
-        // Overridden so that the selector reaches the enumeration rather than being applied to
-        // its result: knowing which probe is wanted is what lets the HID scan be skipped.
-        tools::list_cmsisdap_devices(selector)
-    }
-
-    fn list_probes_filtered(
-        &self,
-        selector: Option<&DebugProbeSelector>,
-    ) -> Vec<crate::probe::list::ProbeListItem> {
         // A TCP probe cannot be enumerated, so list it when the selector names one.
         if let Some(selector) = selector
             && let Some(address) = tcp_address(selector)
@@ -167,10 +158,9 @@ impl ProbeFactory for CmsisDapFactory {
                 },
             )];
         }
-        self.list_probes()
-            .into_iter()
-            .filter(|probe| selector.is_none_or(|s| s.matches_probe(&probe.info)))
-            .collect()
+        // Overridden so that the selector reaches the enumeration rather than being applied to
+        // its result: knowing which probe is wanted is what lets the HID scan be skipped.
+        tools::list_cmsisdap_devices(selector)
     }
 }
 
