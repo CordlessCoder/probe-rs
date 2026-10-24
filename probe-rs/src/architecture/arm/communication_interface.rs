@@ -117,6 +117,17 @@ pub trait ArmDebugInterface: DapAccess + SwdSequence + SwoAccess + Send {
     fn set_wire_speed(&mut self, _speed_khz: u32) -> Result<u32, ArmError> {
         Err(ArmError::NotImplemented("set_wire_speed"))
     }
+
+    /// Sends a vendor command to the probe while this interface owns it.
+    fn send_vendor_command(
+        &mut self,
+        _command_id: u8,
+        _payload: &[u8],
+    ) -> Result<Vec<u8>, DebugProbeError> {
+        Err(DebugProbeError::NotImplemented {
+            function_name: "vendor commands",
+        })
+    }
 }
 
 /// Read chip information from the ROM tables
@@ -878,6 +889,18 @@ impl ArmCommunicationInterface {
 }
 
 impl ArmDebugInterface for ArmCommunicationInterface {
+    fn send_vendor_command(
+        &mut self,
+        command_id: u8,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, DebugProbeError> {
+        let probe = self.probe.as_mut().ok_or(DebugProbeError::NotAttached)?;
+        match probe {
+            ArmProbe::Swd(probe, _) => probe.send_vendor_command(command_id, payload),
+            ArmProbe::Jtag(probe, _) => probe.send_vendor_command(command_id, payload),
+        }
+    }
+
     fn reinitialize(&mut self) -> Result<(), ArmError> {
         let current_dp = self.current_dp;
 

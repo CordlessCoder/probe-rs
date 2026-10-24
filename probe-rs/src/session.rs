@@ -1025,6 +1025,24 @@ impl Session {
         &self.target
     }
 
+    /// Send a vendor command to the probe used by this session.
+    ///
+    /// This keeps probe-specific commands available without taking the probe out of the active
+    /// session. The command ID and payload are defined by the probe firmware.
+    pub fn send_vendor_command(
+        &mut self,
+        command_id: u8,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, DebugProbeError> {
+        match &mut self.interfaces {
+            ArchitectureInterface::Arm(interface)
+            | ArchitectureInterface::ArmWithRiscv { arm: interface, .. } => {
+                interface.send_vendor_command(command_id, payload)
+            }
+            ArchitectureInterface::Jtag(probe, _) => probe.send_vendor_command(command_id, payload),
+        }
+    }
+
     /// Configure the target and probe for serial wire view (SWV) tracing.
     pub fn setup_tracing(
         &mut self,
