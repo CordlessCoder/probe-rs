@@ -1,6 +1,6 @@
 //! ADIv5 transaction rules for SWD probes.
 
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use super::{Direction, Port, SwdBatch, SwdOp, SwdProbe, SwdTransferError};
 use crate::probe::{
@@ -538,13 +538,12 @@ fn remap_results(
 ) -> Results {
     let mut logical_results = Results::new();
     for handle_id in pins_handles {
-        let handle = Handle::from_parts(handle_id.clone(), Box::new(|result| result));
-        if let Ok(result) = expanded_results.take(handle) {
+        if let Some(result) = expanded_results.take_id(handle_id) {
             logical_results.push(handle_id, result);
         }
     }
     let mut expanded_read_values: Vec<Option<u32>> = vec![None; read_handles.len()];
-    let block_aggregate_ids: HashSet<HandleId> = block_read_counts
+    let block_aggregate_ids: FxHashSet<HandleId> = block_read_counts
         .iter()
         .filter_map(|&count| {
             block_value_indices(&read_handles, count)
@@ -555,15 +554,10 @@ fn remap_results(
 
     for (index, handle_id) in read_handles.iter().enumerate() {
         if let Some(handle_id) = handle_id {
-            let handle = Handle::from_parts(
-                handle_id.clone(),
-                Box::new(|result| match result {
-                    CommandResult::U32(value) => value,
-                    _ => panic!("unexpected CommandResult variant for an SWD read"),
-                }),
-            );
-            if let Ok(value) = expanded_results.take(handle) {
-                expanded_read_values[index] = Some(value);
+            match expanded_results.take_id(handle_id) {
+                Some(CommandResult::U32(value)) => expanded_read_values[index] = Some(value),
+                Some(_) => panic!("unexpected CommandResult variant for an SWD read"),
+                None => {}
             }
         }
     }

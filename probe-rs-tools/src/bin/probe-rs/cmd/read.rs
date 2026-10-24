@@ -7,7 +7,7 @@ use probe_rs_rpc_client::{CoreInterface, RpcClient};
 use crate::CoreOptions;
 use crate::util::cli;
 use crate::util::common_options::{ProbeOptions, ReadWriteBitWidth, ReadWriteOptions};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
 #[derive(clap::ValueEnum, Clone, Copy)]
@@ -58,9 +58,10 @@ impl OutputFormat {
                 write!(dst, " ")?;
             }
 
-            for byte in window.iter().rev() {
-                write!(dst, "{byte:02x}")?;
-            }
+            let mut word = [0; 8];
+            word[..window.len()].copy_from_slice(window);
+            let digits = window.len() * 2;
+            write!(dst, "{:0digits$x}", u64::from_le_bytes(word))?;
         }
 
         writeln!(dst)?;
@@ -236,8 +237,9 @@ impl Cmd {
         width: ReadWriteBitWidth,
         format: OutputFormat,
     ) -> anyhow::Result<()> {
-        let mut file = std::fs::File::create(path)?;
+        let mut file = BufWriter::new(std::fs::File::create(path)?);
         format.write(&mut file, address, width, data)?;
+        file.flush()?;
         Ok(())
     }
 
@@ -247,8 +249,41 @@ impl Cmd {
         width: ReadWriteBitWidth,
         format: OutputFormat,
     ) -> anyhow::Result<()> {
-        let mut stdout = std::io::stdout();
+        let mut stdout = BufWriter::new(std::io::stdout().lock());
         format.write(&mut stdout, address, width, data)?;
+        stdout.flush()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn simple_hex(width: ReadWriteBitWidth) -> String {
+        let data: Vec<u8> = (1..=16).collect();
+        let mut out = Vec::new();
+        OutputFormat::write_simple_hex(&mut out, width, &data).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn words_print_most_significant_byte_first() {
+        assert_eq!(
+            simple_hex(ReadWriteBitWidth::B8),
+            "01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10\n"
+        );
+        assert_eq!(
+            simple_hex(ReadWriteBitWidth::B16),
+            "0201 0403 0605 0807 0a09 0c0b 0e0d 100f\n"
+        );
+        assert_eq!(
+            simple_hex(ReadWriteBitWidth::B32),
+            "04030201 08070605 0c0b0a09 100f0e0d\n"
+        );
+        assert_eq!(
+            simple_hex(ReadWriteBitWidth::B64),
+            "0807060504030201 100f0e0d0c0b0a09\n"
+        );
     }
 }

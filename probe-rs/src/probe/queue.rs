@@ -1,5 +1,7 @@
 use core::fmt;
-use std::{collections::HashMap, marker::PhantomData, sync::Arc};
+use std::{marker::PhantomData, sync::Arc};
+
+use rustc_hash::FxHashMap;
 
 use crate::probe::{CommandResult, DebugProbeError, JtagCommand};
 
@@ -211,7 +213,9 @@ impl<Op, E: std::error::Error + Send + Sync + 'static> Batch<Op, E> {
 
 /// The set of results returned by executing a batched command.
 #[derive(Default)]
-pub struct Results(HashMap<HandleId, CommandResult>);
+// A large read keeps one result per word, so the hasher is on its per-word path. The key is a
+// pointer, which needs no DoS-resistant hash.
+pub struct Results(FxHashMap<HandleId, CommandResult>);
 
 impl fmt::Debug for Results {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -227,7 +231,10 @@ impl Results {
 
     /// Creates a new empty result set with the given capacity.
     pub fn with_capacity(capacity: usize) -> Self {
-        Self(HashMap::with_capacity(capacity))
+        Self(FxHashMap::with_capacity_and_hasher(
+            capacity,
+            Default::default(),
+        ))
     }
 
     /// Record the result of one operation.
@@ -248,7 +255,11 @@ impl Results {
     }
 
     pub(crate) fn merge_from(&mut self, other: Results) {
-        self.0.extend(other.0);
+        if self.0.is_empty() {
+            self.0 = other.0;
+        } else {
+            self.0.extend(other.0);
+        }
         self.0.retain(|k, _| k.should_capture());
     }
 
@@ -259,6 +270,11 @@ impl Results {
             Some(result) => Ok(convert(result)),
             None => Err(Handle { id, convert }),
         }
+    }
+
+    /// Takes the result of the operation `id` names, unconverted.
+    pub(crate) fn take_id(&mut self, id: &HandleId) -> Option<CommandResult> {
+        self.0.remove(id)
     }
 }
 
