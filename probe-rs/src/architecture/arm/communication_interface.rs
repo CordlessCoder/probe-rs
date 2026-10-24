@@ -240,6 +240,15 @@ pub(crate) trait DapTransport: Send + Debug {
     /// The wire protocol of the accesses.
     fn protocol(&self) -> Option<WireProtocol>;
 
+    /// Sends a probe vendor command while the transport owns the probe.
+    fn send_vendor_command(
+        &mut self,
+        command_id: u8,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, DebugProbeError> {
+        self.probe().send_vendor_command(command_id, payload)
+    }
+
     /// The wire that the debug sequences use.
     fn wire(&mut self) -> Box<dyn DebugPortWire + '_>;
 
@@ -894,11 +903,10 @@ impl ArmDebugInterface for ArmCommunicationInterface {
         command_id: u8,
         payload: &[u8],
     ) -> Result<Vec<u8>, DebugProbeError> {
-        let probe = self.probe.as_mut().ok_or(DebugProbeError::NotAttached)?;
-        match probe {
-            ArmProbe::Swd(probe, _) => probe.send_vendor_command(command_id, payload),
-            ArmProbe::Jtag(probe, _) => probe.send_vendor_command(command_id, payload),
-        }
+        self.transport
+            .as_mut()
+            .ok_or(DebugProbeError::NotAttached)?
+            .send_vendor_command(command_id, payload)
     }
 
     fn reinitialize(&mut self) -> Result<(), ArmError> {
