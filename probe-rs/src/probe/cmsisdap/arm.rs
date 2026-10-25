@@ -12,7 +12,7 @@ use crate::{
         traits::DebugPortWire,
     },
     probe::{
-        BatchError, BitSequence, DebugProbe, DebugProbeError, JtagChain, WireProtocol,
+        BatchError, BitSequence, CjtagProbe, DebugProbe, DebugProbeError, JtagChain, WireProtocol,
         cmsisdap::{
             CmsisDap,
             commands::{
@@ -310,6 +310,10 @@ impl DebugPortWire for CmsisDapWire<'_> {
         self.0.jtag_configured = false;
         Some(JtagChain::new(self.0))
     }
+
+    fn cjtag(&mut self) -> Option<&mut dyn CjtagProbe> {
+        self.0.try_as_cjtag_probe_mut()
+    }
 }
 
 /// Runs the accesses of an ARM debug interface in the CMSIS-DAP probe firmware.
@@ -409,6 +413,8 @@ mod tests {
         ApV2Address, ArmDebugInterface, FullyQualifiedApAddress, dp::DpAddress,
         sequences::ArmDebugSequence,
     };
+    use crate::probe::ScanFormat;
+    use crate::probe::cmsisdap::CmsisDapCjtagExtension;
     use crate::probe::cmsisdap::commands::{
         CmsisDapDevice,
         fake::{FakeProbe, Reply, standard_reply},
@@ -794,6 +800,62 @@ mod tests {
         assert!(!lose_link.load(Ordering::SeqCst));
         // The line reset of the connect sequence.
         assert!(!sent(&probe, 0x12).is_empty());
+    }
+
+    /// Records whether the debug sequence got the two-pin driver.
+    #[derive(Debug)]
+    struct TwoPinSetup(Arc<AtomicBool>);
+
+    impl ArmDebugSequence for TwoPinSetup {
+        fn debug_port_setup(
+            &self,
+            interface: &mut dyn DebugPortWire,
+            _dp: DpAddress,
+        ) -> Result<(), ArmError> {
+            self.0.store(interface.cjtag().is_some(), Ordering::SeqCst);
+            interface.configure_jtag(true)
+        }
+    }
+
+    /// An extension that frames OScan1 and sends nothing.
+    #[derive(Debug)]
+    struct OScan1Framing;
+
+    impl CmsisDapCjtagExtension for OScan1Framing {
+        fn scan_formats(
+            &mut self,
+            _: &mut dyn FnMut(u8, &[u8]) -> Result<Vec<u8>, DebugProbeError>,
+        ) -> Result<Vec<ScanFormat>, DebugProbeError> {
+            Ok(vec![ScanFormat::OScan1])
+        }
+
+        fn set_framing(
+            &mut self,
+            _: Option<ScanFormat>,
+            _: &mut dyn FnMut(u8, &[u8]) -> Result<Vec<u8>, DebugProbeError>,
+        ) -> Result<(), DebugProbeError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_two_pin_attach_gives_the_debug_sequence_the_driver() {
+        let (mut dap, _probe) = firmware_dap(2, DPV2, |_| None);
+        dap.set_cjtag_extension(Box::new(OScan1Framing));
+        dap.jtag_state.expected_scan_chain = Some(vec![probe_rs_target::ScanChainElement {
+            name: None,
+            ir_len: Some(4),
+        }]);
+        DebugProbe::select_protocol(dap.as_mut(), WireProtocol::CJtag).unwrap();
+        DebugProbe::attach(dap.as_mut()).unwrap();
+
+        let driver = Arc::new(AtomicBool::new(false));
+        let mut interface = dap
+            .try_get_arm_debug_interface(Arc::new(TwoPinSetup(driver.clone())))
+            .map_err(|(_, error)| error)
+            .unwrap();
+        interface.select_debug_port(DpAddress::Default).unwrap();
+        assert!(driver.load(Ordering::SeqCst));
     }
 
     #[test]
