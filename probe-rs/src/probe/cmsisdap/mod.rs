@@ -29,7 +29,7 @@ use crate::{
         cmsisdap::{
             arm::CmsisDapTransport,
             commands::{
-                CmsisDapError, RequestError,
+                CmsisDapError, RequestError, SendError,
                 general::info::{
                     CapabilitiesCommand, PacketCountCommand, SWOTraceBufferSizeCommand,
                 },
@@ -69,7 +69,17 @@ pub(super) fn send_vendor_command(
             payload,
         },
     )
-    .map_err(Into::into)
+    .map_err(|error| match error {
+        // Firmware built from ARM's reference answers a vendor command it does not implement
+        // with `ID_DAP_Invalid` alone.
+        CmsisDapError::Send {
+            source: SendError::CommandIdMismatch(0xFF, _),
+            ..
+        } => DebugProbeError::CommandNotSupportedByProbe {
+            command_name: "vendor command",
+        },
+        error => error.into(),
+    })
 }
 
 use commands::{
@@ -1444,7 +1454,7 @@ mod tests {
 
     #[test]
     fn vendor_command_errors_report_the_requested_id() {
-        for reply in [Some(vec![0xFF]), Some(vec![0x81]), Some(vec![]), None] {
+        for reply in [Some(vec![0x81]), Some(vec![]), None] {
             let response = reply.clone();
             let probe = FakeProbe::shared(64, move |command| match command {
                 [0x8F, ..] => response.clone().map_or(Reply::None, Reply::Now),
@@ -1473,16 +1483,33 @@ mod tests {
                 None => assert!(matches!(source, SendError::Timeout)),
                 _ => unreachable!(),
             }
-            assert_eq!(
-                probe.lock().unwrap().aborts(),
-                usize::from(reply.as_deref() != Some(&[0xFF][..]))
-            );
+            assert_eq!(probe.lock().unwrap().aborts(), 1);
             assert_eq!(
                 commands::send_command(&mut dap.device, &PacketCountCommand {}).unwrap(),
                 4
             );
             assert!(probe.lock().unwrap().owes_nothing());
         }
+    }
+
+    #[test]
+    fn an_unimplemented_vendor_command_is_unsupported() {
+        let probe = FakeProbe::shared(64, |command| match command {
+            [0x8F, ..] => Reply::Now(vec![0xFF]),
+            _ => standard_reply(command, 64, 4),
+        });
+        let mut dap = CmsisDap::new_from_device(CmsisDapDevice::Fake(probe.clone())).unwrap();
+
+        assert!(matches!(
+            dap.send_vendor_command(0x8F, &[]),
+            Err(DebugProbeError::CommandNotSupportedByProbe { .. })
+        ));
+        assert_eq!(probe.lock().unwrap().aborts(), 0);
+        assert_eq!(
+            commands::send_command(&mut dap.device, &PacketCountCommand {}).unwrap(),
+            4
+        );
+        assert!(probe.lock().unwrap().owes_nothing());
     }
 
     #[test]

@@ -743,7 +743,9 @@ impl Probe {
     ///
     /// A CMSIS-DAP payload must fit in one packet, leaving one byte for the command ID.
     /// Callers must interpret the response using the vendor's protocol, including any status
-    /// bytes. Drivers without vendor command support return [`DebugProbeError::NotImplemented`].
+    /// bytes. Drivers without vendor command support return [`DebugProbeError::NotImplemented`],
+    /// and a CMSIS-DAP probe that does not implement the command returns
+    /// [`DebugProbeError::CommandNotSupportedByProbe`].
     pub fn send_vendor_command(
         &mut self,
         command_id: u8,
