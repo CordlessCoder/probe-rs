@@ -1323,10 +1323,11 @@ mod tests {
     };
     use super::commands::{Request, general::info::PacketSizeCommand};
     use super::{CapabilitiesCommand, CmsisDap, HostStatusResponse, PacketCountCommand};
+    use crate::probe::{DebugProbe, DebugProbeError};
 
     fn failed(source: SendError) -> Result<HostStatusResponse, CmsisDapError> {
         Err(CmsisDapError::Send {
-            command_id: CommandId::HostStatus,
+            command_id: CommandId::HostStatus as u8,
             source,
         })
     }
@@ -1356,6 +1357,176 @@ mod tests {
             .is_err()
         );
         assert!(ignore_unknown_command(failed(SendError::Timeout)).is_err());
+    }
+
+    #[test]
+    fn vendor_command_sends_opaque_payload_and_returns_reply_bytes() {
+        let probe = FakeProbe::shared(64, |command| match command {
+            [0x8F, 0x12, 0x34, ..] => Reply::Now(vec![0x8F, 0xA5, 0, 0]),
+            command => standard_reply(command, 64, 4),
+        });
+        let mut dap = CmsisDap::new_from_device(CmsisDapDevice::Fake(probe.clone())).unwrap();
+
+        let response = dap.send_vendor_command(0x8F, &[0x12, 0x34]).unwrap();
+
+        assert_eq!(response, [0xA5, 0, 0]);
+        assert_eq!(
+            probe.lock().unwrap().sent.last().unwrap(),
+            &[0x8F, 0x12, 0x34]
+        );
+    }
+
+    #[test]
+    fn vendor_command_rejects_ids_outside_the_cmsis_dap_range() {
+        let probe = FakeProbe::shared(64, |command| standard_reply(command, 64, 4));
+        let mut dap = CmsisDap::new_from_device(CmsisDapDevice::Fake(probe.clone())).unwrap();
+        let sent_before = probe.lock().unwrap().sent.len();
+
+        assert!(dap.send_vendor_command(0x7F, &[]).is_err());
+        assert!(dap.send_vendor_command(0xA0, &[]).is_err());
+        assert_eq!(probe.lock().unwrap().sent.len(), sent_before);
+    }
+
+    #[test]
+    fn vendor_command_accepts_both_cmsis_dap_range_boundaries() {
+        let probe = FakeProbe::shared(64, |command| match command.first() {
+            Some(0x80..=0x9F) => Reply::Now(vec![command[0], 0x5A]),
+            _ => standard_reply(command, 64, 4),
+        });
+        let mut dap = CmsisDap::new_from_device(CmsisDapDevice::Fake(probe)).unwrap();
+
+        assert_eq!(dap.send_vendor_command(0x80, &[]).unwrap(), [0x5A]);
+        assert_eq!(dap.send_vendor_command(0x9F, &[]).unwrap(), [0x5A]);
+    }
+
+    #[test]
+    fn vendor_command_rejects_oversized_payload_without_sending_or_recovering() {
+        let probe = FakeProbe::shared(64, |command| match command {
+            [0x80, ..] => Reply::Now(vec![0x80]),
+            _ => standard_reply(command, 64, 4),
+        });
+        let mut dap = CmsisDap::new_from_device(CmsisDapDevice::Fake(probe.clone())).unwrap();
+        let sent_before = probe.lock().unwrap().sent.len();
+
+        let error = dap.send_vendor_command(0x80, &[0x55; 64]).unwrap_err();
+        let DebugProbeError::ProbeSpecific(error) = error else {
+            panic!("expected a CMSIS-DAP error");
+        };
+        assert!(matches!(
+            error.downcast_ref::<CmsisDapError>(),
+            Some(CmsisDapError::Send {
+                command_id: 0x80,
+                source: SendError::VendorPayloadTooLarge {
+                    actual: 64,
+                    maximum: 63
+                },
+            })
+        ));
+        assert_eq!(probe.lock().unwrap().sent.len(), sent_before);
+
+        assert!(
+            dap.send_vendor_command(0x80, &[0x55; 63])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(probe.lock().unwrap().sent.last().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn vendor_command_errors_report_the_requested_id() {
+        for reply in [Some(vec![0xFF]), Some(vec![0x81]), Some(vec![]), None] {
+            let response = reply.clone();
+            let probe = FakeProbe::shared(64, move |command| match command {
+                [0x8F, ..] => response.clone().map_or(Reply::None, Reply::Now),
+                _ => standard_reply(command, 64, 4),
+            });
+            let mut dap = CmsisDap::new_from_device(CmsisDapDevice::Fake(probe.clone())).unwrap();
+
+            let error = dap.send_vendor_command(0x8F, &[]).unwrap_err();
+            let DebugProbeError::ProbeSpecific(error) = error else {
+                panic!("expected a CMSIS-DAP error");
+            };
+            let error = error.downcast_ref::<CmsisDapError>().unwrap();
+            let CmsisDapError::Send { command_id, source } = error else {
+                panic!("expected a command error");
+            };
+            assert_eq!(*command_id, 0x8F);
+            assert!(error.to_string().contains("0x8f"));
+            match reply.as_deref() {
+                Some([id]) => assert!(
+                    matches!(source, SendError::CommandIdMismatch(received, 0x8F) if received == id)
+                ),
+                Some([]) => assert!(matches!(source, SendError::NotEnoughData)),
+                None => assert!(matches!(source, SendError::Timeout)),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                probe.lock().unwrap().aborts(),
+                usize::from(reply.as_deref() != Some(&[0xFF][..]))
+            );
+            assert_eq!(
+                commands::send_command(&mut dap.device, &PacketCountCommand {}).unwrap(),
+                4
+            );
+            assert!(probe.lock().unwrap().owes_nothing());
+        }
+    }
+
+    #[test]
+    fn vendor_commands_mix_with_arm_wire_access_and_survive_interface_close() {
+        use crate::architecture::arm::sequences::DefaultArmSequence;
+        use crate::probe::Probe;
+
+        let probe = FakeProbe::shared(64, |command| match command {
+            [0x8F, 0x12] => Reply::Now(vec![0x8F, 0xA5]),
+            [0x02, ..] => Reply::Now(vec![0x02, 1]),
+            [id @ (0x04 | 0x11 | 0x12 | 0x13), ..] => Reply::Now(vec![*id, 0]),
+            _ => standard_reply(command, 64, 4),
+        });
+        let dap = CmsisDap::new_from_device(CmsisDapDevice::Fake(probe.clone())).unwrap();
+        let mut probe_handle = Probe::new(dap);
+        assert_eq!(
+            probe_handle.send_vendor_command(0x8F, &[0x12]).unwrap(),
+            [0xA5]
+        );
+        probe_handle.attach_to_unspecified().unwrap();
+        let mut interface = probe_handle
+            .try_into_arm_debug_interface(DefaultArmSequence::create())
+            .unwrap_or_else(|_| panic!("no ARM interface"));
+        for _ in 0..2 {
+            assert_eq!(
+                interface.send_vendor_command(0x8F, &[0x12]).unwrap(),
+                [0xA5]
+            );
+            interface
+                .swj_sequence(&crate::probe::BitSequence::repeat(true, 8))
+                .unwrap();
+        }
+        let mut probe_handle = interface.close();
+        assert_eq!(
+            probe_handle.send_vendor_command(0x8F, &[0x12]).unwrap(),
+            [0xA5]
+        );
+        assert!(probe.lock().unwrap().owes_nothing());
+    }
+
+    #[test]
+    fn vendor_commands_are_unsupported_by_default() {
+        use crate::architecture::arm::sequences::DefaultArmSequence;
+
+        let mut probe = crate::probe::fake_probe::FakeProbe::new().into_probe();
+        assert!(matches!(
+            probe.send_vendor_command(0x80, &[]),
+            Err(DebugProbeError::NotImplemented { .. })
+        ));
+        probe.attach_to_unspecified().unwrap();
+        let mut interface = probe
+            .try_into_arm_debug_interface(DefaultArmSequence::create())
+            .unwrap_or_else(|_| panic!("no ARM interface"));
+        assert!(matches!(
+            interface.send_vendor_command(0x80, &[]),
+            Err(DebugProbeError::NotImplemented { .. })
+        ));
     }
 
     #[test]

@@ -740,6 +740,10 @@ impl Probe {
     /// The command ID and payload are defined by the probe firmware. CMSIS-DAP probes accept
     /// vendor command IDs from `0x80` through `0x9F`. The response excludes the command ID and
     /// may include packet padding.
+    ///
+    /// A CMSIS-DAP payload must fit in one packet, leaving one byte for the command ID.
+    /// Callers must interpret the response using the vendor's protocol, including any status
+    /// bytes. Drivers without vendor command support return [`DebugProbeError::NotImplemented`].
     pub fn send_vendor_command(
         &mut self,
         command_id: u8,
@@ -981,6 +985,10 @@ pub trait DebugProbe: Any + Send + fmt::Debug {
     /// Probe drivers can implement the vendor command transport they support. CMSIS-DAP uses
     /// command IDs `0x80` through `0x9F`; its response excludes the command ID and may include
     /// packet padding.
+    ///
+    /// See [`Probe::send_vendor_command`] for the caller-facing contract.
+    /// Drivers with a dedicated ARM interface must also implement
+    /// [`ArmDebugInterface::send_vendor_command`] to support calls from a [`Session`].
     fn send_vendor_command(
         &mut self,
         _command_id: u8,

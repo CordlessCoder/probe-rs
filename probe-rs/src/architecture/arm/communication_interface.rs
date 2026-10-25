@@ -118,7 +118,9 @@ pub trait ArmDebugInterface: DapAccess + SwdSequence + SwoAccess + Send {
         Err(ArmError::NotImplemented("set_wire_speed"))
     }
 
-    /// Sends a vendor command to the probe while this interface owns it.
+    /// Sends a vendor command using the format of [`Probe::send_vendor_command`].
+    ///
+    /// Commands must preserve the debug interface's state for further target access.
     fn send_vendor_command(
         &mut self,
         _command_id: u8,
@@ -239,15 +241,6 @@ pub(crate) trait DapTransport: Send + Debug {
 
     /// The wire protocol of the accesses.
     fn protocol(&self) -> Option<WireProtocol>;
-
-    /// Sends a probe vendor command while the transport owns the probe.
-    fn send_vendor_command(
-        &mut self,
-        command_id: u8,
-        payload: &[u8],
-    ) -> Result<Vec<u8>, DebugProbeError> {
-        self.probe().send_vendor_command(command_id, payload)
-    }
 
     /// The wire that the debug sequences use.
     fn wire(&mut self) -> Box<dyn DebugPortWire + '_>;
@@ -903,9 +896,8 @@ impl ArmDebugInterface for ArmCommunicationInterface {
         command_id: u8,
         payload: &[u8],
     ) -> Result<Vec<u8>, DebugProbeError> {
-        self.transport
-            .as_mut()
-            .ok_or(DebugProbeError::NotAttached)?
+        self.transport()
+            .probe()
             .send_vendor_command(command_id, payload)
     }
 

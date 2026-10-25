@@ -38,11 +38,8 @@ const RESYNC_TIMEOUT: Duration = Duration::from_millis(50);
 
 #[derive(Debug, thiserror::Error, docsplay::Display)]
 pub enum CmsisDapError {
-    /// Error handling CMSIS-DAP command {command_id:?}.
-    Send {
-        command_id: CommandId,
-        source: SendError,
-    },
+    /// Error handling CMSIS-DAP command {command_id:#04x}.
+    Send { command_id: u8, source: SendError },
 
     /// CMSIS-DAP responded with an error.
     ErrorResponse(#[source] RequestError),
@@ -98,11 +95,14 @@ pub enum SendError {
     /// Connecting to target failed, received: {0:x}
     ConnectResponseError(u8),
 
-    /// Command ID in response ({0:#02x}) does not match sent command ID ({1:#02x}).
+    /// Command ID in response ({0:#04x}) does not match sent command ID ({1:#04x}).
     CommandIdMismatch(u8, u8),
 
-    /// CMSIS-DAP vendor command IDs must be in the range 0x80 through 0x9F.
+    /// CMSIS-DAP vendor command ID {0:#04x} is outside the range 0x80 through 0x9F.
     InvalidVendorCommandId(u8),
+
+    /// Vendor command payload has {actual} bytes, but the packet holds at most {maximum}.
+    VendorPayloadTooLarge { actual: usize, maximum: usize },
 
     /// String in response is not valid UTF-8.
     ///
@@ -737,10 +737,13 @@ impl Request for VendorCommandRequest<'_> {
         if !(0x80..=0x9F).contains(&self.command_id) {
             return Err(SendError::InvalidVendorCommandId(self.command_id));
         }
-        let request = buffer
-            .get_mut(..self.payload.len())
-            .ok_or(SendError::NotEnoughData)?;
-        request.copy_from_slice(self.payload);
+        if self.payload.len() > buffer.len() {
+            return Err(SendError::VendorPayloadTooLarge {
+                actual: self.payload.len(),
+                maximum: buffer.len(),
+            });
+        }
+        buffer[..self.payload.len()].copy_from_slice(self.payload);
         Ok(self.payload.len())
     }
 
@@ -770,7 +773,7 @@ pub(crate) fn send_command_once<Req: Request>(
     request: &Req,
 ) -> Result<Req::Response, CmsisDapError> {
     send_command_inner(device, request).map_err(|e| CmsisDapError::Send {
-        command_id: Req::COMMAND_ID,
+        command_id: request.command_id(),
         source: e,
     })
 }
@@ -835,7 +838,7 @@ pub(crate) fn send_request<Req: Request>(
 ) -> Result<(), CmsisDapError> {
     let mut buffer = vec![0; packet_buffer_len(device)];
     send_request_inner(device, request, &mut buffer).map_err(|e| CmsisDapError::Send {
-        command_id: Req::COMMAND_ID,
+        command_id: request.command_id(),
         source: e,
     })
 }
@@ -847,7 +850,7 @@ pub(crate) fn receive_response<Req: Request>(
 ) -> Result<Req::Response, CmsisDapError> {
     let mut buffer = vec![0; packet_buffer_len(device)];
     receive_response_inner(device, request, &mut buffer).map_err(|e| CmsisDapError::Send {
-        command_id: Req::COMMAND_ID,
+        command_id: request.command_id(),
         source: e,
     })
 }

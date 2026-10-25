@@ -1027,8 +1027,12 @@ impl Session {
 
     /// Send a vendor command to the probe used by this session.
     ///
-    /// This keeps probe-specific commands available without taking the probe out of the active
-    /// session. The command ID and payload are defined by the probe firmware.
+    /// Uses the same command and response format as [`Probe::send_vendor_command`], including
+    /// any packet padding in the returned payload. Unsupported drivers return
+    /// [`DebugProbeError::NotImplemented`].
+    ///
+    /// Commands that reset or reconfigure the debug interface can invalidate the session's
+    /// cached state. Reattach before further target access after such a command.
     pub fn send_vendor_command(
         &mut self,
         command_id: u8,
