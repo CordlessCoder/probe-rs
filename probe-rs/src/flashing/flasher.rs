@@ -959,35 +959,32 @@ impl<O: Operation> ActiveFlasher<'_, '_, O> {
 
     pub(super) fn uninit(&mut self) -> Result<(), FlashError> {
         tracing::debug!("Running uninit routine.");
-        let algo = &self.flash_algorithm;
 
-        // Skip uninit routine if not present.
-        let Some(pc_uninit) = algo.pc_uninit else {
-            return Ok(());
-        };
+        if let Some(pc_uninit) = self.flash_algorithm.pc_uninit {
+            let error_code = self
+                .call_function_and_wait(
+                    &Registers {
+                        pc: pc_uninit,
+                        r0: Some(O::OPERATION as u64),
+                        r1: None,
+                        r2: None,
+                        r3: None,
+                    },
+                    false,
+                    INIT_TIMEOUT,
+                )
+                .map_err(|error| FlashError::Uninit(Box::new(error)))?;
 
-        let error_code = self
-            .call_function_and_wait(
-                &Registers {
-                    pc: pc_uninit,
-                    r0: Some(O::OPERATION as u64),
-                    r1: None,
-                    r2: None,
-                    r3: None,
-                },
-                false,
-                INIT_TIMEOUT,
-            )
-            .map_err(|error| FlashError::Uninit(Box::new(error)))?;
-
-        if error_code != 0 {
-            return Err(FlashError::RoutineCallFailed {
-                name: "uninit".to_string(),
-                error_code,
-            });
+            if error_code != 0 {
+                return Err(FlashError::RoutineCallFailed {
+                    name: "uninit".to_string(),
+                    error_code,
+                });
+            }
         }
 
-        Ok(())
+        // The only canary read for the calls that returned success.
+        self.check_for_stack_overflow()
     }
 
     /// Checks if the flash algorithm defines a vendor-specific entry point with the given name.
@@ -1052,12 +1049,11 @@ impl<O: Operation> ActiveFlasher<'_, '_, O> {
             tracing::debug!("Routine call failed: {:?}", r);
         }
 
-        // The stack canary explains a failure rather than detecting one, and reading it costs a
-        // round trip on every call -- one in fifteen for a sector erase, and the same again for
-        // every page programmed. It is filled once when the algorithm is loaded and never
-        // rewritten, so it says just as much after the call that went wrong as it would have after
-        // each of the ones that did not. A read that fails is left alone: whatever broke the call
-        // is the more useful error.
+        // Reading the stack canary after every call costs a round trip on each sector erased and
+        // each page programmed. It is filled once when the algorithm is loaded and never
+        // rewritten, so a failed call reads it here to explain the failure, and `uninit` reads it
+        // once for the calls that succeeded. A read that fails is left alone: whatever broke the
+        // call is the more useful error.
         if !matches!(r, Ok(0))
             && let Err(overflow @ FlashError::StackOverflowDetected { .. }) =
                 self.check_for_stack_overflow()
