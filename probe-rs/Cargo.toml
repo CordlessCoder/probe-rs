@@ -34,13 +34,10 @@ flate2 = ["dep:flate2"]
 builtin-targets = ["dep:bincode", "dep:probe-rs-target"]
 cmsisdap_v1 = ["dep:hidapi"]
 
-# CMSIS-DAP v1 probes speak HID, and on Linux hidapi needs exactly one backend chosen at
-# build time. `hidapi-basic-udev` is the default and links nothing; `hidapi-libudev` reads
-# the same devices through libudev, which enumerates several times faster but adds a shared
-# library dependency. Selecting the latter means `--no-default-features` plus the features
-# you want, since Cargo features only add.
+# CMSIS-DAP v1 probes speak HID, and on Linux hidapi builds only with exactly one backend
+# selected. `hidapi-basic-udev` selects one that links nothing. An application that depends on
+# hidapi itself can turn default features off and select the backend through that dependency.
 hidapi-basic-udev = ["hidapi?/linux-native-basic-udev"]
-hidapi-libudev = ["hidapi?/linux-native"]
 
 # Enables the bin, hex, elf image formats
 builtin-formats = ["dep:uf2-decode", "object", "flate2", "dep:ihex"]

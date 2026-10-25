@@ -1,1 +1,0 @@
-A `hidapi-libudev` feature selects libudev for CMSIS-DAP v1 probe discovery on Linux, which enumerates several times faster than the default `hidapi-basic-udev` at the cost of a shared library dependency.

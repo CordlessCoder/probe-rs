@@ -1,0 +1,1 @@
+A default `hidapi-basic-udev` feature selects the Linux HID backend for CMSIS-DAP v1 probes. An application that depends on `hidapi` itself can disable it and select the backend through its own dependency.
