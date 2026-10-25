@@ -1327,9 +1327,18 @@ mod tests {
 
     fn failed(source: SendError) -> Result<HostStatusResponse, CmsisDapError> {
         Err(CmsisDapError::Send {
+            command: CommandId::HostStatus,
             command_id: CommandId::HostStatus as u8,
             source,
         })
+    }
+
+    #[test]
+    fn a_command_error_names_the_command_and_its_id() {
+        assert_eq!(
+            failed(SendError::Timeout).unwrap_err().to_string(),
+            "Error handling CMSIS-DAP command HostStatus (0x01)."
+        );
     }
 
     #[test]
@@ -1415,6 +1424,7 @@ mod tests {
         assert!(matches!(
             error.downcast_ref::<CmsisDapError>(),
             Some(CmsisDapError::Send {
+                command: CommandId::Vendor,
                 command_id: 0x80,
                 source: SendError::VendorPayloadTooLarge {
                     actual: 64,
@@ -1447,7 +1457,10 @@ mod tests {
                 panic!("expected a CMSIS-DAP error");
             };
             let error = error.downcast_ref::<CmsisDapError>().unwrap();
-            let CmsisDapError::Send { command_id, source } = error else {
+            let CmsisDapError::Send {
+                command_id, source, ..
+            } = error
+            else {
                 panic!("expected a command error");
             };
             assert_eq!(*command_id, 0x8F);

@@ -38,8 +38,12 @@ const RESYNC_TIMEOUT: Duration = Duration::from_millis(50);
 
 #[derive(Debug, thiserror::Error, docsplay::Display)]
 pub enum CmsisDapError {
-    /// Error handling CMSIS-DAP command {command_id:#04x}.
-    Send { command_id: u8, source: SendError },
+    /// Error handling CMSIS-DAP command {command:?} ({command_id:#04x}).
+    Send {
+        command: CommandId,
+        command_id: u8,
+        source: SendError,
+    },
 
     /// CMSIS-DAP responded with an error.
     ErrorResponse(#[source] RequestError),
@@ -773,6 +777,7 @@ pub(crate) fn send_command_once<Req: Request>(
     request: &Req,
 ) -> Result<Req::Response, CmsisDapError> {
     send_command_inner(device, request).map_err(|e| CmsisDapError::Send {
+        command: Req::COMMAND_ID,
         command_id: request.command_id(),
         source: e,
     })
@@ -838,6 +843,7 @@ pub(crate) fn send_request<Req: Request>(
 ) -> Result<(), CmsisDapError> {
     let mut buffer = vec![0; packet_buffer_len(device)];
     send_request_inner(device, request, &mut buffer).map_err(|e| CmsisDapError::Send {
+        command: Req::COMMAND_ID,
         command_id: request.command_id(),
         source: e,
     })
@@ -850,6 +856,7 @@ pub(crate) fn receive_response<Req: Request>(
 ) -> Result<Req::Response, CmsisDapError> {
     let mut buffer = vec![0; packet_buffer_len(device)];
     receive_response_inner(device, request, &mut buffer).map_err(|e| CmsisDapError::Send {
+        command: Req::COMMAND_ID,
         command_id: request.command_id(),
         source: e,
     })
