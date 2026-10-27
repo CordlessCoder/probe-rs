@@ -35,6 +35,13 @@ pub(crate) struct FakeProbe {
     /// Whether `DAP_TransferAbort` ends a held transfer at once. Otherwise the abort waits
     /// behind it, as on debugprobe.
     pub(crate) abort_interrupts: bool,
+    /// Whether held replies wait for `DAP_TransferAbort` however long the host waits, as for a
+    /// transfer against a target that never stops answering WAIT. Otherwise the probe finishes
+    /// while a read times out.
+    pub(crate) held_until_abort: bool,
+    /// Whether the device knows each write reaches the probe as a report of its own, as a HID
+    /// device does only when its report size came from the report descriptor.
+    pub(crate) whole_reports: bool,
     pub(crate) max_packet_size: usize,
     pub(crate) usb_timeout: Duration,
     respond: Responder,
@@ -54,6 +61,8 @@ impl FakeProbe {
             held: VecDeque::new(),
             timed_out: false,
             abort_interrupts: true,
+            held_until_abort: false,
+            whole_reports: true,
             max_packet_size,
             usb_timeout: DEFAULT_USB_TIMEOUT,
             respond: Box::new(respond),
@@ -69,7 +78,7 @@ impl FakeProbe {
             self.ready.extend(self.late.drain(..));
             self.ready.extend(self.held.drain(..));
             self.timed_out = false;
-        } else if !abort && std::mem::take(&mut self.timed_out) {
+        } else if !abort && std::mem::take(&mut self.timed_out) && !self.held_until_abort {
             // The probe finished while the host gave up on the read.
             self.late.extend(self.held.drain(..));
         }

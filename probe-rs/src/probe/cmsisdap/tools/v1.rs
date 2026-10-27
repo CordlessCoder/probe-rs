@@ -173,12 +173,13 @@ pub(super) fn open_device(
                     device_info.product_id(),
                     device_info.release_number(),
                 )?;
-                let report_size = descriptor_report_size(&device)
-                    .map_or_else(|| hid_report_size(device_info), usize::from);
+                let descriptor_size = descriptor_report_size(&device);
                 Ok((
                     CmsisDapDevice::V1 {
                         handle: device,
-                        report_size,
+                        report_size: descriptor_size
+                            .map_or_else(|| hid_report_size(device_info), usize::from),
+                        report_size_known: descriptor_size.is_some(),
                         usb_timeout: DEFAULT_USB_TIMEOUT,
                     },
                     Some(s),

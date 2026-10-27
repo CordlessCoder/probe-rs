@@ -194,6 +194,9 @@ pub enum CmsisDapDevice {
     V1 {
         handle: hidapi::HidDevice,
         report_size: usize,
+        /// Whether `report_size` came from the report descriptor. A guessed size can be smaller
+        /// than the probe's reports, which then gathers several writes into one.
+        report_size_known: bool,
         usb_timeout: Duration,
     },
 
@@ -485,6 +488,19 @@ impl CmsisDapDevice {
         }
     }
 
+    /// Whether every write reaches the probe as a report, or a packet, of its own.
+    fn writes_whole_reports(&self) -> bool {
+        match self {
+            #[cfg(feature = "cmsisdap_v1")]
+            CmsisDapDevice::V1 {
+                report_size_known, ..
+            } => *report_size_known,
+            CmsisDapDevice::V2 { .. } | CmsisDapDevice::Tcp { .. } => true,
+            #[cfg(test)]
+            CmsisDapDevice::Fake(probe) => probe.lock().unwrap().whole_reports,
+        }
+    }
+
     /// Attempt to determine the correct packet size for this device.
     ///
     /// Tries to request the CMSIS-DAP maximum packet size, allowing several
@@ -508,18 +524,28 @@ impl CmsisDapDevice {
                     return Ok(size as usize);
                 }
 
-                // Ignore timeouts and retry.
+                // The answer to an abort from a probe that runs it in order, such as debugprobe.
+                // Another abort would answer the next attempt the same way.
                 Err(CmsisDapError::Send {
-                    source: SendError::Timeout,
+                    source: SendError::CommandIdMismatch(0xFF, _),
                     ..
                 }) => (),
 
-                // A reply to a command from before this device was opened. It has now been read
-                // and the rest of the queue discarded with it, so the next attempt gets its own.
+                // No reply, or one to a command sent before this device was opened: the probe can
+                // still be running that session's transfers, against a target that keeps answering
+                // WAIT for longer than these attempts wait. The abort ends the one running. It
+                // follows every failed attempt, because a probe whose buffers the attempts have
+                // filled takes no abort.
                 Err(CmsisDapError::Send {
-                    source: SendError::CommandIdMismatch(..),
+                    source: SendError::Timeout | SendError::CommandIdMismatch(..),
                     ..
-                }) => (),
+                }) => {
+                    // A probe gathering the attempts into one report would take the abort into it
+                    // too, and leave part of a report behind.
+                    if self.writes_whole_reports() {
+                        let _ = send_request(self, &TransferAbortRequest);
+                    }
+                }
 
                 // Raise other errors.
                 Err(e) => return Err(e),

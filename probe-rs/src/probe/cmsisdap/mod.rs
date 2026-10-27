@@ -1360,7 +1360,7 @@ impl From<ScanChainError> for CmsisDapError {
 #[cfg(test)]
 mod tests {
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     };
 
@@ -1568,5 +1568,55 @@ mod tests {
         let _dap = CmsisDap::new_from_device(CmsisDapDevice::Fake(probe.clone())).unwrap();
         let usb_timeout = probe.lock().unwrap().usb_timeout;
         assert_eq!(usb_timeout, DEFAULT_USB_TIMEOUT);
+    }
+
+    #[test]
+    fn opening_ends_a_transfer_an_earlier_session_left_running() {
+        let probe = FakeProbe::shared(64, |command| match command {
+            [0x05, ..] => Reply::Held(vec![0x05, 0x01, 0x02]),
+            _ => standard_reply(command, 64, 4),
+        });
+        {
+            let mut fake = probe.lock().unwrap();
+            fake.held_until_abort = true;
+            // The last command of a host that exited, still retrying against its target.
+            fake.write(&[0x05, 0x00, 0x01, 0x06]);
+        }
+        let dap = CmsisDap::new_from_device(CmsisDapDevice::Fake(probe.clone())).unwrap();
+        assert_eq!((dap.packet_size, dap.packet_count), (64, 4));
+        assert!(probe.lock().unwrap().aborts() >= 1);
+    }
+
+    #[test]
+    fn opening_a_probe_that_answers_the_abort_in_order() {
+        let mut answered = false;
+        let probe = FakeProbe::shared(64, move |command| match command {
+            [0x00, 0xFF, ..] if !std::mem::replace(&mut answered, true) => Reply::None,
+            [0x07, ..] => Reply::Now(vec![0xFF]),
+            _ => standard_reply(command, 64, 4),
+        });
+        probe.lock().unwrap().abort_interrupts = false;
+        let dap = CmsisDap::new_from_device(CmsisDapDevice::Fake(probe.clone())).unwrap();
+        assert_eq!(dap.packet_size, 64);
+    }
+
+    #[test]
+    fn opening_leaves_no_part_of_a_report_behind() {
+        // A HID probe with 512-byte reports, written 64 bytes at a time because its report size
+        // is a guess. It answers the first command of every eight writes.
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let gathered = writes.clone();
+        let probe = FakeProbe::shared(64, move |command| {
+            let mut writes = gathered.lock().unwrap();
+            writes.push(command.to_vec());
+            match writes.len() % 8 {
+                0 => standard_reply(&writes[writes.len() - 8], 512, 4),
+                _ => Reply::None,
+            }
+        });
+        probe.lock().unwrap().whole_reports = false;
+        let mut device = CmsisDapDevice::Fake(probe.clone());
+        assert_eq!(device.find_packet_size().unwrap(), 512);
+        assert_eq!(writes.lock().unwrap().len() % 8, 0);
     }
 }
