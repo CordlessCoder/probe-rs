@@ -216,8 +216,9 @@ impl CmsisDap {
         device.drain();
 
         // Before anything else is asked of the probe. Until this returns, the size a report has to
-        // be to reach the device is a guess -- and some answer nothing at all until they receive a
-        // full one, which is what the retrying inside here is for. Anything sent before it can go
+        // be to reach the device is a guess if the HID report descriptor gave none -- and some
+        // answer nothing at all until they receive a full one, which is what the retrying inside
+        // here is for. Anything sent before it can go
         // unanswered on those probes for reasons that have nothing to do with the probe's state.
         let packet_size = device.find_packet_size()? as u16;
 
