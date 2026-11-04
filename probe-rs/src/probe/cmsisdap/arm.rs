@@ -414,12 +414,12 @@ mod tests {
         sequences::ArmDebugSequence,
     };
     use crate::probe::ScanFormat;
-    use crate::probe::cmsisdap::CmsisDapCjtagExtension;
     use crate::probe::cmsisdap::commands::{
         CmsisDapDevice,
         fake::{FakeProbe, Reply, standard_reply},
         transfer::Ack,
     };
+    use crate::probe::cmsisdap::{CmsisDapCjtagExtension, SendVendorCommand};
 
     /// A configured probe in JTAG mode. CTRL/STAT reads return `ctrl`, other reads return zero.
     fn jtag_dap(ctrl: u32) -> (CmsisDap, Arc<Mutex<FakeProbe>>) {
@@ -822,7 +822,7 @@ mod tests {
     impl CmsisDapCjtagExtension for OScan1Framing {
         fn scan_formats(
             &mut self,
-            _: &mut dyn FnMut(u8, &[u8]) -> Result<Vec<u8>, DebugProbeError>,
+            _: &mut SendVendorCommand<'_>,
         ) -> Result<Vec<ScanFormat>, DebugProbeError> {
             Ok(vec![ScanFormat::OScan1])
         }
@@ -830,7 +830,7 @@ mod tests {
         fn set_framing(
             &mut self,
             _: Option<ScanFormat>,
-            _: &mut dyn FnMut(u8, &[u8]) -> Result<Vec<u8>, DebugProbeError>,
+            _: &mut SendVendorCommand<'_>,
         ) -> Result<(), DebugProbeError> {
             Ok(())
         }
