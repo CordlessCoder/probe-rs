@@ -42,6 +42,22 @@ const SD_TAP_DEFAULT: u32 = (1 << 20) | (1 << 8) | (1 << 6) | (1 << 3);
 /// * [7] KEEPPOWEREDINTLR - Don't reset the ICEPICK in JTAG Test-Logic Reset
 const SYSCTRL_DEFAULT: u32 = 0x80;
 
+/// The AON wake-up controller's TAP, test TAP 5 (SWCU185G Table 6-5).
+const WUC_TAP: u8 = 5;
+/// Every bit of a test TAP register but [8] `SelectTAP` is reserved or read-only (SWCU185G
+/// Table 6-19), so selecting the TAP is the only write.
+const TEST_TAP_SELECT: u32 = 1 << 8;
+const WUC_IR_LEN_IN_BITS: u8 = 4;
+/// What the WUC TAP's instruction register captures, which tells it apart from a TAP whose
+/// instruction register is a different length.
+const WUC_IR_CAPTURE: u32 = 0b0001;
+/// The WUC TAP's control register (SWCU185G Table 6-23).
+const WUC_IR_CONTROL: u32 = 0x01;
+const WUC_DR_LEN_IN_BITS: usize = 8;
+/// `SYS_RESET_REQ`, alone. The control register's bit 1 is `CHIP_ERASE_REQ`, so no other bit may
+/// ever be set here.
+const WUC_SYS_RESET_REQ: u8 = 1 << 7;
+
 /// Run-Test/Idle clocks after selecting a secondary TAP. The TAP joins the scan chain on these
 /// clocks, and a run of only a few leaves it unable to answer.
 const JOIN_IDLE_CLOCKS: u32 = 64;
@@ -53,6 +69,8 @@ enum IcepickRoutingRegister {
     Sysctrl = 1,
     /// Modify parameters of a specific Secondary Tap
     SdTap(u8),
+    /// Select a test TAP
+    StTap(u8),
 }
 
 impl IcepickRoutingRegister {
@@ -72,6 +90,7 @@ impl From<IcepickRoutingRegister> for u32 {
         match value {
             IcepickRoutingRegister::Sysctrl => 1u32,
             IcepickRoutingRegister::SdTap(tap) => 0b010_0000 | tap as u32,
+            IcepickRoutingRegister::StTap(tap) => 0b001_0000 | tap as u32,
         }
     }
 }
@@ -178,8 +197,12 @@ impl<'a> Icepick<'a> {
     /// The TAP joins the scan chain at the next Run-Test/Idle, and only if the TAP controller
     /// stays there for a run of clocks. From then on every scan needs a TAP more of padding, so
     /// the ICEPick's BYPASS instruction goes out first, while the chain is still short.
-    fn select_secondary_tap(&mut self, tap: u8, payload: u32) -> Result<(), ArmError> {
-        let dr = IcepickRoutingRegister::SdTap(tap).write(payload);
+    fn select_secondary_tap(
+        &mut self,
+        register: IcepickRoutingRegister,
+        payload: u32,
+    ) -> Result<(), ArmError> {
+        let dr = register.write(payload);
 
         let mut batch = JtagBatch::new();
         let router = BitSequence::from_bytes(&IR_ROUTER.to_le_bytes(), IR_LEN_IN_BITS as usize);
@@ -243,7 +266,7 @@ impl<'a> Icepick<'a> {
     /// A few things were removed to fit the cc13xx_cc26xx family.
     pub(crate) fn select_tap(&mut self, secondary_tap: u8, tap_name: &str) -> Result<(), ArmError> {
         tracing::trace!("Selecting secondary tap {secondary_tap}");
-        self.select_secondary_tap(secondary_tap, SD_TAP_DEFAULT)?;
+        self.select_secondary_tap(IcepickRoutingRegister::SdTap(secondary_tap), SD_TAP_DEFAULT)?;
 
         // The secondary TAP now sits in front of the ICEPick, so every later scan needs a
         // different amount of padding. Measuring the chain means entering Test-Logic-Reset,
@@ -264,6 +287,81 @@ impl<'a> Icepick<'a> {
         // CMSIS-DAP, and a target's YAML may list the ICEPick alone.
         self.probe.set_expected(&chain);
 
+        Ok(())
+    }
+
+    /// Resets the whole chip through the WUC TAP, which keeps the debug enable through the reset,
+    /// so the boot ROM halts in boot afterwards (SWCU185G 6.8). Leaves the WUC TAP in the scan
+    /// chain, so the caller reconnects afterwards.
+    ///
+    /// Fails without sending the reset unless the instruction capture and the data path length are
+    /// the WUC TAP's: a reset value shifted into another register could request a chip erase.
+    pub(crate) fn reset_through_wuc(&mut self) -> Result<(), ArmError> {
+        self.select_secondary_tap(IcepickRoutingRegister::StTap(WUC_TAP), TEST_TAP_SELECT)?;
+        let chain = [
+            ScanChainElement {
+                name: Some("WUC".to_owned()),
+                ir_len: Some(WUC_IR_LEN_IN_BITS),
+            },
+            ScanChainElement {
+                name: Some("ICEPICK".to_owned()),
+                ir_len: Some(IR_LEN_IN_BITS),
+            },
+        ];
+        self.probe.set_chain(&chain);
+        self.probe.select(0).map_err(ArmError::Probe)?;
+
+        // All ones is BYPASS whatever the instruction register's length, so this scan only reads.
+        let params = self.probe.params();
+        let ir_bits = params.irpre + WUC_IR_LEN_IN_BITS as usize + params.irpost;
+        let mut batch = JtagBatch::new();
+        batch.enter(TapState::ShiftIr);
+        let capture = batch.exchange(BitSequence::repeat(true, ir_bits));
+        self.probe.run_test_idle(&mut batch, 0);
+        let mut results = self.probe.run(batch).map_err(ArmError::Probe)?;
+        let captured = results
+            .take(capture)
+            .map_err(|_| ArmError::Probe(DebugProbeError::Other("missing IR capture".into())))?;
+        let captured =
+            captured.as_bits()[params.irpre..][..WUC_IR_LEN_IN_BITS as usize].load_le::<u32>();
+        if captured != WUC_IR_CAPTURE {
+            return Err(ArmError::Probe(DebugProbeError::Other(format!(
+                "The WUC TAP captured {captured:#06b} instead of {WUC_IR_CAPTURE:#06b}"
+            ))));
+        }
+
+        // A data path of another length would move the reset bit onto another one, bit 1
+        // included. So measure it first: one 1, then zeros until it has left the path. BYPASS
+        // captures 0, so the last 1 on TDO is that bit, and the register latches all zeros,
+        // which requests nothing.
+        let path = params.drpre + WUC_DR_LEN_IN_BITS + params.drpost;
+        let mut probe_bits = BitSequence::repeat(true, 1);
+        probe_bits.extend(&BitSequence::repeat(false, path + WUC_DR_LEN_IN_BITS + 8));
+        let mut batch = JtagBatch::new();
+        let control =
+            BitSequence::from_bytes(&WUC_IR_CONTROL.to_le_bytes(), WUC_IR_LEN_IN_BITS as usize);
+        self.probe.shift_ir(&mut batch, &control);
+        batch.enter(TapState::ShiftDr);
+        let shifted = batch.exchange(probe_bits);
+        self.probe.run_test_idle(&mut batch, 0);
+        let mut results = self.probe.run(batch).map_err(ArmError::Probe)?;
+        let shifted = results
+            .take(shifted)
+            .map_err(|_| ArmError::Probe(DebugProbeError::Other("missing DR capture".into())))?;
+        let measured = shifted.as_bits().last_one();
+        if measured != Some(path) {
+            return Err(ArmError::Probe(DebugProbeError::Other(format!(
+                "The WUC TAP's data path measured {measured:?} bits instead of {path}"
+            ))));
+        }
+
+        let mut batch = JtagBatch::new();
+        self.probe.exchange_dr(
+            &mut batch,
+            &BitSequence::from_bytes(&[WUC_SYS_RESET_REQ], 8),
+        );
+        self.probe.run_test_idle(&mut batch, 0);
+        self.probe.run(batch).map_err(ArmError::Probe)?;
         Ok(())
     }
 }

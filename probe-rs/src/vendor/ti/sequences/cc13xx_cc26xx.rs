@@ -4,11 +4,15 @@ use std::time::Duration;
 
 use crate::MemoryMappedRegister;
 use crate::architecture::arm::armv7m::{Demcr, Dhcsr};
+use crate::architecture::arm::communication_interface::probe_debug_port_wire;
 use crate::architecture::arm::memory::ArmMemoryInterface;
 use crate::architecture::arm::sequences::{ArmDebugSequence, ArmDebugSequenceError};
 use crate::architecture::arm::traits::DebugPortWire;
-use crate::architecture::arm::{ArmError, dp::DpAddress};
-use crate::probe::{BitSequence, WireProtocol};
+use crate::architecture::arm::{
+    ArmDebugInterface, ArmError, FullyQualifiedApAddress, dp::DpAddress,
+};
+use crate::probe::{BitSequence, DebugProbeError, WireProtocol};
+use probe_rs_target::CoreType;
 
 use super::icepick::{DefaultProtocol, Icepick};
 
@@ -58,7 +62,78 @@ fn reset_chip(chip: &str, probe: &mut dyn ArmMemoryInterface) {
     }
 }
 
+impl CC13xxCC26xx {
+    /// The core type, from the family digit of the part name, as [`reset_chip`] reads it.
+    fn core_type(&self) -> CoreType {
+        match self.name.chars().nth(5) {
+            Some('0') => CoreType::Armv7m,
+            Some('4') => CoreType::Armv8m,
+            _ => CoreType::Armv7em,
+        }
+    }
+
+    /// Whether test TAP 5 is the WUC TAP that [`Icepick::reset_through_wuc`] writes. On CC13x4 and
+    /// CC26x4 it is AON_PMCTL, whose registers are not documented (SWCU194 Table 6-4).
+    fn has_wuc_tap(&self) -> bool {
+        matches!(self.name.chars().nth(5), Some('0' | '1' | '2'))
+    }
+}
+
+fn halt(probe: &mut dyn ArmMemoryInterface) -> Result<(), ArmError> {
+    // TODO! Find a way to call the armv7m::halt function instead
+    let mut value = Dhcsr(0);
+    value.set_c_halt(true);
+    value.set_c_debugen(true);
+    value.enable_write();
+
+    probe.write_word_32(Dhcsr::get_mmio_address(), value.into())
+}
+
 impl ArmDebugSequence for CC13xxCC26xx {
+    /// Asserts nothing. A pin reset turns the JTAG power domain off (SWCU185G 6.4), so nothing
+    /// can attach while the pin is held. [`Self::reset_hardware_deassert`] resets the chip instead.
+    fn reset_hardware_assert(&self, _interface: &mut dyn DebugPortWire) -> Result<(), ArmError> {
+        Ok(())
+    }
+
+    /// Resets the chip and halts the core before any application code runs.
+    ///
+    /// The attach powered the JTAG domain up, which sets Halt In Boot: after any reset other than
+    /// a pin reset or power-on, the boot ROM waits for the debugger before it starts the
+    /// application (SWCU185G 6.4, 6.6). The reset goes through the CPU's access port, or, on parts
+    /// with a WUC TAP, through that TAP when the port does not answer.
+    fn reset_hardware_deassert(
+        &self,
+        interface: &mut dyn ArmDebugInterface,
+        default_ap: &FullyQualifiedApAddress,
+    ) -> Result<(), ArmError> {
+        let core_type = self.core_type();
+        let reset = interface
+            .memory_interface(default_ap)
+            .and_then(|mut memory| self.reset_system(&mut *memory, core_type, None));
+        let Err(error) = reset else {
+            return Ok(());
+        };
+        if !self.has_wuc_tap() {
+            return Err(error);
+        }
+        tracing::warn!("Unable to reset through the CPU's access port, using the WUC TAP: {error}");
+
+        let driver = interface.driver_mut().ok_or(ArmError::Probe(
+            DebugProbeError::InterfaceNotAvailable {
+                interface_name: "JTAG",
+            },
+        ))?;
+        probe_debug_port_wire(driver, |wire| {
+            Icepick::new(wire, DefaultProtocol::CJtag)?.reset_through_wuc()
+        })?;
+
+        std::thread::sleep(Duration::from_millis(1));
+        interface.reinitialize()?;
+        self.debug_core_start(interface, default_ap, core_type, None, None)?;
+        halt(&mut *interface.memory_interface(default_ap)?)
+    }
+
     fn reset_system(
         &self,
         probe: &mut dyn ArmMemoryInterface,
@@ -86,13 +161,7 @@ impl ArmDebugSequence for CC13xxCC26xx {
         self.debug_core_start(interface, &ap, core_type, None, None)?;
 
         if demcr.vc_corereset() {
-            // TODO! Find a way to call the armv7m::halt function instead
-            let mut value = Dhcsr(0);
-            value.set_c_halt(true);
-            value.set_c_debugen(true);
-            value.enable_write();
-
-            probe.write_word_32(Dhcsr::get_mmio_address(), value.into())?;
+            halt(probe)?;
         }
 
         Ok(())
