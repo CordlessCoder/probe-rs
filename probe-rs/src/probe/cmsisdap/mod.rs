@@ -1,10 +1,12 @@
 //! CMSIS-DAP probe implementation.
 mod arm;
+mod cjtag;
 mod cmsis_swd;
 mod commands;
 mod tcp;
 mod tools;
 
+pub use cjtag::ScanFormat;
 pub use commands::VendorCommandId;
 
 use crate::{
@@ -195,6 +197,8 @@ pub struct CmsisDap {
 
     /// The last value written to DP SELECT. Its DP bank decides what DP address 0x4 reaches.
     dp_select: u32,
+
+    cjtag: cjtag::Cjtag,
 }
 
 impl std::fmt::Debug for CmsisDap {
@@ -278,6 +282,7 @@ impl CmsisDap {
             reset_line: ResetLine::default(),
             jtag_configured: false,
             dp_select: 0,
+            cjtag: cjtag::Cjtag::new(),
         })
     }
 
@@ -553,6 +558,17 @@ impl CmsisDap {
         &mut self,
         request: JtagSequenceRequest,
     ) -> Result<BitVec, CmsisDapError> {
+        if self.cjtag.is_active() {
+            self.cjtag_sequences(request)
+        } else {
+            self.send_jtag_sequences_unwatched(request)
+        }
+    }
+
+    fn send_jtag_sequences_unwatched(
+        &mut self,
+        request: JtagSequenceRequest,
+    ) -> Result<BitVec, CmsisDapError> {
         commands::send_command(&mut self.device, &request).and_then(|v| match v {
             JtagSequenceResponse(Status::DapOk, tdo) => Ok(tdo),
             JtagSequenceResponse(Status::DapError, _) => {
@@ -624,7 +640,7 @@ impl CmsisDap {
     }
 
     fn write_abort(&mut self, abort: Abort) -> Result<(), ArmError> {
-        if self.protocol == Some(WireProtocol::Jtag) {
+        if self.protocol.is_some_and(WireProtocol::is_jtag) {
             // A JTAG-DP has only DAPABORT, and clears its sticky flags through CTRL/STAT. The
             // abort goes first, because CTRL/STAT answers WAIT while an AP transaction is stuck.
             let value = u32::from(abort);
@@ -819,6 +835,8 @@ impl CmsisDap {
             return Ok(());
         }
 
+        let cjtag = self.protocol == Some(WireProtocol::CJtag);
+
         let protocol: ConnectRequest = if let Some(protocol) = self.protocol {
             match protocol {
                 WireProtocol::Swd => ConnectRequest::Swd,
@@ -828,18 +846,26 @@ impl CmsisDap {
             ConnectRequest::DefaultPort
         };
 
-        let used_protocol =
-            commands::send_command(&mut self.device, &protocol).and_then(|v| match v {
-                ConnectResponse::SuccessfulInitForSWD => Ok(WireProtocol::Swd),
-                ConnectResponse::SuccessfulInitForJTAG => Ok(WireProtocol::Jtag),
-                ConnectResponse::InitFailed => {
-                    Err(CmsisDapError::ErrorResponse(RequestError::InitFailed {
-                        protocol: self.protocol,
-                    }))
-                }
-            })?;
+        let response = if cjtag {
+            self.cjtag_connect()
+        } else {
+            commands::send_command(&mut self.device, &protocol)
+        };
+        let used_protocol = response.and_then(|v| match v {
+            ConnectResponse::SuccessfulInitForSWD => Ok(WireProtocol::Swd),
+            ConnectResponse::SuccessfulInitForJTAG => Ok(WireProtocol::Jtag),
+            ConnectResponse::InitFailed => {
+                Err(CmsisDapError::ErrorResponse(RequestError::InitFailed {
+                    protocol: self.protocol,
+                }))
+            }
+        })?;
 
         // Store the actually used protocol, to handle cases where the default protocol is used.
+        let used_protocol = match used_protocol {
+            WireProtocol::Jtag if cjtag => WireProtocol::CJtag,
+            protocol => protocol,
+        };
         tracing::info!("Using protocol {}", used_protocol);
         self.protocol = Some(used_protocol);
 
@@ -854,6 +880,10 @@ impl CmsisDap {
         }
         self.connected = true;
         self.jtag_configured = false;
+
+        if cjtag {
+            self.cjtag_after_connect()?;
+        }
 
         Ok(())
     }
@@ -1002,7 +1032,7 @@ impl DebugProbe for CmsisDap {
             match_retry: 0,
         })?;
 
-        if self.active_protocol() == Some(WireProtocol::Jtag) {
+        if self.active_protocol().is_some_and(WireProtocol::is_jtag) {
             // no-op: we configure JTAG in debug_port_setup,
             // because that is where we execute the SWJ-DP Switch Sequence
             // to ensure the debug port is ready for JTAG signals,
@@ -1025,6 +1055,8 @@ impl DebugProbe for CmsisDap {
             self.disable_swo()?;
         }
 
+        self.cjtag_before_disconnect()
+            .map_err(DebugProbeError::from)?;
         let response = commands::send_command(&mut self.device, &DisconnectRequest {})
             .map_err(DebugProbeError::from)?;
 
@@ -1034,6 +1066,7 @@ impl DebugProbe for CmsisDap {
 
         self.connected = false;
         self.jtag_configured = false;
+        self.cjtag_disconnected();
 
         match response {
             DisconnectResponse(Status::DapOk) => Ok(()),
@@ -1052,6 +1085,10 @@ impl DebugProbe for CmsisDap {
             }
             WireProtocol::Swd if self.capabilities.swd_implemented => {
                 self.protocol = Some(WireProtocol::Swd);
+                Ok(())
+            }
+            WireProtocol::CJtag if self.capabilities.jtag_implemented && self.has_cjtag() => {
+                self.protocol = Some(WireProtocol::CJtag);
                 Ok(())
             }
             _ => Err(DebugProbeError::UnsupportedProtocol(protocol)),
@@ -1135,7 +1172,7 @@ impl DebugProbe for CmsisDap {
 
     fn try_as_swd_probe(self: Box<Self>) -> Result<Box<dyn SwdProbe>, Box<dyn DebugProbe>> {
         match self.protocol {
-            Some(WireProtocol::Jtag) => Err(self.into_probe()),
+            Some(WireProtocol::Jtag | WireProtocol::CJtag) => Err(self.into_probe()),
             _ => Ok(self),
         }
     }

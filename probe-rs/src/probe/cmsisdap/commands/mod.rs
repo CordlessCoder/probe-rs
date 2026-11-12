@@ -1,3 +1,4 @@
+pub mod cjtag;
 #[cfg(test)]
 pub(crate) mod fake;
 pub mod general;
@@ -160,6 +161,15 @@ pub enum RequestError {
     JtagSequence {
         request: jtag::sequence::SequenceRequest,
     },
+
+    /// The probe cannot frame cJTAG in OScan{format}.
+    CjtagFormat { format: u8 },
+
+    /// The probe refused a cJTAG escape of {edges} edges.
+    CjtagEscape { edges: u8 },
+
+    /// A cJTAG walk into Test-Logic-Reset captured TDO past it, where the TAP has been activated again.
+    CjtagCaptureInTestLogicReset,
 
     /// The JTAG `{name}` scan chain is either too long or otherwise broken. Expected next bit to be {expected_bit}
     BrokenScanChain {

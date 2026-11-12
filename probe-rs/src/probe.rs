@@ -94,7 +94,7 @@ pub(crate) fn register_probe_factory(factory: &'static dyn ProbeFactory) {
 /// The protocol that is to be used by the probe when communicating with the target.
 ///
 /// For ARM select `Swd` or `Jtag`, for RISC-V select `Jtag`. `CJtag` is JTAG over the two
-/// wires of IEEE 1149.7 (OScan1), for probes that translate it.
+/// wires of IEEE 1149.7, for probes that translate it.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum WireProtocol {
     /// Serial Wire Debug is ARMs proprietary standard for communicating with ARM cores.
@@ -103,8 +103,9 @@ pub enum WireProtocol {
     /// JTAG is a standard which is supported by many chips independent of architecture.
     /// See [`Wikipedia`](https://en.wikipedia.org/wiki/JTAG) for more info.
     Jtag,
-    /// Compact JTAG (IEEE 1149.7) on two wires, TMSC and TCKC, in the OScan1 format. The probe
-    /// translates the JTAG operations, so the target sees JTAG.
+    /// Compact JTAG (IEEE 1149.7) on two wires, TMSC and TCKC, in an OScan scan format: OScan1
+    /// unless the probe offers another and it is selected. The probe translates the JTAG
+    /// operations, so the target sees JTAG.
     CJtag,
 }
 

@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
+use bitvec::vec::BitVec;
+
 use crate::{
     architecture::arm::{
         RegisterAddress,
@@ -8,7 +10,7 @@ use crate::{
     },
     probe::{
         BatchError, BatchExecutionError, BitSequence, CommandResult, DebugProbeError, HandleId,
-        Results,
+        Results, WireProtocol,
         cmsisdap::{
             CmsisDap,
             commands::{
@@ -524,6 +526,12 @@ impl CmsisDap {
     fn run_swj_sequence_op(&mut self, bits: &BitSequence) -> Result<(), DebugProbeError> {
         self.connect_if_needed()?;
 
+        if self.protocol == Some(WireProtocol::CJtag) {
+            // Raw clocks would reach the activated target unframed, which it reads as packets.
+            let tms: BitVec = (0..bits.len()).map(|i| bits[i]).collect();
+            return Ok(self.cjtag_tms(&tms)?);
+        }
+
         const MAX_BITS: usize = 256;
         let mut offset = 0;
         while offset < bits.len() {
@@ -548,6 +556,9 @@ impl CmsisDap {
     }
 
     fn run_swj_idle(&mut self, cycles: u32) -> Result<(), DebugProbeError> {
+        if self.protocol == Some(WireProtocol::CJtag) {
+            return Ok(self.cjtag_tms(&BitVec::repeat(false, cycles as usize))?);
+        }
         let mut remaining = cycles as usize;
         while remaining > 0 {
             let chunk_len = remaining.min(256);

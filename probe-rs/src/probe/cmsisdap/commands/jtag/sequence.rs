@@ -82,6 +82,36 @@ impl Sequence {
             tdi.load_le::<u64>().to_le_bytes(),
         )
     }
+
+    /// The level TMS is held at.
+    pub(crate) fn tms(&self) -> bool {
+        self.tms
+    }
+
+    /// The number of TCK cycles.
+    pub(crate) fn cycles(&self) -> usize {
+        usize::from(self.tck_cycles)
+    }
+
+    /// Whether TDO is captured.
+    pub(crate) fn captures(&self) -> bool {
+        self.tdo_capture
+    }
+
+    /// The cycles from `start` to `end`, with their TDI bits.
+    pub(crate) fn cycles_between(&self, start: usize, end: usize) -> Self {
+        assert!(
+            start < end && end <= self.cycles(),
+            "cycles {start}..{end} of {}",
+            self.cycles()
+        );
+        let tdi = (u64::from_le_bytes(self.data) >> start) & (u64::MAX >> (64 - (end - start)));
+        Self {
+            tck_cycles: (end - start) as u8,
+            data: tdi.to_le_bytes(),
+            ..*self
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -97,6 +127,11 @@ impl SequenceRequest {
             sequences.len()
         );
         Ok(SequenceRequest { sequences })
+    }
+
+    /// The sequences, in the order they are sent.
+    pub(crate) fn sequences(&self) -> &[Sequence] {
+        &self.sequences
     }
 }
 
