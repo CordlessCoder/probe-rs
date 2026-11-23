@@ -16,10 +16,12 @@ const DP_CTRL_ADDR: u8 = 0b0100;
 /// RDBUFF register address bits 2 and 3.
 const DP_RDBUFF_ADDR: u8 = 0b1100;
 
-/// ABORT value that clears overrun and sticky error bits.
-const ABORT_CLEAR_STICKY: u32 = (1 << 4) | (1 << 2);
+/// ABORT value that clears the overrun, write data error and sticky error bits.
+const ABORT_CLEAR_STICKY: u32 = (1 << 4) | (1 << 3) | (1 << 2);
 /// ABORT value that requests a DAP abort.
 const ABORT_DAP_ABORT: u32 = 1;
+/// CTRL/STAT.WDATAERR: the DP discarded a write it had acknowledged.
+const CTRL_WDATAERR: u32 = 1 << 7;
 
 /// Layer 1 SWD driver that owns ADIv5 transaction rules.
 pub struct SwdPort<'p> {
@@ -162,10 +164,28 @@ impl<'p> SwdPort<'p> {
                             // link drop on purpose. Failing here would spend none of the retry
                             // budget this loop exists to provide, and would report the failure
                             // of the recovery rather than the condition that caused it.
-                            if let Err(error) = self.clear_overrun_and_sticky_err() {
-                                tracing::debug!("clearing after WAIT failed, retrying: {error:?}");
+                            let ctrl =
+                                self.clear_overrun_and_sticky_err().unwrap_or_else(|error| {
+                                    tracing::debug!(
+                                        "clearing after WAIT failed, retrying: {error:?}"
+                                    );
+                                    0
+                                });
+                            // The DP abandons a write still in its write buffer when the WAIT sets
+                            // the overrun flag, or when the clearing reads CTRL/STAT, and sets
+                            // WDATAERR (IHI0031H B4.2.7). The depth of the buffer is IMPLEMENTATION
+                            // DEFINED; resending from the last write the DP acknowledged covers a
+                            // buffer of one.
+                            if ctrl & CTRL_WDATAERR != 0
+                                && let Some(write) = last_buffered_write(&expanded, fault_index)
+                            {
+                                expanded.consume(write);
+                                // A resend that the DP buffers behind a busy AP is abandoned again
+                                // by the next WAIT, so resend only once the AP is idle.
+                                wait_for_ap(&mut expanded);
+                            } else {
+                                expanded.consume(fault_index);
                             }
-                            expanded.consume(fault_index);
                             bump_write_idle(&mut expanded, idle_cycles as u32);
                             idle_cycles = idle_cycles
                                 .saturating_mul(2)
@@ -416,6 +436,30 @@ fn schedule_transfer(
     batch.schedule_preserved(handle_id.clone(), op);
 }
 
+/// The index of the last write before `end` that the DP can hold in its write buffer.
+fn last_buffered_write(batch: &SwdBatch, end: usize) -> Option<usize> {
+    batch
+        .iter()
+        .take(end)
+        .rposition(|(_, op)| is_write(op) && !is_abort(op))
+}
+
+/// Put an RDBUFF read in front of the remaining operations. It gets WAIT until every earlier
+/// transaction has completed (IHI0031H B4.2.6, B4.2.7).
+fn wait_for_ap(batch: &mut SwdBatch) {
+    let mut read = SwdBatch::new();
+    // The handle is dropped, so the read captures nothing.
+    let _ = read.schedule(SwdOp::Transfer {
+        port: Port::Dp,
+        addr: DP_RDBUFF_ADDR,
+        direction: Direction::Read,
+        data: 0,
+    });
+    let mut remaining = read.remaining_with_ids();
+    remaining.extend(batch.remaining_with_ids());
+    batch.replace_remaining(remaining);
+}
+
 fn bump_write_idle(batch: &mut SwdBatch, extra: u32) {
     let remaining = batch.remaining_with_ids();
     let mut modified = Vec::with_capacity(remaining.len());
@@ -620,10 +664,14 @@ fn remap_results(
 }
 
 impl SwdPort<'_> {
-    fn clear_overrun_and_sticky_err(&mut self) -> Result<(), SwdPortError> {
+    /// Clear the sticky flags and return CTRL/STAT as it was before.
+    fn clear_overrun_and_sticky_err(&mut self) -> Result<u32, SwdPortError> {
         tracing::debug!("Clearing overrun and sticky error");
         let mut batch = SwdBatch::new();
+        // A read of CTRL/STAT abandons a buffered write and sets WDATAERR, which that read need
+        // not report (IHI0031H B4.2.7). The flag is sticky, so a second read reports it.
         let _ = batch.read(Port::Dp, DP_CTRL_ADDR);
+        let ctrl = batch.read(Port::Dp, DP_CTRL_ADDR);
         batch.write(Port::Dp, DP_ABORT_ADDR, ABORT_CLEAR_STICKY);
         if !self.probe.handles_ap_pipeline() {
             batch.idle(
@@ -632,10 +680,11 @@ impl SwdPort<'_> {
             );
             batch.idle(self.settings.idle_cycles_after_transfer as u32);
         }
-        self.probe
+        let mut results = self
+            .probe
             .run_batch(&batch)
             .map_err(|error| SwdPortError::Probe(probe_error(&error.error)))?;
-        Ok(())
+        Ok(results.take(ctrl).unwrap_or(0))
     }
 
     fn write_abort_dap(&mut self) -> Result<(), SwdPortError> {
@@ -687,8 +736,7 @@ mod tests {
     }
 
     fn push_clear_overrun_ok(probe: &mut MockSwdProbe) {
-        probe.push_response(ScriptedResponse::Ok(0));
-        probe.push_response(ScriptedResponse::Ok(0));
+        push_ok(probe, 3);
     }
 
     fn push_ok(probe: &mut MockSwdProbe, count: usize) {
@@ -716,12 +764,13 @@ mod tests {
         port.run(batch).expect("run should succeed");
 
         let reads = read_ops(&probe.transfer_ops());
-        assert_eq!(reads.len(), 5);
+        assert_eq!(reads.len(), 6);
         assert_eq!(reads[0], (Port::Dp, DP_CTRL_ADDR));
         assert_eq!(reads[1], (Port::Dp, DP_CTRL_ADDR));
         assert_eq!(reads[2], (Port::Dp, DP_CTRL_ADDR));
         assert_eq!(reads[3], (Port::Dp, DP_CTRL_ADDR));
         assert_eq!(reads[4], (Port::Dp, DP_CTRL_ADDR));
+        assert_eq!(reads[5], (Port::Dp, DP_CTRL_ADDR));
     }
 
     #[test]
@@ -752,11 +801,12 @@ mod tests {
         assert_eq!(results.take(handle).unwrap(), vec![42]);
 
         let reads = read_ops(&probe.transfer_ops());
-        assert_eq!(reads.len(), 4);
+        assert_eq!(reads.len(), 5);
         assert_eq!(reads[0], (Port::Ap, 0b1000));
         assert_eq!(reads[1], (Port::Dp, DP_RDBUFF_ADDR));
         assert_eq!(reads[2], (Port::Dp, DP_CTRL_ADDR));
-        assert_eq!(reads[3], (Port::Dp, DP_RDBUFF_ADDR));
+        assert_eq!(reads[3], (Port::Dp, DP_CTRL_ADDR));
+        assert_eq!(reads[4], (Port::Dp, DP_RDBUFF_ADDR));
     }
 
     #[test]
@@ -775,10 +825,55 @@ mod tests {
         let ops = probe.transfer_ops();
         assert_eq!(ap_write_count(&ops), 1);
         let reads = read_ops(&ops);
-        assert_eq!(reads.len(), 3);
+        assert_eq!(reads.len(), 4);
         assert_eq!(reads[0], (Port::Dp, DP_RDBUFF_ADDR));
         assert_eq!(reads[1], (Port::Dp, DP_CTRL_ADDR));
-        assert_eq!(reads[2], (Port::Dp, DP_RDBUFF_ADDR));
+        assert_eq!(reads[2], (Port::Dp, DP_CTRL_ADDR));
+        assert_eq!(reads[3], (Port::Dp, DP_RDBUFF_ADDR));
+    }
+
+    #[test]
+    fn wait_after_an_abandoned_write_resends_it() {
+        // The AP performs the first write and the DP buffers the second. The third gets WAIT,
+        // and the clearing's first CTRL/STAT read abandons the second, which only its second
+        // read reports. The retry waits for the AP with an RDBUFF read, then resends from the
+        // second.
+        let mut probe = MockSwdProbe::new();
+        push_ok(&mut probe, 2);
+        probe.push_response(ScriptedResponse::Wait);
+        probe.push_response(ScriptedResponse::Ok(0));
+        probe.push_response(ScriptedResponse::Ok(CTRL_WDATAERR));
+        probe.push_response(ScriptedResponse::Ok(0));
+        push_ok(&mut probe, 5);
+
+        let mut batch = SwdBatch::new();
+        let mut port = SwdPort::new(&mut probe, SwdSettings::default());
+        port.write_ap_block(&mut batch, 0b1100, &[1, 2, 3, 4]);
+        port.run(batch).expect("run should succeed");
+
+        let ops = probe.transfer_ops();
+        let ap_writes: Vec<u32> = ops
+            .iter()
+            .filter(|op| op.port == Port::Ap && op.direction == Direction::Write)
+            .map(|op| op.data)
+            .collect();
+        assert_eq!(ap_writes, [1, 2, 3, 2, 3, 4]);
+        let resend = ops
+            .iter()
+            .rposition(|op| op.port == Port::Ap && op.data == 2)
+            .unwrap();
+        assert_eq!(
+            read_ops(&ops[resend - 1..resend]),
+            [(Port::Dp, DP_RDBUFF_ADDR)],
+            "the resend must wait for the AP"
+        );
+        assert!(
+            ops.iter().any(|op| op.port == Port::Dp
+                && op.addr == DP_ABORT_ADDR
+                && op.direction == Direction::Write
+                && op.data & (1 << 3) != 0),
+            "the clearing must clear WDATAERR, or every later access gets FAULT"
+        );
     }
 
     #[test]
