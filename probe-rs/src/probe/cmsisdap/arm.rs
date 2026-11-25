@@ -33,7 +33,7 @@ impl CmsisDap {
     ///
     /// Each read writes one word to `values`, in the order of the reads.
     fn transfer(&mut self, accesses: &[Access], values: &mut [u32]) -> Result<(), ArmError> {
-        let jtag = self.protocol == Some(WireProtocol::Jtag);
+        let jtag = self.protocol.is_some_and(WireProtocol::is_jtag);
         if jtag && !self.jtag_configured {
             self.track_select(accesses);
             // The probe does not know the scan chain yet, so the accesses run as JTAG scans.
