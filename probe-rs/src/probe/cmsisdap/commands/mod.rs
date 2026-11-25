@@ -103,6 +103,9 @@ pub enum SendError {
     /// Vendor command payload has {actual} bytes, but the packet holds at most {maximum}.
     VendorPayloadTooLarge { actual: usize, maximum: usize },
 
+    /// DAP_ExecuteCommands with {count} commands does not fit in one packet.
+    TooManyCommands { count: usize },
+
     /// String in response is not valid UTF-8.
     ///
     /// Strings are required to be UTF-8 encoded by the
