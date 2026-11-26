@@ -210,7 +210,7 @@ impl<Op, E: std::error::Error + Send + Sync + 'static> Batch<Op, E> {
     /// Iterate over the operations in the batch, in the order of the schedule.
     ///
     /// A probe driver walks the batch with this method.
-    pub fn iter(&self) -> impl Iterator<Item = &(HandleId, Op)> {
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &(HandleId, Op)> + ExactSizeIterator {
         self.batch.iter()
     }
 
@@ -533,7 +533,9 @@ impl<Op> ErasedBatch<Op> {
         self.len() == 0
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &(HandleId, Op)> {
+    pub(crate) fn iter(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = &(HandleId, Op)> + ExactSizeIterator {
         self.commands[self.cursor..].iter()
     }
 
